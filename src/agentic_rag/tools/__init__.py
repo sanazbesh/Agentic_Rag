@@ -1,6 +1,12 @@
 """Tooling module interfaces and query-intelligence utilities."""
 
 from .interfaces import Tool, ToolRegistry
+from .context_processing import (
+    CompressContextResult,
+    CompressedParentChunk,
+    ParentChunkCompressor,
+    compress_context,
+)
 from .query_intelligence import (
     QueryDecompositionResult,
     QueryRewriteResult,
@@ -12,6 +18,10 @@ from .query_intelligence import (
 __all__ = [
     "Tool",
     "ToolRegistry",
+    "CompressedParentChunk",
+    "CompressContextResult",
+    "ParentChunkCompressor",
+    "compress_context",
     "QueryRewriteResult",
     "QueryDecompositionResult",
     "QueryTransformationService",
