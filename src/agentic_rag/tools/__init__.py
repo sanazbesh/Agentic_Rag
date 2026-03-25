@@ -9,10 +9,14 @@ from .context_processing import (
 )
 from .answer_generation import AnswerCitation, GenerateAnswerResult, LegalAnswerSynthesizer, generate_answer
 from .query_intelligence import (
+    LegalEntityExtractionResult,
+    LegalEntityExtractor,
+    LegalEntityFilters,
     QueryDecompositionResult,
     QueryRewriteResult,
     QueryTransformationService,
     decompose_query,
+    extract_legal_entities,
     rewrite_query,
 )
 
@@ -30,6 +34,10 @@ __all__ = [
     "QueryRewriteResult",
     "QueryDecompositionResult",
     "QueryTransformationService",
+    "LegalEntityFilters",
+    "LegalEntityExtractionResult",
+    "LegalEntityExtractor",
     "rewrite_query",
     "decompose_query",
+    "extract_legal_entities",
 ]
