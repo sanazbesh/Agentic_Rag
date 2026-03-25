@@ -7,6 +7,7 @@ from .context_processing import (
     ParentChunkCompressor,
     compress_context,
 )
+from .answer_generation import AnswerCitation, GenerateAnswerResult, LegalAnswerSynthesizer, generate_answer
 from .query_intelligence import (
     QueryDecompositionResult,
     QueryRewriteResult,
@@ -22,6 +23,10 @@ __all__ = [
     "CompressContextResult",
     "ParentChunkCompressor",
     "compress_context",
+    "AnswerCitation",
+    "GenerateAnswerResult",
+    "LegalAnswerSynthesizer",
+    "generate_answer",
     "QueryRewriteResult",
     "QueryDecompositionResult",
     "QueryTransformationService",
