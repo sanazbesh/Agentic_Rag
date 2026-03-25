@@ -2,15 +2,22 @@
 
 from .interfaces import QueryRewriter, Retriever, Reranker
 from .parent_child import (
+    ChunkReranker,
     ChildChunkRepository,
     ChildChunkSearcher,
     ChildSearchResult,
+    HybridSearchResult,
     InMemoryChildChunkRepository,
+    InMemoryKeywordChunkRepository,
     InMemoryParentChunkRepository,
+    KeywordChunkRepository,
+    KeywordSearchService,
     ParentChildRetrievalTools,
     ParentChunkRepository,
     ParentChunkResult,
     ParentChunkStore,
+    RerankedChunkResult,
+    VectorSearchService,
 )
 
 __all__ = [
@@ -20,10 +27,17 @@ __all__ = [
     "ChildChunkRepository",
     "ParentChunkRepository",
     "ChildChunkSearcher",
+    "VectorSearchService",
+    "KeywordChunkRepository",
+    "KeywordSearchService",
+    "ChunkReranker",
     "ParentChunkStore",
     "ParentChildRetrievalTools",
     "ChildSearchResult",
+    "HybridSearchResult",
+    "RerankedChunkResult",
     "ParentChunkResult",
     "InMemoryChildChunkRepository",
+    "InMemoryKeywordChunkRepository",
     "InMemoryParentChunkRepository",
 ]
