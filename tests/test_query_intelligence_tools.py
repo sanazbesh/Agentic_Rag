@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from agentic_rag.tools import decompose_query, rewrite_query
+from agentic_rag.tools import decompose_query, extract_legal_entities, rewrite_query
 from agentic_rag.tools.query_intelligence import QueryTransformationService
 
 
@@ -141,3 +141,99 @@ def test_safe_fallbacks_on_llm_failure() -> None:
     assert rewrite.rewrite_notes == "llm_failure_fallback_original_query"
     assert decompose.sub_queries == ("definition and remedy for unconscionability",)
     assert decompose.decomposition_notes == "llm_failure_fallback_original_query"
+
+
+def test_extract_legal_entities_contract_clause_query() -> None:
+    result = extract_legal_entities("Review NDA confidentiality clause obligations within 30 days.")
+
+    assert result.normalized_query == "Review non-disclosure agreement confidentiality clause obligations within 30 days."
+    assert "non-disclosure agreement" in result.document_types
+    assert "confidentiality clause" in result.clause_types
+    assert "within 30 days" in result.time_constraints
+
+
+def test_extract_legal_entities_jurisdiction_query() -> None:
+    result = extract_legal_entities("Delaware breach of contract requirements after 2020.")
+
+    assert result.jurisdictions == ["Delaware"]
+    assert result.legal_topics == ["breach"]
+    assert result.filters.jurisdiction == ["Delaware"]
+    assert result.filters.date_from == "2020-01-01"
+
+
+def test_extract_legal_entities_court_query() -> None:
+    result = extract_legal_entities("Recent Supreme Court appeal on negligence.")
+
+    assert result.courts == ["Supreme Court"]
+    assert "appeal" in result.procedural_posture
+    assert "recent_without_explicit_timeframe" in result.ambiguity_notes
+
+
+def test_extract_legal_entities_statute_query() -> None:
+    result = extract_legal_entities("Interpret GDPR Section 5 for customer data policy.")
+
+    assert "GDPR" in result.laws_or_regulations
+    assert "Section 5" in result.legal_citations
+    assert "policy" in result.document_types
+
+
+def test_extract_legal_entities_clause_extraction() -> None:
+    result = extract_legal_entities("Need indemnity clause language in a contract.")
+
+    assert result.clause_types == ["indemnity clause"]
+    assert result.document_types == ["contract"]
+    assert result.filters.clause_type == ["indemnity clause"]
+
+
+def test_extract_legal_entities_procedural_query() -> None:
+    result = extract_legal_entities("Motion to dismiss for fraud in federal district court.")
+
+    assert "motion to dismiss" in result.procedural_posture
+    assert "fraud" in result.causes_of_action
+    assert result.jurisdictions == ["Federal"]
+    assert result.courts == ["District Court"]
+
+
+def test_extract_legal_entities_ambiguous_query() -> None:
+    result = extract_legal_entities("What is the governing law clause?")
+
+    assert "governing law clause" in result.clause_types
+    assert "governing_law_without_jurisdiction" in result.ambiguity_notes
+    assert result.jurisdictions == []
+
+
+def test_extract_legal_entities_empty_query() -> None:
+    result = extract_legal_entities("  ")
+
+    assert result.original_query == "  "
+    assert result.warnings == ["empty_input"]
+    assert result.document_types == []
+
+
+def test_extract_legal_entities_determinism() -> None:
+    query = "California summary judgment negligence before 2022."
+    first = extract_legal_entities(query)
+    second = extract_legal_entities(query)
+
+    assert first == second
+
+
+def test_extract_legal_entities_filter_correctness() -> None:
+    result = extract_legal_entities("New York Court of Appeal termination clause after 2021.")
+
+    assert result.filters.jurisdiction == result.jurisdictions
+    assert result.filters.court == result.courts
+    assert result.filters.document_type == result.document_types
+    assert result.filters.clause_type == result.clause_types
+    assert result.filters.date_from == "2021-01-01"
+    assert result.filters.date_to is None
+
+
+def test_extract_legal_entities_non_conflation_validation() -> None:
+    result = extract_legal_entities("Find UCC Rule 12 in Delaware Chancery Court cases.")
+
+    assert "UCC" in result.laws_or_regulations
+    assert "Rule 12" in result.legal_citations
+    assert "Delaware" in result.jurisdictions
+    assert "Chancery Court" in result.courts
+    assert "UCC" not in result.legal_citations

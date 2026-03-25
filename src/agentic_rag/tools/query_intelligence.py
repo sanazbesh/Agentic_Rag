@@ -54,6 +54,322 @@ class QueryDecompositionResult:
     decomposition_notes: str = ""
 
 
+@dataclass(slots=True, frozen=True)
+class LegalEntityFilters:
+    """Subset filter payload derived strictly from extracted legal entities."""
+
+    jurisdiction: list[str]
+    court: list[str]
+    document_type: list[str]
+    date_from: str | None
+    date_to: str | None
+    clause_type: list[str]
+
+
+@dataclass(slots=True, frozen=True)
+class LegalEntityExtractionResult:
+    """Structured legal query parsing output for retrieval optimization.
+
+    This model is intentionally conservative for legal RAG: it extracts only
+    explicit signals from the *current* query so downstream retrieval/ranking
+    can filter and score accurately without hallucinating legal details.
+    """
+
+    original_query: str
+    normalized_query: str | None
+    document_types: list[str]
+    legal_topics: list[str]
+    jurisdictions: list[str]
+    courts: list[str]
+    laws_or_regulations: list[str]
+    legal_citations: list[str]
+    clause_types: list[str]
+    parties: list[str]
+    dates: list[str]
+    time_constraints: list[str]
+    obligations: list[str]
+    remedies: list[str]
+    procedural_posture: list[str]
+    causes_of_action: list[str]
+    factual_entities: list[str]
+    keywords: list[str]
+    filters: LegalEntityFilters
+    ambiguity_notes: list[str]
+    warnings: list[str]
+    extraction_notes: list[str] | None
+
+
+@dataclass(slots=True)
+class LegalEntityExtractor:
+    """Deterministic parser for high-precision legal entity extraction.
+
+    The extractor keeps the retrieval tool thin and debuggable:
+    1) deterministic patterns and controlled vocab only,
+    2) conservative field population,
+    3) filter derivation strictly from extracted entities.
+    """
+
+    _DOCUMENT_TYPES: tuple[str, ...] = (
+        "contract",
+        "lease",
+        "non-disclosure agreement",
+        "employment agreement",
+        "statute",
+        "regulation",
+        "case",
+        "judgment",
+        "policy",
+    )
+    _LEGAL_TOPICS: tuple[str, ...] = (
+        "termination",
+        "breach",
+        "confidentiality",
+        "indemnity",
+        "negligence",
+        "liability",
+        "arbitration",
+        "governing law",
+    )
+    _JURISDICTIONS: tuple[str, ...] = (
+        "ontario",
+        "canada",
+        "new york",
+        "delaware",
+        "uk",
+        "eu",
+        "federal",
+        "california",
+    )
+    _COURTS: tuple[str, ...] = (
+        "supreme court",
+        "court of appeal",
+        "chancery court",
+        "district court",
+        "court of chancery",
+    )
+    _LAWS: tuple[str, ...] = (
+        "gdpr",
+        "employment standards act",
+        "ucc",
+        "civil code",
+    )
+    _CLAUSE_TYPES: tuple[str, ...] = (
+        "termination clause",
+        "confidentiality clause",
+        "indemnity clause",
+        "arbitration clause",
+        "governing law clause",
+    )
+    _PARTIES: tuple[str, ...] = (
+        "tenant",
+        "landlord",
+        "employer",
+        "employee",
+        "plaintiff",
+        "defendant",
+    )
+    _REMEDIES: tuple[str, ...] = ("damages", "injunction", "termination", "indemnity", "specific performance")
+    _PROCEDURAL: tuple[str, ...] = ("motion to dismiss", "appeal", "summary judgment")
+    _CAUSES: tuple[str, ...] = ("breach of contract", "fraud", "negligence", "unjust enrichment")
+    _FACTUAL: tuple[str, ...] = ("notice period", "severance", "customer data", "trade secrets")
+    _KEYWORD_CANDIDATES: tuple[str, ...] = (
+        "enforceability",
+        "elements",
+        "exceptions",
+        "standard",
+        "interpretation",
+    )
+
+    _LEGAL_CITATION_PATTERNS: tuple[re.Pattern[str], ...] = (
+        re.compile(r"\bSection\s+[\w.\-()]+", flags=re.IGNORECASE),
+        re.compile(r"\bRule\s+[\w.\-()]+", flags=re.IGNORECASE),
+        re.compile(r"\b\d+\s+U\.S\.C\.\s+§+\s*[\w.\-()]+", flags=re.IGNORECASE),
+    )
+    _DATE_PATTERNS: tuple[re.Pattern[str], ...] = (
+        re.compile(r"\b(19|20)\d{2}\b"),
+        re.compile(r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+\d{1,2},\s*(19|20)\d{2}\b", flags=re.IGNORECASE),
+    )
+    _TIME_CONSTRAINT_PATTERNS: tuple[re.Pattern[str], ...] = (
+        re.compile(r"\bwithin\s+\d+\s+(?:day|days|month|months|year|years)\b", flags=re.IGNORECASE),
+        re.compile(r"\b(?:after|before|since|until)\s+(?:\d{4}|[A-Za-z]+\s+\d{4})\b", flags=re.IGNORECASE),
+        re.compile(r"\brecent\b", flags=re.IGNORECASE),
+    )
+    _OBLIGATION_PATTERNS: tuple[re.Pattern[str], ...] = (
+        re.compile(r"\bmust\b", flags=re.IGNORECASE),
+        re.compile(r"\bshall\b", flags=re.IGNORECASE),
+        re.compile(r"\bmay not\b", flags=re.IGNORECASE),
+        re.compile(r"\brequired to\b", flags=re.IGNORECASE),
+    )
+
+    def extract(self, query: str) -> LegalEntityExtractionResult:
+        """Parse a legal query into strict structured entities for RAG retrieval.
+
+        Conservative extraction principle:
+        - Explicit textual evidence only.
+        - No guessed jurisdictions/courts/topics.
+        - Filters are strict subset projections from extracted fields.
+        """
+
+        original_query = query
+        raw = (query or "").strip()
+        if not raw:
+            return LegalEntityExtractionResult(
+                original_query=original_query,
+                normalized_query=None,
+                document_types=[],
+                legal_topics=[],
+                jurisdictions=[],
+                courts=[],
+                laws_or_regulations=[],
+                legal_citations=[],
+                clause_types=[],
+                parties=[],
+                dates=[],
+                time_constraints=[],
+                obligations=[],
+                remedies=[],
+                procedural_posture=[],
+                causes_of_action=[],
+                factual_entities=[],
+                keywords=[],
+                filters=LegalEntityFilters(
+                    jurisdiction=[],
+                    court=[],
+                    document_type=[],
+                    date_from=None,
+                    date_to=None,
+                    clause_type=[],
+                ),
+                ambiguity_notes=[],
+                warnings=["empty_input"],
+                extraction_notes=["deterministic_pattern_matching"],
+            )
+
+        normalized = re.sub(r"\bNDA\b", "non-disclosure agreement", raw, flags=re.IGNORECASE)
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        lowered = normalized.lower()
+
+        document_types = self._find_terms(lowered, self._DOCUMENT_TYPES)
+        legal_topics = self._find_terms(lowered, self._LEGAL_TOPICS)
+        jurisdictions = self._title_terms(self._find_terms(lowered, self._JURISDICTIONS))
+        courts = self._title_terms(self._find_terms(lowered, self._COURTS))
+        laws = self._title_terms(self._find_terms(lowered, self._LAWS))
+        clause_types = self._find_terms(lowered, self._CLAUSE_TYPES)
+        parties = self._find_terms(lowered, self._PARTIES)
+        remedies = self._find_terms(lowered, self._REMEDIES)
+        procedural = self._find_terms(lowered, self._PROCEDURAL)
+        causes = self._find_terms(lowered, self._CAUSES)
+        factual = self._find_terms(lowered, self._FACTUAL)
+
+        legal_citations = self._extract_patterns(normalized, self._LEGAL_CITATION_PATTERNS)
+        dates = self._extract_patterns(normalized, self._DATE_PATTERNS)
+        time_constraints = self._extract_patterns(normalized, self._TIME_CONSTRAINT_PATTERNS)
+        obligations = self._extract_patterns(normalized, self._OBLIGATION_PATTERNS)
+
+        ambiguity_notes: list[str] = []
+        if "governing law" in lowered and not jurisdictions:
+            ambiguity_notes.append("governing_law_without_jurisdiction")
+        if re.search(r"\brecent\b", lowered) and not dates:
+            ambiguity_notes.append("recent_without_explicit_timeframe")
+
+        filters = LegalEntityFilters(
+            jurisdiction=list(jurisdictions),
+            court=list(courts),
+            document_type=list(document_types),
+            date_from=self._derive_date_boundary(time_constraints, "from"),
+            date_to=self._derive_date_boundary(time_constraints, "to"),
+            clause_type=list(clause_types),
+        )
+
+        keywords = self._derive_keywords(
+            lowered=lowered,
+            structured_values=[
+                *document_types,
+                *legal_topics,
+                *jurisdictions,
+                *courts,
+                *laws,
+                *legal_citations,
+                *clause_types,
+                *parties,
+                *dates,
+                *time_constraints,
+                *obligations,
+                *remedies,
+                *procedural,
+                *causes,
+                *factual,
+            ],
+        )
+
+        return LegalEntityExtractionResult(
+            original_query=original_query,
+            normalized_query=normalized if normalized != raw else None,
+            document_types=document_types,
+            legal_topics=legal_topics,
+            jurisdictions=jurisdictions,
+            courts=courts,
+            laws_or_regulations=laws,
+            legal_citations=legal_citations,
+            clause_types=clause_types,
+            parties=parties,
+            dates=dates,
+            time_constraints=time_constraints,
+            obligations=obligations,
+            remedies=remedies,
+            procedural_posture=procedural,
+            causes_of_action=causes,
+            factual_entities=factual,
+            keywords=keywords,
+            filters=filters,
+            ambiguity_notes=ambiguity_notes,
+            warnings=[],
+            extraction_notes=["deterministic_pattern_matching", "controlled_vocabulary_mapping"],
+        )
+
+    def _find_terms(self, lowered_query: str, terms: Sequence[str]) -> list[str]:
+        return [term for term in terms if re.search(rf"\b{re.escape(term)}\b", lowered_query)]
+
+    def _title_terms(self, terms: Sequence[str]) -> list[str]:
+        normalized: list[str] = []
+        for item in terms:
+            if item in {"uk", "eu", "gdpr", "ucc"}:
+                normalized.append(item.upper())
+            else:
+                normalized.append(item.title())
+        return normalized
+
+    def _extract_patterns(self, query: str, patterns: Sequence[re.Pattern[str]]) -> list[str]:
+        seen: list[str] = []
+        for pattern in patterns:
+            for match in pattern.finditer(query):
+                value = match.group(0).strip()
+                if value not in seen:
+                    seen.append(value)
+        return seen
+
+    def _derive_date_boundary(self, constraints: Sequence[str], direction: str) -> str | None:
+        for text in constraints:
+            lowered = text.lower()
+            year_match = re.search(r"\b(19|20)\d{2}\b", lowered)
+            if not year_match:
+                continue
+            year = year_match.group(0)
+            if direction == "from" and any(token in lowered for token in ("after", "since")):
+                return f"{year}-01-01"
+            if direction == "to" and any(token in lowered for token in ("before", "until")):
+                return f"{year}-12-31"
+        return None
+
+    def _derive_keywords(self, lowered: str, structured_values: Sequence[str]) -> list[str]:
+        blocked_terms = {token.strip().lower() for value in structured_values for token in value.split()}
+        output: list[str] = []
+        for candidate in self._KEYWORD_CANDIDATES:
+            if candidate in lowered and candidate not in blocked_terms:
+                output.append(candidate)
+        return output
+
+
 @dataclass(slots=True)
 class QueryTransformationService:
     """Shared service for deterministic legal query rewriting and decomposition.
@@ -334,6 +650,7 @@ def _is_complex_query(query: str) -> bool:
 
 
 _DEFAULT_QUERY_TRANSFORMATION_SERVICE = QueryTransformationService()
+_DEFAULT_LEGAL_ENTITY_EXTRACTOR = LegalEntityExtractor()
 
 
 def rewrite_query(
@@ -370,3 +687,14 @@ def decompose_query(
         conversation_summary=conversation_summary,
         recent_messages=recent_messages,
     )
+
+
+def extract_legal_entities(query: str) -> LegalEntityExtractionResult:
+    """Extract structured legal entities from a user query for retrieval.
+
+    This tool is parsing-only (not retrieval, memory, or answer generation).
+    It prioritizes high-precision deterministic extraction and derives filters
+    solely from extracted entities for safer downstream retrieval/ranking.
+    """
+
+    return _DEFAULT_LEGAL_ENTITY_EXTRACTOR.extract(query=query)
