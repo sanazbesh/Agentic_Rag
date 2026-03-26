@@ -8,6 +8,7 @@ from .dense_child_chunks import (
     DenseEmbeddingService,
     DenseIndexingResult,
     QdrantChildChunkStore,
+    ChildChunkQdrantPayload,
     child_chunk_payload,
     stable_qdrant_point_id,
 )
@@ -23,6 +24,7 @@ __all__ = [
     "DenseEmbeddingService",
     "DenseIndexingResult",
     "QdrantChildChunkStore",
+    "ChildChunkQdrantPayload",
     "ChildChunkDenseIndexer",
     "child_chunk_payload",
     "stable_qdrant_point_id",
