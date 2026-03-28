@@ -1,6 +1,16 @@
 """Orchestration interfaces and deterministic retrieval-stage graph helpers."""
 
 from .interfaces import Agent, Orchestrator
+from .legal_rag_graph import (
+    FinalAnswerModel,
+    LegalRagDependencies,
+    LegalRagState,
+    build_answer_graph,
+    build_full_legal_rag_graph,
+    default_legal_rag_state,
+    run_legal_rag_turn,
+)
+
 from .retrieval_graph import (
     QueryRoutingDecision,
     RetrievalDependencies,
@@ -23,4 +33,11 @@ __all__ = [
     "heuristic_query_classifier",
     "build_retrieval_graph",
     "run_retrieval_stage",
+    "FinalAnswerModel",
+    "LegalRagState",
+    "LegalRagDependencies",
+    "default_legal_rag_state",
+    "build_answer_graph",
+    "build_full_legal_rag_graph",
+    "run_legal_rag_turn",
 ]
