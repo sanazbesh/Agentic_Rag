@@ -11,6 +11,7 @@ from ui.backend_adapter import BackendAdapterError, get_available_documents, par
 from ui.upload_manager import ALLOWED_EXTENSIONS, remove_uploaded_document, save_uploaded_files
 
 DEBUG_SECTIONS = [
+    ("adapter_meta", "Adapter Meta"),
     ("rewritten_query", "Rewritten Query"),
     ("extracted_entities", "Extracted Entities"),
     ("filters", "Filters"),
@@ -289,7 +290,13 @@ def render_debug_panel(final_result: dict[str, Any], debug_payload: dict[str, An
         if key not in payload:
             continue
         with st.expander(title, expanded=False):
-            st.json(payload[key], expanded=False)
+            value = payload[key]
+            if isinstance(value, (dict, list)):
+                st.json(value, expanded=False)
+            elif isinstance(value, str):
+                st.code(value, language="text")
+            else:
+                st.write(value)
 
     with st.expander("Raw final result + debug payload", expanded=False):
         st.markdown("**Raw final_result**")

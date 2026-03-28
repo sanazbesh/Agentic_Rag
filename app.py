@@ -11,6 +11,8 @@ Integration note:
 
 from __future__ import annotations
 
+import logging
+from dataclasses import replace
 from collections.abc import Callable
 from typing import Any
 
@@ -29,9 +31,10 @@ from ui.components import (
 
 
 st.set_page_config(page_title="Legal RAG Test UI", layout="wide")
+logger = logging.getLogger(__name__)
 
 
-def build_real_backend_runners() -> tuple[Callable[..., Any] | None, Callable[..., Any] | None]:
+def build_real_backend_runners() -> tuple[Callable[..., Any] | None, Callable[..., Any] | None, str | None]:
     """Return configured real backend runners.
 
     Replace this with your project-specific wiring to invoke:
@@ -43,20 +46,86 @@ def build_real_backend_runners() -> tuple[Callable[..., Any] | None, Callable[..
     - allows optional debug payload runner without changing UI code
     """
 
-    # Example sketch (uncomment and adapt in your environment):
-    # from agentic_rag.orchestration.legal_rag_graph import run_legal_rag_turn
-    #
-    # def real_backend_runner(query: str, conversation_summary=None, recent_messages=None, selected_documents=None):
-    #     return run_legal_rag_turn(
-    #         query=query,
-    #         conversation_summary=conversation_summary,
-    #         recent_messages=recent_messages,
-    #         selected_documents=selected_documents,
-    #         dependencies=...,  # your LegalRagDependencies
-    #     )
-    #
-    # return real_backend_runner, None
-    return None, None
+    try:
+        from agentic_rag.orchestration.legal_rag_graph import LegalRagDependencies, run_legal_rag_turn
+    except Exception as exc:
+        return None, None, f"Unable to import legal RAG runner: {type(exc).__name__}: {exc}"
+
+    dependencies = st.session_state.get("legal_rag_dependencies")
+    if dependencies is None:
+        return (
+            None,
+            None,
+            "Real backend not wired. Set st.session_state['legal_rag_dependencies'] with a LegalRagDependencies "
+            "instance before running with mock mode disabled.",
+        )
+    if not isinstance(dependencies, LegalRagDependencies):
+        return (
+            None,
+            None,
+            "Real backend wiring invalid: st.session_state['legal_rag_dependencies'] must be a "
+            "LegalRagDependencies instance.",
+        )
+
+    retrieval_config = st.session_state.get("legal_rag_retrieval_config")
+
+    def real_backend_runner(
+        *,
+        query: str,
+        conversation_summary: str | None = None,
+        recent_messages: list[dict[str, Any]] | None = None,
+        selected_documents: list[dict[str, Any]] | None = None,
+    ) -> Any:
+        selected_docs = [doc for doc in (selected_documents or []) if isinstance(doc, dict)]
+        selected_ids = [str(doc.get("id")) for doc in selected_docs if doc.get("id")]
+        selected_paths = [str(doc.get("path")) for doc in selected_docs if doc.get("path")]
+
+        base_hybrid_search = dependencies.retrieval.hybrid_search
+
+        def hybrid_search_with_selected_docs(user_query: str, *, filters: dict[str, Any] | None, top_k: int) -> Any:
+            merged_filters = dict(filters or {})
+            if selected_ids:
+                merged_filters["selected_document_ids"] = selected_ids
+            if selected_paths:
+                merged_filters["selected_document_paths"] = selected_paths
+            logger.info(
+                "real_backend_hybrid_search selected_document_ids=%s selected_document_paths=%s",
+                selected_ids,
+                selected_paths,
+            )
+            return base_hybrid_search(user_query, filters=merged_filters or None, top_k=top_k)
+
+        wrapped_dependencies = replace(
+            dependencies,
+            retrieval=replace(dependencies.retrieval, hybrid_search=hybrid_search_with_selected_docs),
+        )
+
+        return run_legal_rag_turn(
+            query=query,
+            dependencies=wrapped_dependencies,
+            conversation_summary=conversation_summary,
+            recent_messages=recent_messages,
+            retrieval_config=retrieval_config,
+        )
+
+    def real_debug_runner(
+        *,
+        selected_documents: list[dict[str, Any]] | None = None,
+        **_: Any,
+    ) -> dict[str, Any]:
+        selected_docs = [doc for doc in (selected_documents or []) if isinstance(doc, dict)]
+        selected_ids = [str(doc.get("id")) for doc in selected_docs if doc.get("id")]
+        selected_paths = [str(doc.get("path")) for doc in selected_docs if doc.get("path")]
+        return {
+            "meta": {
+                "mode": "real",
+                "selected_document_ids": selected_ids,
+                "selected_document_paths": selected_paths,
+                "uses_uploaded_documents": any(doc.get("source") == "uploaded" for doc in selected_docs),
+            }
+        }
+
+    return real_backend_runner, real_debug_runner, None
 
 
 def main() -> None:
@@ -77,7 +146,11 @@ def main() -> None:
         elif input_state["recent_messages_parse_error"]:
             st.warning("Please fix recent_messages JSON before running.")
         else:
-            real_backend_runner, real_debug_runner = build_real_backend_runners()
+            real_backend_runner, real_debug_runner, real_backend_wiring_error = build_real_backend_runners()
+            if not sidebar_state["use_mock_backend"] and real_backend_runner is None:
+                st.warning(real_backend_wiring_error or "Real backend mode is enabled, but no backend is wired.")
+                logger.warning("real_backend_not_wired reason=%s", real_backend_wiring_error)
+                return
             with st.spinner("Running legal RAG pipeline..."):
                 try:
                     response = run_backend_query(
@@ -94,7 +167,7 @@ def main() -> None:
                         "debug_payload": response.debug_payload,
                     }
                 except BackendAdapterError as exc:
-                    st.error(f"Backend adapter error: {exc}")
+                    st.warning(f"Backend adapter warning: {exc}")
                     st.session_state.last_run = {
                         "error": str(exc),
                         "query": input_state["query"],
@@ -122,6 +195,14 @@ def main() -> None:
 
     render_answer_panel(final_result)
     render_citations(final_result.get("citations", []))
+    adapter_meta = (debug_payload or {}).get("adapter_meta") if isinstance(debug_payload, dict) else None
+    if isinstance(adapter_meta, dict):
+        st.caption(
+            "Backend mode: "
+            f"{adapter_meta.get('backend_mode', 'unknown')} | "
+            f"Selected docs: {len(adapter_meta.get('selected_document_ids', []))} | "
+            f"Uses uploaded documents: {adapter_meta.get('uses_uploaded_documents', False)}"
+        )
 
     if sidebar_state["show_debug"]:
         render_debug_panel(final_result, debug_payload)
