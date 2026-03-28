@@ -8,6 +8,7 @@ from typing import Any
 import streamlit as st
 
 from ui.backend_adapter import BackendAdapterError, get_available_documents, parse_recent_messages
+from ui.upload_manager import ALLOWED_EXTENSIONS, remove_uploaded_document, save_uploaded_files
 
 DEBUG_SECTIONS = [
     ("rewritten_query", "Rewritten Query"),
@@ -28,13 +29,79 @@ def initialize_session_state() -> None:
         "query": "",
         "conversation_summary": "",
         "recent_messages_json": "[]",
+        "selected_document_ids": [],
         "selected_documents": [],
+        "uploaded_documents": [],
         "use_mock_backend": True,
         "show_debug": True,
         "last_run": None,
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
+
+
+def _render_upload_controls() -> None:
+    """Render local upload controls and update uploaded-document session registry."""
+
+    st.sidebar.subheader("Upload legal documents")
+    uploaded_files = st.sidebar.file_uploader(
+        "Upload .pdf, .md, or .txt files",
+        type=sorted(ALLOWED_EXTENSIONS),
+        accept_multiple_files=True,
+        help="Files are stored locally in data/uploads for this test UI.",
+    )
+
+    if st.sidebar.button("Save uploaded files", use_container_width=True):
+        saved_documents, errors = save_uploaded_files(uploaded_files)
+
+        if saved_documents:
+            st.session_state.uploaded_documents.extend(saved_documents)
+            st.sidebar.success(f"Saved {len(saved_documents)} file(s) to local upload storage.")
+
+        for error in errors:
+            st.sidebar.error(error)
+
+        if not saved_documents and not errors:
+            st.sidebar.warning("No files were provided for upload.")
+
+        if saved_documents:
+            st.rerun()
+
+    uploaded_documents: list[dict[str, Any]] = st.session_state.uploaded_documents
+    if not uploaded_documents:
+        st.sidebar.caption("No uploaded documents yet.")
+        return
+
+    st.sidebar.markdown("**Uploaded documents**")
+    for doc in uploaded_documents:
+        st.sidebar.caption(f"• {doc['name']} ({doc.get('type', 'unknown')}, {doc.get('size_bytes', 0)} bytes)")
+
+    removable_ids = [doc["id"] for doc in uploaded_documents]
+    remove_id = st.sidebar.selectbox(
+        "Remove uploaded document",
+        options=[""] + removable_ids,
+        format_func=lambda doc_id: "Select a document" if not doc_id else doc_id,
+    )
+    if st.sidebar.button("Remove selected upload", use_container_width=True, disabled=not remove_id):
+        document = next((doc for doc in uploaded_documents if doc["id"] == remove_id), None)
+        if document is not None:
+            remove_uploaded_document(document)
+            st.session_state.uploaded_documents = [doc for doc in uploaded_documents if doc["id"] != remove_id]
+            st.session_state.selected_document_ids = [
+                doc_id for doc_id in st.session_state.selected_document_ids if doc_id != remove_id
+            ]
+            st.sidebar.success(f"Removed {remove_id}.")
+            st.rerun()
+
+    if st.sidebar.button("Clear all uploaded documents", use_container_width=True):
+        for document in uploaded_documents:
+            remove_uploaded_document(document)
+        st.session_state.uploaded_documents = []
+        st.session_state.selected_document_ids = [
+            doc_id for doc_id in st.session_state.selected_document_ids if not doc_id.startswith("uploaded:")
+        ]
+        st.sidebar.success("Cleared uploaded document list.")
+        st.rerun()
 
 
 def render_sidebar() -> dict[str, Any]:
@@ -48,23 +115,35 @@ def render_sidebar() -> dict[str, Any]:
     )
     st.session_state.use_mock_backend = use_mock_backend
 
-    available_documents = get_available_documents(use_mock_backend=use_mock_backend)
-    document_options = {doc["id"]: doc["name"] for doc in available_documents}
-    selected_documents = st.sidebar.multiselect(
+    _render_upload_controls()
+
+    available_documents = get_available_documents(
+        use_mock_backend=use_mock_backend,
+        uploaded_documents=st.session_state.uploaded_documents,
+    )
+    document_options = {doc["id"]: doc for doc in available_documents}
+
+    valid_defaults = [doc_id for doc_id in st.session_state.selected_document_ids if doc_id in document_options]
+    if len(valid_defaults) != len(st.session_state.selected_document_ids):
+        st.session_state.selected_document_ids = valid_defaults
+
+    selected_document_ids = st.sidebar.multiselect(
         "Selected legal documents",
         options=list(document_options.keys()),
-        default=st.session_state.selected_documents,
-        format_func=lambda doc_id: f"{document_options.get(doc_id, doc_id)} ({doc_id})",
-        help="Mock list now; replace in backend_adapter.get_available_documents for real index data.",
+        default=valid_defaults,
+        format_func=lambda doc_id: (
+            f"{document_options[doc_id]['name']} "
+            f"[{document_options[doc_id].get('source', 'unknown')}:{document_options[doc_id].get('type', 'n/a')}]"
+        ),
+        help=(
+            "Selected documents are passed to backend_adapter.run_backend_query(...) as "
+            "structured descriptors, including local uploaded file paths."
+        ),
     )
-    st.session_state.selected_documents = selected_documents
 
-    st.sidebar.subheader("Upload (placeholder)")
-    st.sidebar.file_uploader(
-        "Optional legal document upload (not wired in v1)",
-        type=["pdf", "md", "txt", "docx"],
-        disabled=True,
-    )
+    selected_documents = [document_options[doc_id] for doc_id in selected_document_ids]
+    st.session_state.selected_document_ids = selected_document_ids
+    st.session_state.selected_documents = selected_documents
 
     st.sidebar.subheader("Pipeline settings")
     show_debug = st.sidebar.toggle(
@@ -76,6 +155,19 @@ def render_sidebar() -> dict[str, Any]:
 
     if st.sidebar.button("Clear latest result", use_container_width=True):
         st.session_state.last_run = None
+
+    if show_debug and st.session_state.uploaded_documents:
+        with st.sidebar.expander("Debug: uploaded metadata", expanded=False):
+            compact_debug = [
+                {
+                    "id": doc.get("id"),
+                    "path": doc.get("path"),
+                    "type": doc.get("type"),
+                    "source": doc.get("source"),
+                }
+                for doc in st.session_state.uploaded_documents
+            ]
+            st.json(compact_debug, expanded=False)
 
     return {
         "use_mock_backend": use_mock_backend,

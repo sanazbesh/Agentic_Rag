@@ -9,15 +9,39 @@ from __future__ import annotations
 from typing import Any
 
 
-MOCK_DOCUMENTS: list[dict[str, str]] = [
-    {"id": "doc-nda-001", "name": "Mutual NDA (2024)"},
-    {"id": "doc-msa-017", "name": "Master Services Agreement"},
-    {"id": "doc-employment-003", "name": "Employment Agreement"},
-    {"id": "doc-dpa-009", "name": "Data Processing Addendum"},
+MOCK_DOCUMENTS: list[dict[str, Any]] = [
+    {
+        "id": "doc-nda-001",
+        "name": "Mutual NDA (2024)",
+        "path": "mock://mutual_nda_2024",
+        "type": "mock",
+        "source": "mock",
+    },
+    {
+        "id": "doc-msa-017",
+        "name": "Master Services Agreement",
+        "path": "mock://msa_017",
+        "type": "mock",
+        "source": "mock",
+    },
+    {
+        "id": "doc-employment-003",
+        "name": "Employment Agreement",
+        "path": "mock://employment_003",
+        "type": "mock",
+        "source": "mock",
+    },
+    {
+        "id": "doc-dpa-009",
+        "name": "Data Processing Addendum",
+        "path": "mock://dpa_009",
+        "type": "mock",
+        "source": "mock",
+    },
 ]
 
 
-def get_mock_documents() -> list[dict[str, str]]:
+def get_mock_documents() -> list[dict[str, Any]]:
     """Return mock documents for sidebar selection."""
 
     return MOCK_DOCUMENTS
@@ -28,7 +52,7 @@ def run_mock_backend_query(
     query: str,
     conversation_summary: str | None,
     recent_messages: list[dict[str, Any]] | None,
-    selected_documents: list[str] | None,
+    selected_documents: list[dict[str, Any]] | None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Return a mock final result and debug payload using the real schema."""
 
@@ -79,11 +103,15 @@ def run_mock_backend_query(
             "warnings": [],
         }
 
+    selected_document_ids = [doc.get("id") for doc in (selected_documents or []) if isinstance(doc, dict)]
+    selected_document_paths = [doc.get("path") for doc in (selected_documents or []) if isinstance(doc, dict)]
+
     debug_payload: dict[str, Any] = {
         "rewritten_query": "Summarize liability cap and carve-outs in selected legal agreements.",
         "extracted_entities": ["liability cap", "carve-outs", "MSA", "confidentiality"],
         "filters": {
-            "selected_documents": selected_documents or [],
+            "selected_documents": selected_document_ids,
+            "selected_document_paths": selected_document_paths,
             "jurisdiction": "US",
             "document_type": ["contract"],
         },
