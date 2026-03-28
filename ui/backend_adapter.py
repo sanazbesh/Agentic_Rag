@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
 from ui.mock_backend import get_mock_documents, run_mock_backend_query
+from ui.upload_manager import register_uploaded_documents
 
 REQUIRED_FINAL_FIELDS = {"answer_text", "grounded", "sufficient_context", "citations", "warnings"}
 
@@ -95,21 +96,31 @@ def get_available_documents(
     *,
     use_mock_backend: bool | None = None,
     use_mock: bool | None = None,
-) -> list[dict[str, str]]:
+    uploaded_documents: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     """Return documents for sidebar selection.
 
-    Real backend document listing can be wired here later.
+    Document descriptor contract (v1):
+    ``{"id", "name", "path", "type", "source", ...}``
+
+    Current sources are:
+    - uploaded local documents
+    - mock backend documents (when mock mode is enabled)
+
+    Real backend document listing can be merged here later.
     """
     if use_mock_backend is None and use_mock is None:
         raise BackendAdapterError("Expected `use_mock_backend` (or legacy `use_mock`) argument.")
 
     mock_mode = use_mock_backend if use_mock_backend is not None else use_mock
 
-    if mock_mode:
-        return get_mock_documents()
+    documents: list[dict[str, Any]] = []
+    documents.extend(uploaded_documents or [])
 
-    # Real-mode placeholder. Replace with your indexed document listing call.
-    return []
+    if mock_mode:
+        documents.extend(get_mock_documents())
+
+    return documents
 
 
 def run_backend_query(
@@ -117,18 +128,24 @@ def run_backend_query(
     query: str,
     conversation_summary: str | None,
     recent_messages: list[dict[str, Any]] | None,
-    selected_documents: list[str] | None,
+    selected_documents: list[dict[str, Any]] | None,
     use_mock_backend: bool,
     real_backend_runner: Callable[..., Any] | None = None,
     real_debug_runner: Callable[..., Any] | None = None,
 ) -> BackendQueryResponse:
     """Run query against mock or real backend.
 
+    `selected_documents` is a list of stable document descriptors from the UI,
+    including uploaded local files. Real backend wiring can consume descriptor
+    metadata directly (e.g., ``path``) for ingestion/retrieval handoff.
+
     Real mode supports two integration options:
     1) `real_backend_runner`: callable returning final result model/object.
     2) `real_debug_runner`: optional callable returning full debug/state object.
        If present, this adapter stores that output in `debug_payload`.
     """
+
+    register_uploaded_documents(selected_documents or [])
 
     if use_mock_backend:
         final_result, debug_payload = run_mock_backend_query(
