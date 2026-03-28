@@ -152,7 +152,12 @@ def main() -> None:
 
     initialize_session_state()
 
-    sidebar_state = render_sidebar()
+    real_backend_runner, real_debug_runner, real_backend_wiring_error = build_real_backend_runners()
+
+    sidebar_state = render_sidebar(
+        real_backend_available=real_backend_runner is not None,
+        real_backend_wiring_error=real_backend_wiring_error,
+    )
     input_state = render_query_input()
 
     if input_state["recent_messages_parse_error"]:
@@ -164,7 +169,6 @@ def main() -> None:
         elif input_state["recent_messages_parse_error"]:
             st.warning("Please fix recent_messages JSON before running.")
         else:
-            real_backend_runner, real_debug_runner, real_backend_wiring_error = build_real_backend_runners()
             if not sidebar_state["use_mock_backend"] and real_backend_runner is None:
                 st.warning(real_backend_wiring_error or "Real backend mode is enabled, but no backend is wired.")
                 logger.warning("real_backend_not_wired reason=%s", real_backend_wiring_error)

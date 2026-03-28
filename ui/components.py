@@ -105,15 +105,27 @@ def _render_upload_controls() -> None:
         st.rerun()
 
 
-def render_sidebar() -> dict[str, Any]:
+def render_sidebar(
+    *,
+    real_backend_available: bool,
+    real_backend_wiring_error: str | None,
+) -> dict[str, Any]:
     """Render sidebar controls and return selected options."""
 
     st.sidebar.header("RAG Controls")
     use_mock_backend = st.sidebar.toggle(
         "Use mock backend",
         value=st.session_state.use_mock_backend,
+        disabled=not real_backend_available,
         help="Turn off to use your real run_legal_rag_turn wiring.",
     )
+    if not real_backend_available:
+        use_mock_backend = True
+        st.sidebar.caption(
+            "Real backend unavailable in this session. "
+            f"Reason: {real_backend_wiring_error or 'not configured'}."
+        )
+
     st.session_state.use_mock_backend = use_mock_backend
 
     _render_upload_controls()
