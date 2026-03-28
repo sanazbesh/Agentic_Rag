@@ -91,13 +91,21 @@ def parse_recent_messages(raw_text: str) -> list[dict[str, Any]] | None:
     return parsed
 
 
-def get_available_documents(use_mock: bool) -> list[dict[str, str]]:
+def get_available_documents(
+    *,
+    use_mock_backend: bool | None = None,
+    use_mock: bool | None = None,
+) -> list[dict[str, str]]:
     """Return documents for sidebar selection.
 
     Real backend document listing can be wired here later.
     """
+    if use_mock_backend is None and use_mock is None:
+        raise BackendAdapterError("Expected `use_mock_backend` (or legacy `use_mock`) argument.")
 
-    if use_mock:
+    mock_mode = use_mock_backend if use_mock_backend is not None else use_mock
+
+    if mock_mode:
         return get_mock_documents()
 
     # Real-mode placeholder. Replace with your indexed document listing call.
