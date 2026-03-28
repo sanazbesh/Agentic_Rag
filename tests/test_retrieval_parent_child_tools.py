@@ -2,15 +2,21 @@ from __future__ import annotations
 
 from agentic_rag.retrieval import (
     ChunkReranker,
+    DenseChildSearchService,
     ChildChunkSearcher,
     HybridSearchResult,
+    HybridSearchService,
     InMemoryChildChunkRepository,
     InMemoryKeywordChunkRepository,
     InMemoryParentChunkRepository,
+    KeywordChunkRepository,
     KeywordSearchService,
     ParentChildRetrievalTools,
     ParentChunkStore,
+    RRFFuser,
     RerankedChunkResult,
+    SparseChildSearchService,
+    VectorSearchService,
 )
 
 
@@ -184,22 +190,38 @@ def test_hybrid_search_returns_structured_results() -> None:
     assert first.child_chunk_id
     assert first.parent_chunk_id
     assert first.document_id
-    assert isinstance(first.combined_score, float)
-    assert isinstance(first.vector_score, float)
-    assert isinstance(first.keyword_score, float)
+    assert isinstance(first.hybrid_score, float)
+    assert isinstance(first.matched_in_dense, bool)
+    assert isinstance(first.matched_in_sparse, bool)
+    assert (first.dense_score is None) or isinstance(first.dense_score, float)
+    assert (first.sparse_score is None) or isinstance(first.sparse_score, float)
     assert isinstance(first.payload, dict)
 
 
-def test_hybrid_search_combines_vector_and_keyword_results() -> None:
+def test_hybrid_search_combines_dense_and_sparse_results() -> None:
     toolkit = _toolkit()
 
     results = toolkit.hybrid_search("contract")
 
     assert results
     top = results[0]
-    assert top.vector_score > 0.0
-    assert top.keyword_score > 0.0
-    assert top.combined_score > 0.0
+    assert top.dense_score is not None and top.dense_score > 0.0
+    assert top.sparse_score is not None and top.sparse_score > 0.0
+    assert top.hybrid_score > 0.0
+
+
+def test_hybrid_search_rrf_scoring_correctness() -> None:
+    toolkit = _toolkit()
+
+    results = toolkit.hybrid_search("duty damages", top_k=10)
+
+    by_id = {item.child_chunk_id: item for item in results}
+    assert "child-1" in by_id and "child-2" in by_id
+
+    expected_child_1 = (1.0 / (60 + 1)) + (1.0 / (60 + 2))
+    expected_child_2 = (1.0 / (60 + 2)) + (1.0 / (60 + 1))
+    assert abs(by_id["child-1"].hybrid_score - expected_child_1) < 1e-12
+    assert abs(by_id["child-2"].hybrid_score - expected_child_2) < 1e-12
 
 
 def test_hybrid_search_deduplicates_overlapping_results() -> None:
@@ -209,6 +231,38 @@ def test_hybrid_search_deduplicates_overlapping_results() -> None:
 
     ids = [item.child_chunk_id for item in results]
     assert len(ids) == len(set(ids))
+
+
+def test_hybrid_search_deduplicates_duplicates_within_source_list() -> None:
+    records = [
+        {
+            "id": "dup",
+            "text": "Duty appears once.",
+            "payload": {"parent_chunk_id": "p1", "document_id": "d1", "jurisdiction": "NY"},
+        },
+        {
+            "id": "dup",
+            "text": "Duty appears duplicated.",
+            "payload": {"parent_chunk_id": "p1b", "document_id": "d1b", "jurisdiction": "NY"},
+        },
+    ]
+    service = HybridSearchService(
+        dense_service=DenseChildSearchService(
+            vector_service=VectorSearchService(
+                child_searcher=ChildChunkSearcher(repository=InMemoryChildChunkRepository(records), default_limit=10)
+            )
+        ),
+        sparse_service=SparseChildSearchService(
+            keyword_service=KeywordSearchService(
+                repository=InMemoryKeywordChunkRepository(records),
+                default_limit=10,
+            )
+        ),
+        fuser=RRFFuser(rrf_k=60),
+    )
+    results = service.search("duty", top_k=10)
+    assert [item.child_chunk_id for item in results] == ["dup"]
+    assert results[0].parent_chunk_id == "p1"
 
 
 def test_hybrid_search_respects_filters_none() -> None:
@@ -226,6 +280,126 @@ def test_hybrid_search_handles_empty_and_no_result_cases() -> None:
     assert toolkit.hybrid_search("") == []
     assert toolkit.hybrid_search("   ") == []
     assert toolkit.hybrid_search("res ipsa loquitur") == []
+
+
+def test_hybrid_search_dense_only_fallback_when_sparse_fails() -> None:
+    class FailingKeywordRepository(KeywordChunkRepository):
+        def search_keyword(self, query: str, *, filters=None, limit: int = 10):  # type: ignore[override]
+            raise RuntimeError("sparse unavailable")
+
+    records = [
+        {"id": "child-1", "text": "duty damages", "payload": {"parent_chunk_id": "p1", "document_id": "d1"}}
+    ]
+    service = HybridSearchService(
+        dense_service=DenseChildSearchService(
+            vector_service=VectorSearchService(
+                child_searcher=ChildChunkSearcher(repository=InMemoryChildChunkRepository(records), default_limit=5)
+            )
+        ),
+        sparse_service=SparseChildSearchService(
+            keyword_service=KeywordSearchService(repository=FailingKeywordRepository(), default_limit=5)
+        ),
+    )
+    results = service.search("duty", top_k=5)
+    assert len(results) == 1
+    assert results[0].matched_in_dense is True
+    assert results[0].matched_in_sparse is False
+
+
+def test_hybrid_search_sparse_only_fallback_when_dense_fails() -> None:
+    class FailingChildRepository(InMemoryChildChunkRepository):
+        def search(self, query: str, *, filters=None, limit: int = 10):  # type: ignore[override]
+            raise RuntimeError("dense unavailable")
+
+    records = [
+        {"id": "child-2", "text": "negligence duty", "payload": {"parent_chunk_id": "p2", "document_id": "d2"}}
+    ]
+    service = HybridSearchService(
+        dense_service=DenseChildSearchService(
+            vector_service=VectorSearchService(
+                child_searcher=ChildChunkSearcher(repository=FailingChildRepository(records), default_limit=5)
+            )
+        ),
+        sparse_service=SparseChildSearchService(
+            keyword_service=KeywordSearchService(
+                repository=InMemoryKeywordChunkRepository(records),
+                default_limit=5,
+            )
+        ),
+    )
+    results = service.search("duty", top_k=5)
+    assert len(results) == 1
+    assert results[0].matched_in_dense is False
+    assert results[0].matched_in_sparse is True
+
+
+def test_hybrid_search_both_empty_returns_empty() -> None:
+    toolkit = _toolkit()
+    assert toolkit.hybrid_search("no overlap phrase", top_k=5) == []
+
+
+def test_hybrid_search_deterministic_tie_break() -> None:
+    records = [
+        {"id": "a", "text": "alpha", "payload": {"parent_chunk_id": "p-a", "document_id": "d-a"}},
+        {"id": "b", "text": "beta", "payload": {"parent_chunk_id": "p-b", "document_id": "d-b"}},
+    ]
+    service = HybridSearchService(
+        dense_service=DenseChildSearchService(
+            vector_service=VectorSearchService(
+                child_searcher=ChildChunkSearcher(repository=InMemoryChildChunkRepository(records), default_limit=2)
+            )
+        ),
+        sparse_service=SparseChildSearchService(
+            keyword_service=KeywordSearchService(repository=InMemoryKeywordChunkRepository(records), default_limit=2)
+        ),
+    )
+    # query matches neither term; each source returns [] so force tie via direct fuser impossible here.
+    # Use direct fuser inputs instead for deterministic tie by child id.
+    dense_hits = [
+        service.dense_service.search("alpha", limit=2),
+        service.dense_service.search("beta", limit=2),
+    ]
+    tied = RRFFuser(rrf_k=60).fuse(
+        dense_results=[dense_hits[0][0]],
+        sparse_results=[dense_hits[1][0]],
+        top_k=10,
+    )
+    assert [item.child_chunk_id for item in tied] == ["a", "b"]
+
+
+def test_hybrid_search_filter_behavior() -> None:
+    toolkit = _toolkit()
+    results = toolkit.hybrid_search("duty", filters={"jurisdiction": "NY"}, top_k=10)
+    assert [item.child_chunk_id for item in results] == ["child-1"]
+
+
+def test_hybrid_search_top_k_enforced() -> None:
+    toolkit = _toolkit()
+    results = toolkit.hybrid_search("duty damages", top_k=1)
+    assert len(results) == 1
+
+
+def test_hybrid_search_preserves_metadata_for_parent_lookup() -> None:
+    toolkit = _toolkit()
+    results = toolkit.hybrid_search("breach duty damages", top_k=10)
+    assert results
+    first = results[0]
+    assert first.parent_chunk_id
+    assert first.document_id
+    assert first.text
+    assert "jurisdiction" in first.metadata
+
+
+def test_hybrid_search_non_llm_deterministic_infrastructure() -> None:
+    toolkit = _toolkit()
+    first = toolkit.hybrid_search("  duty damages  ", top_k=10)
+    second = toolkit.hybrid_search("duty damages", top_k=10)
+    assert first == second
+
+
+def test_hybrid_search_returns_empty_for_non_positive_top_k() -> None:
+    toolkit = _toolkit()
+    assert toolkit.hybrid_search("duty", top_k=0) == []
 
 
 def test_rerank_chunks_returns_sorted_results() -> None:

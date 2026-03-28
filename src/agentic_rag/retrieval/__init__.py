@@ -3,10 +3,12 @@
 from .interfaces import QueryRewriter, Retriever, Reranker
 from .parent_child import (
     ChunkReranker,
-    ChildChunkRepository,
     ChildChunkSearcher,
     ChildSearchResult,
+    ChildChunkRepository,
+    DenseChildSearchService,
     HybridSearchResult,
+    HybridSearchService,
     InMemoryChildChunkRepository,
     InMemoryKeywordChunkRepository,
     InMemoryParentChunkRepository,
@@ -16,8 +18,11 @@ from .parent_child import (
     ParentChunkRepository,
     ParentChunkResult,
     ParentChunkStore,
+    RRFFuser,
     RerankedChunkResult,
+    SparseChildSearchService,
     VectorSearchService,
+    hybrid_search,
 )
 from .sparse import SparseSearchResult, SparseSearchService, search_child_chunks_sparse
 
@@ -29,8 +34,12 @@ __all__ = [
     "ParentChunkRepository",
     "ChildChunkSearcher",
     "VectorSearchService",
+    "DenseChildSearchService",
     "KeywordChunkRepository",
     "KeywordSearchService",
+    "SparseChildSearchService",
+    "RRFFuser",
+    "HybridSearchService",
     "ChunkReranker",
     "ParentChunkStore",
     "ParentChildRetrievalTools",
@@ -41,6 +50,7 @@ __all__ = [
     "InMemoryChildChunkRepository",
     "InMemoryKeywordChunkRepository",
     "InMemoryParentChunkRepository",
+    "hybrid_search",
     "SparseSearchResult",
     "SparseSearchService",
     "search_child_chunks_sparse",

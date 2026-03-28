@@ -6,10 +6,18 @@ parent chunks are fetched as larger context units for later LLM use.
 
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
+
+try:
+    from pydantic import BaseModel, ConfigDict, Field
+except Exception:  # pragma: no cover - fallback for constrained test envs
+    from agentic_rag._compat_pydantic import BaseModel, ConfigDict, Field
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True, frozen=True)
@@ -24,23 +32,36 @@ class ChildSearchResult:
     payload: Mapping[str, Any] = field(default_factory=dict)
 
 
-@dataclass(slots=True, frozen=True)
-class HybridSearchResult:
-    """Combined vector + keyword hit used by ``hybrid_search``.
+class HybridSearchResult(BaseModel):
+    """Fused child-chunk hit for legal hybrid retrieval.
 
-    Hybrid retrieval improves legal search quality by mixing semantic recall
-    (vector search) with exact-term precision (keyword search for statutes,
-    clauses, and term-of-art matches).
+    Legal search benefits from combining dense semantic retrieval with sparse
+    lexical retrieval because citations and term-of-art phrases often require
+    exact matching while factual paraphrases benefit from semantic matching.
+    This result model preserves both source-specific signals and parent linkage
+    metadata required for downstream parent expansion and reranking.
     """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     child_chunk_id: str
     parent_chunk_id: str
     document_id: str
     text: str
-    combined_score: float
-    vector_score: float = 0.0
-    keyword_score: float = 0.0
-    payload: Mapping[str, Any] = field(default_factory=dict)
+    hybrid_score: float
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    dense_score: float | None = None
+    sparse_score: float | None = None
+    dense_rank: int | None = None
+    sparse_rank: int | None = None
+    matched_in_dense: bool = False
+    matched_in_sparse: bool = False
+
+    @property
+    def payload(self) -> Mapping[str, Any]:
+        """Backward-compatible alias for existing pipeline code."""
+
+        return self.metadata
 
 
 @dataclass(slots=True, frozen=True)
@@ -150,6 +171,23 @@ class VectorSearchService:
 
 
 @dataclass(slots=True)
+class DenseChildSearchService:
+    """Dense semantic child-chunk retrieval facade."""
+
+    vector_service: VectorSearchService
+
+    def search(
+        self,
+        query: str,
+        *,
+        filters: Mapping[str, Any] | None = None,
+        limit: int,
+    ) -> list[ChildSearchResult]:
+        results = self.vector_service.search(query=query, filters=filters)
+        return results[: max(0, limit)]
+
+
+@dataclass(slots=True)
 class KeywordSearchService:
     """Keyword retrieval service abstraction (BM25-compatible interface)."""
 
@@ -168,80 +206,210 @@ class KeywordSearchService:
 
 
 @dataclass(slots=True)
-class HybridSearchService:
-    """Fuses vector and keyword retrieval into a single ranked list."""
+class SparseChildSearchService:
+    """Sparse/BM25 child-chunk retrieval facade."""
 
-    vector_service: VectorSearchService
     keyword_service: KeywordSearchService
-    vector_weight: float = 0.6
-    keyword_weight: float = 0.4
 
     def search(
         self,
         query: str,
         *,
         filters: Mapping[str, Any] | None = None,
+        limit: int,
+    ) -> list[ChildSearchResult]:
+        results = self.keyword_service.search(query=query, filters=filters)
+        return results[: max(0, limit)]
+
+
+@dataclass(slots=True)
+class RRFFuser:
+    """Reciprocal Rank Fusion (RRF) over dense + sparse child chunk result lists.
+
+    RRF is used instead of raw score addition because dense and sparse scores
+    are not naturally comparable across scales. Rank-only fusion is robust,
+    deterministic, and easy to reason about.
+    """
+
+    rrf_k: int = 60
+
+    def fuse(
+        self,
+        *,
+        dense_results: Sequence[ChildSearchResult],
+        sparse_results: Sequence[ChildSearchResult],
+        top_k: int,
+    ) -> list[HybridSearchResult]:
+        if top_k <= 0:
+            return []
+
+        dense_ranked = _dedupe_by_child_chunk_id(dense_results)
+        sparse_ranked = _dedupe_by_child_chunk_id(sparse_results)
+
+        merged: dict[str, dict[str, Any]] = {}
+        self._merge_source(
+            merged=merged,
+            source_results=dense_ranked,
+            source_name="dense",
+        )
+        self._merge_source(
+            merged=merged,
+            source_results=sparse_ranked,
+            source_name="sparse",
+        )
+
+        fused_results = [
+            HybridSearchResult(
+                child_chunk_id=record["child_chunk_id"],
+                parent_chunk_id=record["parent_chunk_id"],
+                document_id=record["document_id"],
+                text=record["text"],
+                metadata=record["metadata"],
+                dense_score=record["dense_score"],
+                sparse_score=record["sparse_score"],
+                dense_rank=record["dense_rank"],
+                sparse_rank=record["sparse_rank"],
+                matched_in_dense=record["matched_in_dense"],
+                matched_in_sparse=record["matched_in_sparse"],
+                hybrid_score=float(record["hybrid_score"]),
+            )
+            for record in merged.values()
+        ]
+
+        fused_results.sort(
+            key=lambda item: (
+                -item.hybrid_score,
+                -_matched_source_count(item),
+                _best_rank(item),
+                item.child_chunk_id,
+            )
+        )
+        return fused_results[:top_k]
+
+    def _merge_source(
+        self,
+        *,
+        merged: dict[str, dict[str, Any]],
+        source_results: Sequence[ChildSearchResult],
+        source_name: str,
+    ) -> None:
+        for rank, hit in enumerate(source_results, start=1):
+            existing = merged.get(hit.child_chunk_id)
+            if existing is None:
+                existing = _init_merged_record(hit)
+                merged[hit.child_chunk_id] = existing
+
+            _merge_core_fields(existing=existing, incoming=hit)
+            if source_name == "dense":
+                existing["dense_score"] = hit.score
+                existing["dense_rank"] = rank
+                existing["matched_in_dense"] = True
+            else:
+                existing["sparse_score"] = hit.score
+                existing["sparse_rank"] = rank
+                existing["matched_in_sparse"] = True
+            existing["hybrid_score"] += 1.0 / float(self.rrf_k + rank)
+
+
+@dataclass(slots=True)
+class HybridSearchService:
+    """Runs dense+sparse retrieval and fuses ranks with RRF.
+
+    ``search`` is intentionally thin: it orchestrates candidate retrieval and
+    delegates fusion to :class:`RRFFuser`.
+    """
+
+    dense_service: DenseChildSearchService
+    sparse_service: SparseChildSearchService
+    fuser: RRFFuser = field(default_factory=RRFFuser)
+    default_top_k: int = 10
+    default_dense_top_k: int = 20
+    default_sparse_top_k: int = 20
+    max_candidate_pool: int = 500
+
+    def search(
+        self,
+        query: str,
+        *,
+        filters: Mapping[str, Any] | None = None,
+        top_k: int | None = None,
+        dense_top_k: int | None = None,
+        sparse_top_k: int | None = None,
     ) -> list[HybridSearchResult]:
         if not query or not query.strip():
             return []
-
-        vector_hits = self.vector_service.search(query=query, filters=filters)
-        keyword_hits = self.keyword_service.search(query=query, filters=filters)
-        if not vector_hits and not keyword_hits:
+        effective_top_k = self.default_top_k if top_k is None else max(0, top_k)
+        if effective_top_k <= 0:
             return []
 
-        normalized_vector = _normalize_scores(vector_hits)
-        normalized_keyword = _normalize_scores(keyword_hits)
-
-        merged: dict[str, HybridSearchResult] = {}
-        for hit in vector_hits:
-            vec_score = normalized_vector.get(hit.child_chunk_id, 0.0)
-            merged[hit.child_chunk_id] = HybridSearchResult(
-                child_chunk_id=hit.child_chunk_id,
-                parent_chunk_id=hit.parent_chunk_id,
-                document_id=hit.document_id,
-                text=hit.text,
-                combined_score=(self.vector_weight * vec_score),
-                vector_score=hit.score,
-                keyword_score=0.0,
-                payload=dict(hit.payload),
-            )
-
-        for hit in keyword_hits:
-            key_score = normalized_keyword.get(hit.child_chunk_id, 0.0)
-            existing = merged.get(hit.child_chunk_id)
-            if existing is None:
-                merged[hit.child_chunk_id] = HybridSearchResult(
-                    child_chunk_id=hit.child_chunk_id,
-                    parent_chunk_id=hit.parent_chunk_id,
-                    document_id=hit.document_id,
-                    text=hit.text,
-                    combined_score=(self.keyword_weight * key_score),
-                    vector_score=0.0,
-                    keyword_score=hit.score,
-                    payload=dict(hit.payload),
-                )
-                continue
-
-            merged[hit.child_chunk_id] = HybridSearchResult(
-                child_chunk_id=existing.child_chunk_id,
-                parent_chunk_id=existing.parent_chunk_id,
-                document_id=existing.document_id,
-                text=existing.text,
-                combined_score=existing.combined_score + (self.keyword_weight * key_score),
-                vector_score=existing.vector_score,
-                keyword_score=hit.score,
-                payload=existing.payload,
-            )
-
-        return sorted(
-            merged.values(),
-            key=lambda item: (
-                -item.combined_score,
-                -(1 if item.vector_score > 0 else 0),
-                item.child_chunk_id,
-            ),
+        dense_limit = _resolve_candidate_limit(
+            requested=dense_top_k,
+            fallback=self.default_dense_top_k,
+            top_k=effective_top_k,
+            max_limit=self.max_candidate_pool,
         )
+        sparse_limit = _resolve_candidate_limit(
+            requested=sparse_top_k,
+            fallback=self.default_sparse_top_k,
+            top_k=effective_top_k,
+            max_limit=self.max_candidate_pool,
+        )
+
+        normalized_query = query.strip()
+        logger.info(
+            "hybrid_search_started query_length=%s top_k=%s dense_top_k=%s sparse_top_k=%s",
+            len(normalized_query),
+            effective_top_k,
+            dense_limit,
+            sparse_limit,
+        )
+
+        dense_hits: list[ChildSearchResult] = []
+        sparse_hits: list[ChildSearchResult] = []
+        dense_error = False
+        sparse_error = False
+
+        try:
+            dense_hits = self.dense_service.search(
+                query=normalized_query,
+                filters=filters,
+                limit=dense_limit,
+            )
+        except Exception as exc:  # pragma: no cover - defensive path
+            dense_error = True
+            logger.warning("hybrid_search_dense_failed error=%s", exc)
+
+        try:
+            sparse_hits = self.sparse_service.search(
+                query=normalized_query,
+                filters=filters,
+                limit=sparse_limit,
+            )
+        except Exception as exc:  # pragma: no cover - defensive path
+            sparse_error = True
+            logger.warning("hybrid_search_sparse_failed error=%s", exc)
+
+        logger.info(
+            "hybrid_search_candidates dense_count=%s sparse_count=%s",
+            len(dense_hits),
+            len(sparse_hits),
+        )
+
+        if dense_error and sparse_error:
+            logger.warning("hybrid_search_both_sources_failed")
+            return []
+
+        fused = self.fuser.fuse(
+            dense_results=dense_hits,
+            sparse_results=sparse_hits,
+            top_k=effective_top_k,
+        )
+        logger.info(
+            "hybrid_search_completed fused_unique_count=%s returned_count=%s",
+            len({item.child_chunk_id for item in fused}),
+            len(fused),
+        )
+        return fused
 
 
 @dataclass(slots=True)
@@ -337,16 +505,17 @@ class ParentChildRetrievalTools:
         self,
         query: str,
         filters: Mapping[str, Any] | None = None,
+        top_k: int = 10,
     ) -> list[HybridSearchResult]:
         """Tool: fuse vector and keyword retrieval for legal-domain recall + precision."""
 
         if self.keyword_search_service is None:
             return []
         hybrid_service = HybridSearchService(
-            vector_service=VectorSearchService(self.child_searcher),
-            keyword_service=self.keyword_search_service,
+            dense_service=DenseChildSearchService(vector_service=VectorSearchService(self.child_searcher)),
+            sparse_service=SparseChildSearchService(keyword_service=self.keyword_search_service),
         )
-        return hybrid_service.search(query=query, filters=filters)
+        return hybrid_service.search(query=query, filters=filters, top_k=top_k)
 
     def rerank_chunks(
         self,
@@ -490,6 +659,42 @@ class InMemoryParentChunkRepository(ParentChunkRepository):
         return output
 
 
+def hybrid_search(
+    query: str,
+    *,
+    dense_service: DenseChildSearchService,
+    sparse_service: SparseChildSearchService,
+    filters: Mapping[str, Any] | None = None,
+    top_k: int = 10,
+    dense_top_k: int | None = None,
+    sparse_top_k: int | None = None,
+    rrf_k: int = 60,
+    max_candidate_pool: int = 500,
+) -> list[HybridSearchResult]:
+    """Run child-chunk hybrid retrieval with deterministic Reciprocal Rank Fusion.
+
+    Dense and sparse retrieval scores are not directly comparable in legal RAG;
+    RRF fuses rank positions from both sources into one stable final list.
+    """
+
+    service = HybridSearchService(
+        dense_service=dense_service,
+        sparse_service=sparse_service,
+        fuser=RRFFuser(rrf_k=rrf_k),
+        default_top_k=top_k,
+        default_dense_top_k=20,
+        default_sparse_top_k=20,
+        max_candidate_pool=max_candidate_pool,
+    )
+    return service.search(
+        query=query,
+        filters=filters,
+        top_k=top_k,
+        dense_top_k=dense_top_k,
+        sparse_top_k=sparse_top_k,
+    )
+
+
 def _parent_from_record(parent_id: str, record: Mapping[str, Any]) -> ParentChunkResult:
     heading_path_val = record.get("heading_path", ())
     if isinstance(heading_path_val, Sequence) and not isinstance(heading_path_val, (str, bytes)):
@@ -564,22 +769,74 @@ def _keyword_score_text(text: str, tokens: Sequence[str]) -> float:
     return score / float(len(tokens))
 
 
-def _normalize_scores(results: Sequence[ChildSearchResult]) -> dict[str, float]:
-    if not results:
-        return {}
-    max_score = max(item.score for item in results)
-    min_score = min(item.score for item in results)
-    if max_score == min_score:
-        return {item.child_chunk_id: 1.0 for item in results}
-    denom = max_score - min_score
-    return {item.child_chunk_id: (item.score - min_score) / denom for item in results}
+def _resolve_candidate_limit(
+    *,
+    requested: int | None,
+    fallback: int,
+    top_k: int,
+    max_limit: int,
+) -> int:
+    limit = fallback if requested is None else requested
+    limit = max(limit, top_k)
+    return min(limit, max_limit)
+
+
+def _dedupe_by_child_chunk_id(results: Sequence[ChildSearchResult]) -> list[ChildSearchResult]:
+    deduped: dict[str, ChildSearchResult] = {}
+    for result in results:
+        if result.child_chunk_id not in deduped:
+            deduped[result.child_chunk_id] = result
+    return list(deduped.values())
+
+
+def _init_merged_record(hit: ChildSearchResult) -> dict[str, Any]:
+    return {
+        "child_chunk_id": hit.child_chunk_id,
+        "parent_chunk_id": hit.parent_chunk_id,
+        "document_id": hit.document_id,
+        "text": hit.text,
+        "metadata": dict(hit.payload),
+        "dense_score": None,
+        "sparse_score": None,
+        "dense_rank": None,
+        "sparse_rank": None,
+        "matched_in_dense": False,
+        "matched_in_sparse": False,
+        "hybrid_score": 0.0,
+    }
+
+
+def _merge_core_fields(*, existing: dict[str, Any], incoming: ChildSearchResult) -> None:
+    # Deterministic merge rule:
+    # 1) Keep first-seen identifiers/text unless missing.
+    # 2) Merge metadata dictionaries with first-seen keys preserved.
+    if not existing["parent_chunk_id"] and incoming.parent_chunk_id:
+        existing["parent_chunk_id"] = incoming.parent_chunk_id
+    if not existing["document_id"] and incoming.document_id:
+        existing["document_id"] = incoming.document_id
+    if not existing["text"] and incoming.text:
+        existing["text"] = incoming.text
+
+    incoming_metadata = dict(incoming.payload)
+    metadata = dict(incoming_metadata)
+    metadata.update(existing["metadata"])
+    existing["metadata"] = metadata
+
+
+def _matched_source_count(item: HybridSearchResult) -> int:
+    return int(item.matched_in_dense) + int(item.matched_in_sparse)
+
+
+def _best_rank(item: HybridSearchResult) -> int:
+    ranks = [rank for rank in (item.dense_rank, item.sparse_rank) if rank is not None]
+    return min(ranks) if ranks else 10**9
 
 
 def _extract_original_score(
     chunk: ChildSearchResult | HybridSearchResult | RerankedChunkResult,
 ) -> float:
     if isinstance(chunk, HybridSearchResult):
-        return chunk.combined_score
+        return chunk.hybrid_score
     if isinstance(chunk, RerankedChunkResult):
         return chunk.rerank_score
     return chunk.score
