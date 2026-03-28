@@ -1,0 +1,340 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+
+from agentic_rag.orchestration.legal_rag_graph import (
+    FinalAnswerModel,
+    LegalRagDependencies,
+    build_full_legal_rag_graph,
+    default_legal_rag_state,
+    run_legal_rag_turn,
+)
+from agentic_rag.orchestration.retrieval_graph import QueryRoutingDecision, RetrievalDependencies, RetrievalGraphConfig
+from agentic_rag.retrieval.parent_child import HybridSearchResult, ParentChunkResult, RerankedChunkResult
+from agentic_rag.tools.answer_generation import AnswerCitation, GenerateAnswerResult
+from agentic_rag.tools.context_processing import CompressContextResult, CompressedParentChunk
+from agentic_rag.tools.query_intelligence import LegalEntityExtractionResult, LegalEntityFilters, QueryRewriteResult
+
+
+@dataclass
+class FakeServices:
+    classifier: QueryRoutingDecision
+    rewritten_query: str = ""
+    hybrid_results: list[HybridSearchResult] = field(default_factory=list)
+    reranked_results: list[RerankedChunkResult] = field(default_factory=list)
+    parent_results: list[ParentChunkResult] = field(default_factory=list)
+    compressed_items: list[CompressedParentChunk] = field(default_factory=list)
+
+    answer_result: object | None = None
+    answer_raises: bool = False
+
+    answer_calls: list[dict[str, Any]] = field(default_factory=list)
+
+    def retrieval_dependencies(self) -> RetrievalDependencies:
+        return RetrievalDependencies(
+            rewrite_query=self.rewrite_query,
+            extract_legal_entities=self.extract_legal_entities,
+            hybrid_search=self.hybrid_search,
+            rerank_chunks=self.rerank_chunks,
+            retrieve_parent_chunks=self.retrieve_parent_chunks,
+            compress_context=self.compress_context,
+            classify_query_state=self.classify,
+        )
+
+    def as_dependencies(self) -> LegalRagDependencies:
+        return LegalRagDependencies(
+            retrieval=self.retrieval_dependencies(),
+            generate_grounded_answer=self.generate_answer,
+        )
+
+    def classify(self, *_: Any, **__: Any) -> QueryRoutingDecision:
+        return self.classifier
+
+    def rewrite_query(self, query: str, **_: Any) -> QueryRewriteResult:
+        return QueryRewriteResult(
+            original_query=query,
+            rewritten_query=self.rewritten_query or query,
+            used_conversation_context=False,
+            rewrite_notes="test",
+        )
+
+    def extract_legal_entities(self, query: str) -> LegalEntityExtractionResult:
+        return LegalEntityExtractionResult(
+            original_query=query,
+            normalized_query=query,
+            document_types=[],
+            legal_topics=[],
+            jurisdictions=[],
+            courts=[],
+            laws_or_regulations=[],
+            legal_citations=[],
+            clause_types=[],
+            parties=[],
+            dates=[],
+            time_constraints=[],
+            obligations=[],
+            remedies=[],
+            procedural_posture=[],
+            causes_of_action=[],
+            factual_entities=[],
+            keywords=[],
+            filters=LegalEntityFilters(),
+            ambiguity_notes=[],
+            warnings=[],
+            extraction_notes=[],
+        )
+
+    def hybrid_search(self, query: str, *, filters: dict[str, Any] | None = None, top_k: int = 10) -> list[HybridSearchResult]:
+        _ = (query, filters, top_k)
+        return self.hybrid_results
+
+    def rerank_chunks(self, chunks: list[HybridSearchResult], query: str) -> list[RerankedChunkResult]:
+        _ = (chunks, query)
+        return self.reranked_results
+
+    def retrieve_parent_chunks(self, parent_ids: list[str]) -> list[ParentChunkResult]:
+        _ = parent_ids
+        return self.parent_results
+
+    def compress_context(self, _: list[ParentChunkResult]) -> CompressContextResult:
+        return CompressContextResult(items=tuple(self.compressed_items), total_original_chars=100, total_compressed_chars=80)
+
+    def generate_answer(self, context: list[object], query: str) -> object:
+        self.answer_calls.append({"context": context, "query": query})
+        if self.answer_raises:
+            raise RuntimeError("boom")
+        if self.answer_result is not None:
+            return self.answer_result
+        return GenerateAnswerResult(
+            answer_text="Grounded answer",
+            grounded=True,
+            sufficient_context=True,
+            citations=[
+                AnswerCitation(
+                    parent_chunk_id="p1",
+                    document_id="doc-1",
+                    source_name="source",
+                    heading="Section 1",
+                    supporting_excerpt="Text",
+                )
+            ],
+            warnings=[],
+        )
+
+
+def _decision(*, rewrite: bool = False) -> QueryRoutingDecision:
+    return QueryRoutingDecision(
+        is_followup=False,
+        is_ambiguous=False,
+        use_conversation_context=False,
+        should_rewrite=rewrite,
+        should_extract_entities=False,
+        routing_notes=["test"],
+    )
+
+
+def _hybrid(child_id: str, parent_id: str) -> HybridSearchResult:
+    return HybridSearchResult(
+        child_chunk_id=child_id,
+        parent_chunk_id=parent_id,
+        document_id="doc-1",
+        text="termination clause",
+        hybrid_score=0.8,
+    )
+
+
+def _reranked(child_id: str, parent_id: str) -> RerankedChunkResult:
+    return RerankedChunkResult(
+        child_chunk_id=child_id,
+        parent_chunk_id=parent_id,
+        document_id="doc-1",
+        text="reranked text",
+        rerank_score=0.9,
+        original_score=0.8,
+    )
+
+
+def _parent(parent_id: str, text: str = "Parent text") -> ParentChunkResult:
+    return ParentChunkResult(
+        parent_chunk_id=parent_id,
+        document_id="doc-1",
+        text=text,
+        source="test",
+        source_name="test-source",
+        heading_text="Section A",
+    )
+
+
+def test_happy_path_end_to_end() -> None:
+    services = FakeServices(
+        classifier=_decision(),
+        hybrid_results=[_hybrid("c1", "p1")],
+        reranked_results=[_reranked("c1", "p1")],
+        parent_results=[_parent("p1")],
+    )
+    result = run_legal_rag_turn(query="What is the termination rule?", dependencies=services.as_dependencies())
+    assert isinstance(result, FinalAnswerModel)
+    assert result.grounded is True
+    assert result.citations[0].parent_chunk_id == "p1"
+
+
+def test_compressed_context_preference() -> None:
+    services = FakeServices(
+        classifier=_decision(),
+        hybrid_results=[_hybrid("c1", "p1")],
+        reranked_results=[_reranked("c1", "p1")],
+        parent_results=[_parent("p1", text="raw parent")],
+        compressed_items=[
+            CompressedParentChunk(
+                parent_chunk_id="p1",
+                document_id="doc-1",
+                source="test",
+                source_name="compressed-source",
+                compressed_text="compressed parent",
+            )
+        ],
+    )
+    run_legal_rag_turn(
+        query="Q",
+        dependencies=services.as_dependencies(),
+        retrieval_config=RetrievalGraphConfig(compress_if_parent_chunks_gte=1),
+    )
+    assert services.answer_calls
+    used_context = services.answer_calls[0]["context"]
+    assert len(used_context) == 1
+    assert isinstance(used_context[0], CompressedParentChunk)
+
+
+def test_parent_chunks_fallback_when_compressed_empty() -> None:
+    services = FakeServices(
+        classifier=_decision(),
+        hybrid_results=[_hybrid("c1", "p1")],
+        reranked_results=[_reranked("c1", "p1")],
+        parent_results=[_parent("p1", text="raw parent")],
+        compressed_items=[],
+    )
+    run_legal_rag_turn(query="Q", dependencies=services.as_dependencies())
+    used_context = services.answer_calls[0]["context"]
+    assert isinstance(used_context[0], ParentChunkResult)
+
+
+def test_empty_context_insufficiency_response() -> None:
+    services = FakeServices(classifier=_decision(), hybrid_results=[], reranked_results=[], parent_results=[])
+    result = run_legal_rag_turn(query="Q", dependencies=services.as_dependencies())
+    assert result.grounded is False
+    assert result.sufficient_context is False
+    assert result.citations == []
+    assert "No relevant information was retrieved" in result.answer_text
+
+
+def test_partial_context_flags_preserved() -> None:
+    partial = GenerateAnswerResult(
+        answer_text="Partial grounded answer",
+        grounded=True,
+        sufficient_context=False,
+        citations=[AnswerCitation(parent_chunk_id="p1", document_id=None, source_name=None, heading=None, supporting_excerpt="x")],
+        warnings=["partial"],
+    )
+    services = FakeServices(
+        classifier=_decision(),
+        hybrid_results=[_hybrid("c1", "p1")],
+        reranked_results=[_reranked("c1", "p1")],
+        parent_results=[_parent("p1")],
+        answer_result=partial,
+    )
+    result = run_legal_rag_turn(query="Q", dependencies=services.as_dependencies())
+    assert result.grounded is True
+    assert result.sufficient_context is False
+
+
+def test_citation_preservation() -> None:
+    citation = AnswerCitation(
+        parent_chunk_id="p-preserve",
+        document_id="d1",
+        source_name="src",
+        heading="H1",
+        supporting_excerpt="Excerpt",
+    )
+    services = FakeServices(
+        classifier=_decision(),
+        hybrid_results=[_hybrid("c1", "p1")],
+        reranked_results=[_reranked("c1", "p1")],
+        parent_results=[_parent("p1")],
+        answer_result=GenerateAnswerResult(
+            answer_text="A",
+            grounded=True,
+            sufficient_context=True,
+            citations=[citation],
+            warnings=[],
+        ),
+    )
+    result = run_legal_rag_turn(query="Q", dependencies=services.as_dependencies())
+    assert result.citations == [citation]
+
+
+def test_answer_generation_failure_fallback() -> None:
+    services = FakeServices(
+        classifier=_decision(),
+        hybrid_results=[_hybrid("c1", "p1")],
+        reranked_results=[_reranked("c1", "p1")],
+        parent_results=[_parent("p1")],
+        answer_raises=True,
+    )
+    result = run_legal_rag_turn(query="Q", dependencies=services.as_dependencies())
+    assert result.grounded is False
+    assert result.sufficient_context is False
+    assert result.citations == []
+    assert any("answer_generation_failed" in warning for warning in result.warnings)
+
+
+def test_finalization_robustness_on_malformed_answer_output() -> None:
+    services = FakeServices(
+        classifier=_decision(),
+        hybrid_results=[_hybrid("c1", "p1")],
+        reranked_results=[_reranked("c1", "p1")],
+        parent_results=[_parent("p1")],
+        answer_result={"answer_text": "bad", "grounded": True, "sufficient_context": True, "citations": [{"document_id": "d1"}]},
+    )
+    result = run_legal_rag_turn(query="Q", dependencies=services.as_dependencies())
+    assert result.grounded is False
+    assert result.sufficient_context is False
+    assert result.citations == []
+
+
+def test_runner_returns_only_final_typed_model() -> None:
+    services = FakeServices(
+        classifier=_decision(),
+        hybrid_results=[_hybrid("c1", "p1")],
+        reranked_results=[_reranked("c1", "p1")],
+        parent_results=[_parent("p1")],
+    )
+    result = run_legal_rag_turn(query="Q", dependencies=services.as_dependencies())
+    assert isinstance(result, FinalAnswerModel)
+
+
+def test_determinism_sanity_same_input_equivalent_output() -> None:
+    services = FakeServices(
+        classifier=_decision(rewrite=True),
+        rewritten_query="rewritten",
+        hybrid_results=[_hybrid("c1", "p1")],
+        reranked_results=[_reranked("c1", "p1")],
+        parent_results=[_parent("p1")],
+    )
+    result_a = run_legal_rag_turn(query="Q", dependencies=services.as_dependencies())
+    result_b = run_legal_rag_turn(query="Q", dependencies=services.as_dependencies())
+    assert result_a == result_b
+
+
+def test_build_full_graph_composition_works() -> None:
+    services = FakeServices(
+        classifier=_decision(),
+        hybrid_results=[_hybrid("c1", "p1")],
+        reranked_results=[_reranked("c1", "p1")],
+        parent_results=[_parent("p1")],
+    )
+    graph = build_full_legal_rag_graph(services.as_dependencies())
+    initial = default_legal_rag_state(query="Q")
+    final_state = graph.invoke(initial)
+    assert final_state["final_response_ready"] is True
+    assert isinstance(final_state["final_answer"], FinalAnswerModel)
