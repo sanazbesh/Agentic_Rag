@@ -13,6 +13,14 @@ from .dense_child_chunks import (
     stable_qdrant_point_id,
 )
 from .interfaces import Chunker, Embedder, VectorIndex
+from .sparse_child_chunks import (
+    BM25Index,
+    LegalSparseTokenizer,
+    SparseChunkMetadata,
+    SparseIndexedChildChunk,
+    SparseIndexingResult,
+    SparseIndex,
+)
 
 __all__ = [
     "Chunker",
@@ -26,6 +34,12 @@ __all__ = [
     "QdrantChildChunkStore",
     "ChildChunkQdrantPayload",
     "ChildChunkDenseIndexer",
+    "SparseIndex",
+    "LegalSparseTokenizer",
+    "SparseChunkMetadata",
+    "SparseIndexedChildChunk",
+    "SparseIndexingResult",
+    "BM25Index",
     "child_chunk_payload",
     "stable_qdrant_point_id",
 ]
