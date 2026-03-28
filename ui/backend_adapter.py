@@ -9,6 +9,7 @@ switching between mock and real backends and for returning:
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
@@ -16,6 +17,7 @@ from ui.mock_backend import get_mock_documents, run_mock_backend_query
 from ui.upload_manager import register_uploaded_documents
 
 REQUIRED_FINAL_FIELDS = {"answer_text", "grounded", "sufficient_context", "citations", "warnings"}
+logger = logging.getLogger(__name__)
 
 
 class BackendAdapterError(RuntimeError):
@@ -26,6 +28,25 @@ class BackendAdapterError(RuntimeError):
 class BackendQueryResponse:
     final_result: dict[str, Any]
     debug_payload: dict[str, Any] | None
+
+
+def _adapter_debug_meta(
+    *,
+    mode: str,
+    selected_documents: list[dict[str, Any]] | None,
+    has_real_debug_payload: bool,
+) -> dict[str, Any]:
+    selected_docs = [doc for doc in (selected_documents or []) if isinstance(doc, dict)]
+    selected_ids = [str(doc.get("id")) for doc in selected_docs if doc.get("id")]
+    selected_paths = [str(doc.get("path")) for doc in selected_docs if doc.get("path")]
+    uses_uploaded = any(doc.get("source") == "uploaded" for doc in selected_docs)
+    return {
+        "backend_mode": mode,
+        "selected_document_ids": selected_ids,
+        "selected_document_paths": selected_paths,
+        "uses_uploaded_documents": uses_uploaded,
+        "has_real_debug_payload": has_real_debug_payload,
+    }
 
 
 def _coerce_final_result(raw: Any) -> dict[str, Any]:
@@ -146,6 +167,13 @@ def run_backend_query(
     """
 
     register_uploaded_documents(selected_documents or [])
+    selected_docs = [doc for doc in (selected_documents or []) if isinstance(doc, dict)]
+    logger.info(
+        "run_backend_query use_mock_backend=%s selected_document_ids=%s selected_document_paths=%s",
+        use_mock_backend,
+        [doc.get("id") for doc in selected_docs],
+        [doc.get("path") for doc in selected_docs],
+    )
 
     if use_mock_backend:
         final_result, debug_payload = run_mock_backend_query(
@@ -154,9 +182,15 @@ def run_backend_query(
             recent_messages=recent_messages,
             selected_documents=selected_documents,
         )
+        payload = dict(debug_payload or {})
+        payload["adapter_meta"] = _adapter_debug_meta(
+            mode="mock",
+            selected_documents=selected_documents,
+            has_real_debug_payload=False,
+        )
         return BackendQueryResponse(
             final_result=validate_final_result(final_result),
-            debug_payload=debug_payload,
+            debug_payload=payload,
         )
 
     if real_backend_runner is None:
@@ -181,8 +215,14 @@ def run_backend_query(
         )
         if isinstance(debug_raw, Mapping):
             debug_payload = dict(debug_raw)
+    payload = dict(debug_payload or {})
+    payload["adapter_meta"] = _adapter_debug_meta(
+        mode="real",
+        selected_documents=selected_documents,
+        has_real_debug_payload=debug_payload is not None,
+    )
 
     return BackendQueryResponse(
         final_result=validate_final_result(raw_final_result),
-        debug_payload=debug_payload,
+        debug_payload=payload,
     )
