@@ -19,6 +19,7 @@ from .parent_child import (
     RerankedChunkResult,
     VectorSearchService,
 )
+from .sparse import SparseSearchResult, SparseSearchService, search_child_chunks_sparse
 
 __all__ = [
     "QueryRewriter",
@@ -40,4 +41,7 @@ __all__ = [
     "InMemoryChildChunkRepository",
     "InMemoryKeywordChunkRepository",
     "InMemoryParentChunkRepository",
+    "SparseSearchResult",
+    "SparseSearchService",
+    "search_child_chunks_sparse",
 ]
