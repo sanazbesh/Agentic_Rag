@@ -145,6 +145,7 @@ def build_real_backend_runners() -> tuple[Callable[..., Any] | None, Callable[..
             resolved_topics = list(resolution.get("resolved_topic_hints", []))
         else:
             resolved_topics = list(getattr(resolution, "resolved_topic_hints", []))
+        scope_meta = st.session_state.get("last_real_backend_scope_meta")
         return {
             "meta": {
                 "mode": "real",
@@ -152,6 +153,7 @@ def build_real_backend_runners() -> tuple[Callable[..., Any] | None, Callable[..
                 "selected_document_paths": selected_paths,
                 "uses_uploaded_documents": any(doc.get("source") == "uploaded" for doc in selected_docs),
             },
+            "scope": dict(scope_meta) if isinstance(scope_meta, dict) else {},
             "query_classification": latest_state.get("query_classification"),
             "context_resolution": latest_state.get("context_resolution"),
             "resolved_query": latest_state.get("resolved_query"),
