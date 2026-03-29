@@ -38,10 +38,26 @@ class QueryRoutingDecision(BaseModel):
 
     is_followup: bool
     is_ambiguous: bool
+    is_context_dependent: bool
     use_conversation_context: bool
     should_rewrite: bool
     should_extract_entities: bool
+    refers_to_prior_document_scope: bool
+    refers_to_prior_clause_or_topic: bool
     routing_notes: list[str] = Field(default_factory=list)
+
+
+class QueryContextResolution(BaseModel):
+    """Typed, inspectable output for conservative follow-up reference resolution."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    resolved_query: str
+    used_conversation_context: bool
+    resolved_document_ids: list[str] = Field(default_factory=list)
+    resolved_topic_hints: list[str] = Field(default_factory=list)
+    resolution_notes: list[str] = Field(default_factory=list)
+    unresolved_references: list[str] = Field(default_factory=list)
 
 
 class RetrievalStageState(TypedDict):
@@ -53,8 +69,10 @@ class RetrievalStageState(TypedDict):
     use_conversation_context: bool
 
     rewritten_query: str | None
+    resolved_query: str
     effective_query: str
     query_classification: QueryRoutingDecision | None
+    context_resolution: QueryContextResolution | None
 
     extracted_entities: LegalEntityExtractionResult | None
     filters: dict[str, Any] | None
@@ -71,6 +89,11 @@ class RetrievalStageState(TypedDict):
 
     warnings: list[str]
     retrieval_stage_complete: bool
+    last_resolved_document_scope: list[str]
+    last_resolved_topic: str | None
+    prior_effective_query: str | None
+    prior_final_answer: str | None
+    prior_citations: list[Mapping[str, Any]]
 
 
 class QueryClassifier(Protocol):
@@ -123,8 +146,10 @@ def default_retrieval_state(
         recent_messages=list(recent_messages or []),
         use_conversation_context=False,
         rewritten_query=None,
+        resolved_query=normalized_query,
         effective_query=normalized_query,
         query_classification=None,
+        context_resolution=None,
         extracted_entities=None,
         filters=None,
         child_results=[],
@@ -137,6 +162,11 @@ def default_retrieval_state(
         should_compress=False,
         warnings=[],
         retrieval_stage_complete=False,
+        last_resolved_document_scope=[],
+        last_resolved_topic=None,
+        prior_effective_query=None,
+        prior_final_answer=None,
+        prior_citations=[],
     )
 
 
@@ -176,14 +206,45 @@ def heuristic_query_classifier(
         "contract",
     }
     ambiguous_markers = {"exception", "that", "this", "it", "still apply", "what about"}
+    pronoun_markers = {
+        "it",
+        "this",
+        "that",
+        "the document",
+        "this document",
+        "that document",
+        "the clause",
+        "that clause",
+        "this agreement",
+        "that agreement",
+    }
+    explicit_scope_markers = {
+        " in the nda",
+        " in the msa",
+        " in the lease",
+        " in the agreement",
+        " in the contract",
+        " in the statute",
+    }
 
     token_set = set(lowered.split())
     has_recent_context = bool((conversation_summary and conversation_summary.strip()) or recent_messages)
     is_followup = lowered.startswith(followup_starters) or bool(token_set.intersection(followup_markers))
+    is_context_dependent = any(marker in lowered for marker in pronoun_markers) or lowered.startswith(
+        ("what about", "does it", "compare that")
+    )
+    has_explicit_new_scope = any(marker in f" {lowered}" for marker in explicit_scope_markers) and "that agreement" not in lowered
     is_ambiguous = any(marker in lowered for marker in ambiguous_markers) and len(token_set) <= 10
-    use_context = has_recent_context and (is_followup or is_ambiguous)
+    use_context = has_recent_context and (is_followup or is_ambiguous or is_context_dependent) and not has_explicit_new_scope
+    refers_to_prior_document_scope = is_context_dependent and any(
+        marker in lowered
+        for marker in ("it", "document", "that agreement", "this agreement")
+    )
+    refers_to_prior_clause_or_topic = is_context_dependent and any(
+        marker in lowered for marker in ("clause", "what about", "compare that", "still apply")
+    )
 
-    should_rewrite = is_followup or is_ambiguous or len(token_set) <= 3
+    should_rewrite = is_followup or is_ambiguous or is_context_dependent or len(token_set) <= 3
     should_extract = any(marker in lowered for marker in legal_filter_markers)
 
     notes: list[str] = []
@@ -191,6 +252,8 @@ def heuristic_query_classifier(
         notes.append("followup_like_query")
     if is_ambiguous:
         notes.append("ambiguous_or_elliptical")
+    if is_context_dependent:
+        notes.append("context_dependent")
     if use_context:
         notes.append("use_conversation_context")
     if should_rewrite:
@@ -201,9 +264,12 @@ def heuristic_query_classifier(
     return QueryRoutingDecision(
         is_followup=is_followup,
         is_ambiguous=is_ambiguous,
+        is_context_dependent=is_context_dependent,
         use_conversation_context=use_context,
         should_rewrite=should_rewrite,
         should_extract_entities=should_extract,
+        refers_to_prior_document_scope=refers_to_prior_document_scope,
+        refers_to_prior_clause_or_topic=refers_to_prior_clause_or_topic,
         routing_notes=notes,
     )
 
@@ -242,8 +308,44 @@ class RetrievalGraphNodes:
         updated["parent_ids"] = list(updated.get("parent_ids", []))
         updated["parent_chunks"] = list(updated.get("parent_chunks", []))
         updated["compressed_context"] = list(updated.get("compressed_context", []))
+        self._hydrate_prior_turn_memory(updated)
         logger.info("node_exit name=ingest_turn query_length=%s", len(updated["original_query"]))
         return cast(RetrievalStageState, updated)
+
+    def _hydrate_prior_turn_memory(self, state: dict[str, Any]) -> None:
+        messages = list(state.get("recent_messages", []))
+        assistant_messages = [msg for msg in reversed(messages) if str(msg.get("role", "")).lower() == "assistant"]
+        for assistant in assistant_messages:
+            metadata = assistant.get("metadata")
+            if not isinstance(metadata, Mapping):
+                continue
+            if not state.get("last_resolved_document_scope"):
+                state["last_resolved_document_scope"] = [
+                    str(item) for item in metadata.get("resolved_document_ids", []) if item
+                ]
+            if not state.get("last_resolved_topic"):
+                topic_hints = [str(item) for item in metadata.get("resolved_topic_hints", []) if item]
+                state["last_resolved_topic"] = topic_hints[0] if topic_hints else None
+            if not state.get("prior_effective_query"):
+                prior_effective_query = metadata.get("effective_query")
+                if isinstance(prior_effective_query, str) and prior_effective_query.strip():
+                    state["prior_effective_query"] = prior_effective_query
+            if not state.get("prior_final_answer"):
+                prior_final_answer = metadata.get("answer_text")
+                if isinstance(prior_final_answer, str) and prior_final_answer.strip():
+                    state["prior_final_answer"] = prior_final_answer
+            if not state.get("prior_citations"):
+                citations = metadata.get("citations")
+                if isinstance(citations, list):
+                    state["prior_citations"] = [item for item in citations if isinstance(item, Mapping)]
+            if (
+                state.get("last_resolved_document_scope")
+                and state.get("last_resolved_topic")
+                and state.get("prior_effective_query")
+                and state.get("prior_final_answer")
+                and state.get("prior_citations")
+            ):
+                return
 
     def classify_query_state(self, state: RetrievalStageState) -> RetrievalStageState:
         logger.info("node_enter name=classify_query_state")
@@ -266,10 +368,79 @@ class RetrievalGraphNodes:
         )
         return cast(RetrievalStageState, updated)
 
+    def resolve_query_context(self, state: RetrievalStageState) -> RetrievalStageState:
+        """Resolve conversational references before retrieval in a typed, traceable way."""
+
+        logger.info("node_enter name=resolve_query_context")
+        updated = dict(state)
+        query = str(updated["original_query"]).strip()
+        decision = updated.get("query_classification")
+        if not isinstance(decision, QueryRoutingDecision):
+            resolution = QueryContextResolution(resolved_query=query, used_conversation_context=False)
+            updated["context_resolution"] = resolution
+            updated["resolved_query"] = query
+            return cast(RetrievalStageState, updated)
+
+        candidate_doc_ids: list[str] = list(updated.get("last_resolved_document_scope", []))
+        for citation in updated.get("prior_citations", []):
+            document_id = citation.get("document_id")
+            if isinstance(document_id, str) and document_id and document_id not in candidate_doc_ids:
+                candidate_doc_ids.append(document_id)
+
+        topic_hints: list[str] = []
+        if updated.get("last_resolved_topic"):
+            topic_hints.append(str(updated["last_resolved_topic"]))
+        used_context = False
+        unresolved_references: list[str] = []
+        resolution_notes = list(decision.routing_notes)
+        resolved_query = query
+
+        if decision.is_context_dependent:
+            if decision.refers_to_prior_document_scope and len(candidate_doc_ids) > 1:
+                unresolved_references.append("document_reference:ambiguous_multiple_candidates")
+                resolution_notes.append("ambiguous_document_reference")
+            elif decision.refers_to_prior_document_scope and len(candidate_doc_ids) == 1:
+                if decision.use_conversation_context:
+                    used_context = True
+                    resolution_notes.append("resolved_document_scope_from_prior_turn")
+            elif decision.refers_to_prior_document_scope and not candidate_doc_ids:
+                unresolved_references.append("document_reference:missing_prior_scope")
+                resolution_notes.append("unable_to_resolve_document_scope")
+
+            if decision.refers_to_prior_clause_or_topic and topic_hints and decision.use_conversation_context:
+                used_context = True
+                resolution_notes.append("resolved_clause_or_topic_from_prior_turn")
+
+            if used_context and topic_hints and query.lower().startswith("what about"):
+                resolved_query = f"{query} in relation to {topic_hints[0]}"
+
+        resolution = QueryContextResolution(
+            resolved_query=resolved_query,
+            used_conversation_context=used_context,
+            resolved_document_ids=candidate_doc_ids if used_context else [],
+            resolved_topic_hints=topic_hints if used_context else [],
+            resolution_notes=resolution_notes,
+            unresolved_references=unresolved_references,
+        )
+        updated["context_resolution"] = resolution
+        updated["resolved_query"] = resolution.resolved_query
+        if resolution.resolved_document_ids:
+            existing_filters = dict(updated.get("filters") or {})
+            existing_filters["resolved_document_ids"] = list(resolution.resolved_document_ids)
+            updated["filters"] = existing_filters
+        if resolution.unresolved_references:
+            updated["warnings"] = [*updated["warnings"], *resolution.unresolved_references]
+        logger.info(
+            "node_exit name=resolve_query_context used_context=%s unresolved_count=%s",
+            resolution.used_conversation_context,
+            len(resolution.unresolved_references),
+        )
+        return cast(RetrievalStageState, updated)
+
     def rewrite_query_if_needed(self, state: RetrievalStageState) -> RetrievalStageState:
         logger.info("node_enter name=rewrite_query_if_needed should_rewrite=%s", state["should_rewrite"])
         updated = dict(state)
-        original_query = updated["original_query"]
+        original_query = str(updated.get("resolved_query") or updated["original_query"])
         updated["effective_query"] = original_query
         if not updated["should_rewrite"]:
             logger.info("node_exit name=rewrite_query_if_needed rewritten=false")
@@ -302,7 +473,9 @@ class RetrievalGraphNodes:
         try:
             extraction = self.dependencies.extract_legal_entities(updated["effective_query"])
             updated["extracted_entities"] = extraction
-            updated["filters"] = _derive_filters(extraction)
+            merged_filters = dict(updated.get("filters") or {})
+            merged_filters.update(_derive_filters(extraction) or {})
+            updated["filters"] = merged_filters or None
         except Exception as exc:  # pragma: no cover
             updated["warnings"] = [*updated["warnings"], f"entity_extraction_failed:{type(exc).__name__}"]
             updated["extracted_entities"] = None
@@ -440,7 +613,12 @@ class RetrievalGraphNodes:
         return cast(RetrievalStageState, updated)
 
 
-DecisionLiteral = Literal["rewrite_query_if_needed", "extract_entities_if_needed", "compress_context_node", "mark_complete_without_compression"]
+DecisionLiteral = Literal[
+    "rewrite_query_if_needed",
+    "extract_entities_if_needed",
+    "compress_context_node",
+    "mark_complete_without_compression",
+]
 
 
 def _route_after_classification(state: RetrievalStageState) -> DecisionLiteral:
@@ -461,6 +639,7 @@ class _FallbackCompiledGraph:
         current = state
         current = self._nodes.ingest_turn(current)
         current = self._nodes.classify_query_state(current)
+        current = self._nodes.resolve_query_context(current)
         if _route_after_classification(current) == "rewrite_query_if_needed":
             current = self._nodes.rewrite_query_if_needed(current)
         current = self._nodes.extract_entities_if_needed(current)
@@ -492,6 +671,7 @@ def build_retrieval_graph(
     graph = StateGraph(RetrievalStageState)
     graph.add_node("ingest_turn", nodes.ingest_turn)
     graph.add_node("classify_query_state", nodes.classify_query_state)
+    graph.add_node("resolve_query_context", nodes.resolve_query_context)
     graph.add_node("rewrite_query_if_needed", nodes.rewrite_query_if_needed)
     graph.add_node("extract_entities_if_needed", nodes.extract_entities_if_needed)
     graph.add_node("run_hybrid_search", nodes.run_hybrid_search)
@@ -504,8 +684,9 @@ def build_retrieval_graph(
 
     graph.add_edge(START, "ingest_turn")
     graph.add_edge("ingest_turn", "classify_query_state")
+    graph.add_edge("classify_query_state", "resolve_query_context")
     graph.add_conditional_edges(
-        "classify_query_state",
+        "resolve_query_context",
         _route_after_classification,
         {
             "rewrite_query_if_needed": "rewrite_query_if_needed",
