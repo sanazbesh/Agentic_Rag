@@ -12,6 +12,13 @@ from ui.upload_manager import ALLOWED_EXTENSIONS, remove_uploaded_document, save
 
 DEBUG_SECTIONS = [
     ("adapter_meta", "Adapter Meta"),
+    ("query_classification", "Query Classification"),
+    ("context_resolution", "Conversation Resolution"),
+    ("resolved_query", "Resolved Query"),
+    ("effective_query", "Effective Query"),
+    ("resolved_document_scope", "Resolved Document Scope"),
+    ("resolved_topic_hints", "Resolved Topic Hints"),
+    ("recent_messages_used", "Recent Messages Used"),
     ("rewritten_query", "Rewritten Query"),
     ("extracted_entities", "Extracted Entities"),
     ("filters", "Filters"),
@@ -30,6 +37,7 @@ def initialize_session_state() -> None:
         "query": "",
         "conversation_summary": "",
         "recent_messages_json": "[]",
+        "conversation_history": [],
         "selected_document_ids": [],
         "selected_documents": [],
         "uploaded_documents": [],
@@ -214,12 +222,14 @@ def render_query_input() -> dict[str, Any]:
 
         col_run, col_reset = st.columns([1, 1])
         run_clicked = col_run.form_submit_button("Run", use_container_width=True)
-        reset_clicked = col_reset.form_submit_button("Reset Inputs", use_container_width=True)
+        reset_clicked = col_reset.form_submit_button("Clear Conversation", use_container_width=True)
 
     if reset_clicked:
         st.session_state.query = ""
         st.session_state.conversation_summary = ""
         st.session_state.recent_messages_json = "[]"
+        st.session_state.conversation_history = []
+        st.session_state.last_run = None
         st.rerun()
 
     st.session_state.query = query
@@ -235,9 +245,11 @@ def render_query_input() -> dict[str, Any]:
 
     return {
         "run_clicked": run_clicked,
+        "clear_clicked": reset_clicked,
         "query": query,
         "conversation_summary": conversation_summary or None,
         "recent_messages": recent_messages,
+        "recent_messages_override_used": bool(recent_messages_json.strip() and recent_messages_json.strip() != "[]"),
         "recent_messages_parse_error": parse_error,
     }
 

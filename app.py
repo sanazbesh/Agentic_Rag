@@ -31,6 +31,7 @@ from ui.components import (
     render_query_input,
     render_sidebar,
 )
+from ui.session_memory import append_conversation_turn, serialize_history_as_messages, summarize_conversation
 
 
 st.set_page_config(page_title="Legal RAG Test UI", layout="wide")
@@ -65,7 +66,7 @@ def build_real_backend_runners() -> tuple[Callable[..., Any] | None, Callable[..
     """
 
     try:
-        from agentic_rag.orchestration.legal_rag_graph import LegalRagDependencies, run_legal_rag_turn
+        from agentic_rag.orchestration.legal_rag_graph import LegalRagDependencies, run_legal_rag_turn_with_state
     except Exception as exc:
         return None, None, f"Unable to import legal RAG runner: {type(exc).__name__}: {exc}"
 
@@ -86,6 +87,8 @@ def build_real_backend_runners() -> tuple[Callable[..., Any] | None, Callable[..
         )
 
     retrieval_config = st.session_state.get("legal_rag_retrieval_config")
+
+    latest_state: dict[str, Any] = {}
 
     def real_backend_runner(
         *,
@@ -118,13 +121,16 @@ def build_real_backend_runners() -> tuple[Callable[..., Any] | None, Callable[..
             retrieval=replace(dependencies.retrieval, hybrid_search=hybrid_search_with_selected_docs),
         )
 
-        return run_legal_rag_turn(
+        final_answer, final_state = run_legal_rag_turn_with_state(
             query=query,
             dependencies=wrapped_dependencies,
             conversation_summary=conversation_summary,
             recent_messages=recent_messages,
             retrieval_config=retrieval_config,
         )
+        latest_state.clear()
+        latest_state.update(dict(final_state))
+        return final_answer
 
     def real_debug_runner(
         *,
@@ -134,13 +140,26 @@ def build_real_backend_runners() -> tuple[Callable[..., Any] | None, Callable[..
         selected_docs = [doc for doc in (selected_documents or []) if isinstance(doc, dict)]
         selected_ids = [str(doc.get("id")) for doc in selected_docs if doc.get("id")]
         selected_paths = [str(doc.get("path")) for doc in selected_docs if doc.get("path")]
+        resolution = latest_state.get("context_resolution")
+        if isinstance(resolution, dict):
+            resolved_topics = list(resolution.get("resolved_topic_hints", []))
+        else:
+            resolved_topics = list(getattr(resolution, "resolved_topic_hints", []))
         return {
             "meta": {
                 "mode": "real",
                 "selected_document_ids": selected_ids,
                 "selected_document_paths": selected_paths,
                 "uses_uploaded_documents": any(doc.get("source") == "uploaded" for doc in selected_docs),
-            }
+            },
+            "query_classification": latest_state.get("query_classification"),
+            "context_resolution": latest_state.get("context_resolution"),
+            "resolved_query": latest_state.get("resolved_query"),
+            "effective_query": latest_state.get("effective_query"),
+            "resolved_document_scope": latest_state.get("last_resolved_document_scope", []),
+            "resolved_topic_hints": resolved_topics,
+            "warnings": latest_state.get("warnings", []),
+            "recent_messages_used": latest_state.get("recent_messages", []),
         }
 
     return real_backend_runner, real_debug_runner, None
@@ -175,10 +194,20 @@ def main() -> None:
                 return
             with st.spinner("Running legal RAG pipeline..."):
                 try:
+                    conversation_history = st.session_state.get("conversation_history", [])
+                    default_recent_messages = serialize_history_as_messages(conversation_history)
+                    default_summary = summarize_conversation(conversation_history)
+                    recent_messages = (
+                        input_state["recent_messages"]
+                        if input_state["recent_messages_override_used"]
+                        else default_recent_messages
+                    )
+                    conversation_summary = input_state["conversation_summary"] or default_summary
+
                     response = run_backend_query(
                         query=input_state["query"],
-                        conversation_summary=input_state["conversation_summary"],
-                        recent_messages=input_state["recent_messages"],
+                        conversation_summary=conversation_summary,
+                        recent_messages=recent_messages,
                         selected_documents=sidebar_state["selected_documents"],
                         use_mock_backend=sidebar_state["use_mock_backend"],
                         real_backend_runner=real_backend_runner,
@@ -188,6 +217,26 @@ def main() -> None:
                         "final_result": response.final_result,
                         "debug_payload": response.debug_payload,
                     }
+                    debug_payload = response.debug_payload or {}
+                    context_resolution = debug_payload.get("context_resolution") if isinstance(debug_payload, dict) else None
+                    resolution_dict = (
+                        context_resolution.model_dump()
+                        if hasattr(context_resolution, "model_dump")
+                        else (dict(context_resolution) if isinstance(context_resolution, dict) else {})
+                    )
+                    turn_metadata = {
+                        "effective_query": debug_payload.get("effective_query"),
+                        "resolved_document_ids": resolution_dict.get("resolved_document_ids", []),
+                        "resolved_topic_hints": resolution_dict.get("resolved_topic_hints", []),
+                        "answer_text": response.final_result.get("answer_text", ""),
+                        "citations": response.final_result.get("citations", []),
+                    }
+                    st.session_state.conversation_history = append_conversation_turn(
+                        history=conversation_history,
+                        query=input_state["query"],
+                        answer_text=response.final_result.get("answer_text", ""),
+                        metadata=turn_metadata,
+                    )
                 except BackendAdapterError as exc:
                     st.warning(f"Backend adapter warning: {exc}")
                     st.session_state.last_run = {
