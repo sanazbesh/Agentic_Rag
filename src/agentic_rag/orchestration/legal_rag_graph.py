@@ -416,28 +416,3 @@ def run_legal_rag_turn(
     if not isinstance(final_answer, FinalAnswerModel):
         return _safe_fallback(warnings=["runner_fallback:missing_or_invalid_final_answer"], message=FAILURE_MESSAGE)
     return final_answer
-
-
-def run_legal_rag_turn_with_state(
-    *,
-    query: str,
-    dependencies: LegalRagDependencies,
-    conversation_summary: str | None = None,
-    recent_messages: Sequence[Mapping[str, Any]] | None = None,
-    retrieval_config: RetrievalGraphConfig | None = None,
-) -> tuple[FinalAnswerModel, LegalRagState]:
-    """Run one legal RAG turn and return both final answer and full state for debug/session memory."""
-
-    initial = default_legal_rag_state(
-        query=query,
-        conversation_summary=conversation_summary,
-        recent_messages=recent_messages,
-    )
-    app = build_full_legal_rag_graph(dependencies=dependencies, retrieval_config=retrieval_config)
-    final_state = cast(LegalRagState, app.invoke(initial))
-    final_answer = final_state.get("final_answer")
-    if not isinstance(final_answer, FinalAnswerModel):
-        fallback = _safe_fallback(warnings=["runner_fallback:missing_or_invalid_final_answer"], message=FAILURE_MESSAGE)
-        final_state["final_answer"] = fallback
-        return fallback, final_state
-    return final_answer, final_state

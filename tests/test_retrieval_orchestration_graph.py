@@ -146,12 +146,9 @@ def _decision(*, followup: bool, ambiguous: bool, use_context: bool, rewrite: bo
     return QueryRoutingDecision(
         is_followup=followup,
         is_ambiguous=ambiguous,
-        is_context_dependent=followup or ambiguous,
         use_conversation_context=use_context,
         should_rewrite=rewrite,
         should_extract_entities=extract,
-        refers_to_prior_document_scope=followup,
-        refers_to_prior_clause_or_topic=followup,
         routing_notes=["test"],
     )
 
