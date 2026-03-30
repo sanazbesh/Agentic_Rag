@@ -21,6 +21,22 @@ from typing import Any
 
 import streamlit as st
 
+
+def _ensure_src_path_for_local_runs() -> None:
+    """Ensure `src/` is importable when running `streamlit run app.py` locally."""
+
+    if importlib.util.find_spec("agentic_rag") is not None:
+        return
+
+    src_path = Path(__file__).resolve().parent / "src"
+    if src_path.is_dir():
+        sys.path.insert(0, str(src_path))
+        logger.info("Added src path for local imports: %s", src_path)
+
+
+logger = logging.getLogger(__name__)
+_ensure_src_path_for_local_runs()
+
 from ui.backend_adapter import BackendAdapterError, run_backend_query
 from ui.components import (
     initialize_session_state,
@@ -36,22 +52,6 @@ from ui.session_memory import append_conversation_turn, serialize_history_as_mes
 
 
 st.set_page_config(page_title="Legal RAG Test UI", layout="wide")
-logger = logging.getLogger(__name__)
-
-
-def _ensure_src_path_for_local_runs() -> None:
-    """Ensure `src/` is importable when running `streamlit run app.py` locally."""
-
-    if importlib.util.find_spec("agentic_rag") is not None:
-        return
-
-    src_path = Path(__file__).resolve().parent / "src"
-    if src_path.is_dir():
-        sys.path.insert(0, str(src_path))
-        logger.info("Added src path for local imports: %s", src_path)
-
-
-_ensure_src_path_for_local_runs()
 
 
 def build_real_backend_runners() -> tuple[Callable[..., Any] | None, Callable[..., Any] | None, str | None]:
