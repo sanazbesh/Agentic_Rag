@@ -30,6 +30,18 @@ DEBUG_SECTIONS = [
 ]
 
 
+def _to_jsonable(value: Any) -> Any:
+    """Convert nested objects (including pydantic models) into JSON-safe values."""
+
+    if hasattr(value, "model_dump") and callable(value.model_dump):
+        return _to_jsonable(value.model_dump())
+    if isinstance(value, dict):
+        return {str(key): _to_jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_to_jsonable(item) for item in value]
+    return value
+
+
 def initialize_session_state() -> None:
     """Initialize session defaults for local debugging workflow."""
 
@@ -145,6 +157,9 @@ def render_sidebar(
     document_options = {doc["id"]: doc for doc in available_documents}
 
     valid_defaults = [doc_id for doc_id in st.session_state.selected_document_ids if doc_id in document_options]
+    if not valid_defaults and st.session_state.uploaded_documents:
+        uploaded_ids = [str(doc.get("id")) for doc in st.session_state.uploaded_documents if doc.get("id")]
+        valid_defaults = [doc_id for doc_id in uploaded_ids if doc_id in document_options]
     if len(valid_defaults) != len(st.session_state.selected_document_ids):
         st.session_state.selected_document_ids = valid_defaults
 
@@ -332,7 +347,7 @@ def render_debug_panel(final_result: dict[str, Any], debug_payload: dict[str, An
 def render_download_button(final_result: dict[str, Any], debug_payload: dict[str, Any] | None) -> None:
     """Provide download action for latest response/debug bundle."""
 
-    blob = {"final_result": final_result, "debug_payload": debug_payload}
+    blob = {"final_result": _to_jsonable(final_result), "debug_payload": _to_jsonable(debug_payload)}
     st.download_button(
         "Download latest result JSON",
         data=json.dumps(blob, indent=2),
