@@ -188,7 +188,7 @@ class LegalAnswerSynthesizer:
 
     def _direct_answer(self, citations: Sequence[AnswerCitation]) -> str:
         first = citations[0].supporting_excerpt or "The retrieved context contains relevant provisions."
-        return f"Based on the retrieved documents, {first}"
+        return first
 
     def _is_fully_answerable(self, ranked: Sequence[dict[str, Any]], query: str) -> bool:
         query_terms = _query_terms(query)
