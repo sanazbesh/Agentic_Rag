@@ -298,7 +298,15 @@ def render_answer_panel(final_result: dict[str, Any]) -> None:
             st.warning(str(warning))
 
 
-def render_citations(citations: list[dict[str, Any]]) -> None:
+def _citation_value(citation: Any, key: str, default: Any = None) -> Any:
+    """Read citation fields from dict-like or object-like citation payloads."""
+
+    if isinstance(citation, dict):
+        return citation.get(key, default)
+    return getattr(citation, key, default)
+
+
+def render_citations(citations: list[Any]) -> None:
     """Render citations in structured evidence cards."""
 
     st.subheader("Citations")
@@ -307,16 +315,17 @@ def render_citations(citations: list[dict[str, Any]]) -> None:
         return
 
     for index, citation in enumerate(citations, start=1):
-        source_name = citation.get("source_name") or "Unknown source"
-        heading = citation.get("heading") or "(No heading)"
+        source_name = _citation_value(citation, "source_name") or "Unknown source"
+        heading = _citation_value(citation, "heading") or "(No heading)"
         with st.expander(f"Citation {index}: {source_name} — {heading}", expanded=False):
             st.markdown(f"- **source_name:** {source_name}")
             st.markdown(f"- **heading:** {heading}")
-            st.markdown(f"- **parent_chunk_id:** {citation.get('parent_chunk_id', '')}")
-            if citation.get("document_id"):
-                st.markdown(f"- **document_id:** {citation.get('document_id')}")
+            st.markdown(f"- **parent_chunk_id:** {_citation_value(citation, 'parent_chunk_id', '')}")
+            document_id = _citation_value(citation, "document_id")
+            if document_id:
+                st.markdown(f"- **document_id:** {document_id}")
             st.markdown("- **supporting_excerpt:**")
-            st.code(citation.get("supporting_excerpt") or "", language="text")
+            st.code(_citation_value(citation, "supporting_excerpt") or "", language="text")
 
 
 def render_debug_panel(final_result: dict[str, Any], debug_payload: dict[str, Any] | None) -> None:
