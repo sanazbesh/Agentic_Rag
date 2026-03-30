@@ -31,6 +31,7 @@ from ui.components import (
     render_query_input,
     render_sidebar,
 )
+from ui.local_backend import build_local_backend_dependencies
 from ui.session_memory import append_conversation_turn, serialize_history_as_messages, summarize_conversation
 
 
@@ -71,14 +72,7 @@ def build_real_backend_runners() -> tuple[Callable[..., Any] | None, Callable[..
         return None, None, f"Unable to import legal RAG runner: {type(exc).__name__}: {exc}"
 
     dependencies = st.session_state.get("legal_rag_dependencies")
-    if dependencies is None:
-        return (
-            None,
-            None,
-            "Real backend not wired. Set st.session_state['legal_rag_dependencies'] with a LegalRagDependencies "
-            "instance before running with mock mode disabled.",
-        )
-    if not isinstance(dependencies, LegalRagDependencies):
+    if dependencies is not None and not isinstance(dependencies, LegalRagDependencies):
         return (
             None,
             None,
@@ -101,7 +95,15 @@ def build_real_backend_runners() -> tuple[Callable[..., Any] | None, Callable[..
         selected_ids = [str(doc.get("id")) for doc in selected_docs if doc.get("id")]
         selected_paths = [str(doc.get("path")) for doc in selected_docs if doc.get("path")]
 
-        base_hybrid_search = dependencies.retrieval.hybrid_search
+        active_dependencies = dependencies
+        local_scope_meta: dict[str, Any] | None = None
+
+        if active_dependencies is None:
+            local_backend = build_local_backend_dependencies(selected_docs)
+            active_dependencies = local_backend.dependencies
+            local_scope_meta = dict(local_backend.scope_meta)
+
+        base_hybrid_search = active_dependencies.retrieval.hybrid_search
 
         def hybrid_search_with_selected_docs(user_query: str, *, filters: dict[str, Any] | None, top_k: int) -> Any:
             merged_filters = dict(filters or {})
@@ -117,8 +119,8 @@ def build_real_backend_runners() -> tuple[Callable[..., Any] | None, Callable[..
             return base_hybrid_search(user_query, filters=merged_filters or None, top_k=top_k)
 
         wrapped_dependencies = replace(
-            dependencies,
-            retrieval=replace(dependencies.retrieval, hybrid_search=hybrid_search_with_selected_docs),
+            active_dependencies,
+            retrieval=replace(active_dependencies.retrieval, hybrid_search=hybrid_search_with_selected_docs),
         )
 
         final_answer, final_state = run_legal_rag_turn_with_state(
@@ -130,6 +132,16 @@ def build_real_backend_runners() -> tuple[Callable[..., Any] | None, Callable[..
         )
         latest_state.clear()
         latest_state.update(dict(final_state))
+
+        scope_meta = {
+            "selected_document_count": len(selected_docs),
+            "selected_document_ids": selected_ids,
+            "selected_document_paths": selected_paths,
+        }
+        if local_scope_meta:
+            scope_meta.update(local_scope_meta)
+        st.session_state["last_real_backend_scope_meta"] = scope_meta
+
         return final_answer
 
     def real_debug_runner(
