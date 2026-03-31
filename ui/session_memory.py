@@ -64,3 +64,26 @@ def clear_conversation() -> list[dict[str, Any]]:
     """Return an empty conversation history payload for explicit reset flows."""
 
     return []
+
+
+def build_backend_context(
+    *,
+    history: Sequence[Mapping[str, Any]],
+    conversation_summary_input: str | None,
+    recent_messages_override: list[dict[str, Any]] | None,
+) -> tuple[str | None, list[dict[str, Any]], bool]:
+    """Build backend context from session history unless override is explicitly provided.
+
+    Returns:
+      (conversation_summary, recent_messages, used_recent_messages_override)
+    """
+
+    default_recent_messages = serialize_history_as_messages(history)
+    default_summary = summarize_conversation(history)
+
+    override_used = recent_messages_override is not None
+    recent_messages = recent_messages_override if override_used else default_recent_messages
+    summary_input = (conversation_summary_input or "").strip()
+    conversation_summary = summary_input or default_summary
+
+    return conversation_summary, recent_messages, override_used
