@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import asdict, is_dataclass
 from typing import Any
 
 import streamlit as st
@@ -35,10 +36,14 @@ def _to_jsonable(value: Any) -> Any:
 
     if hasattr(value, "model_dump") and callable(value.model_dump):
         return _to_jsonable(value.model_dump())
+    if is_dataclass(value):
+        return _to_jsonable(asdict(value))
     if isinstance(value, dict):
         return {str(key): _to_jsonable(item) for key, item in value.items()}
     if isinstance(value, (list, tuple, set)):
         return [_to_jsonable(item) for item in value]
+    if hasattr(value, "__dict__"):
+        return _to_jsonable(vars(value))
     return value
 
 
