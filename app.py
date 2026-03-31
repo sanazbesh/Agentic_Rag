@@ -184,6 +184,9 @@ def main() -> None:
     st.caption("Local-first Streamlit UI for testing retrieval, grounding, citations, and debug state.")
 
     initialize_session_state()
+    if st.session_state.get("pending_query_input_clear"):
+        st.session_state.current_query_input = ""
+        st.session_state.pending_query_input_clear = False
 
     real_backend_runner, real_debug_runner, real_backend_wiring_error = build_real_backend_runners()
 
