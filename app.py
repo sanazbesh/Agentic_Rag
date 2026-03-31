@@ -48,7 +48,7 @@ from ui.components import (
     render_sidebar,
 )
 from ui.local_backend import build_local_backend_dependencies
-from ui.session_memory import append_conversation_turn, serialize_history_as_messages, summarize_conversation
+from ui.session_memory import append_conversation_turn, build_backend_context
 
 
 st.set_page_config(page_title="Legal RAG Test UI", layout="wide")
@@ -184,6 +184,9 @@ def main() -> None:
     st.caption("Local-first Streamlit UI for testing retrieval, grounding, citations, and debug state.")
 
     initialize_session_state()
+    if st.session_state.get("pending_query_input_clear"):
+        st.session_state.current_query_input = ""
+        st.session_state.pending_query_input_clear = False
 
     real_backend_runner, real_debug_runner, real_backend_wiring_error = build_real_backend_runners()
 
@@ -209,14 +212,13 @@ def main() -> None:
             with st.spinner("Running legal RAG pipeline..."):
                 try:
                     conversation_history = st.session_state.get("conversation_history", [])
-                    default_recent_messages = serialize_history_as_messages(conversation_history)
-                    default_summary = summarize_conversation(conversation_history)
-                    recent_messages = (
-                        input_state["recent_messages"]
-                        if input_state["recent_messages_override_used"]
-                        else default_recent_messages
+                    conversation_summary, recent_messages, _ = build_backend_context(
+                        history=conversation_history,
+                        conversation_summary_input=input_state["conversation_summary"],
+                        recent_messages_override=(
+                            input_state["recent_messages"] if input_state["recent_messages_override_used"] else None
+                        ),
                     )
-                    conversation_summary = input_state["conversation_summary"] or default_summary
 
                     response = run_backend_query(
                         query=input_state["query"],
@@ -231,6 +233,8 @@ def main() -> None:
                         "final_result": response.final_result,
                         "debug_payload": response.debug_payload,
                     }
+                    st.session_state.latest_result = response.final_result
+                    st.session_state.latest_debug_payload = response.debug_payload
                     debug_payload = response.debug_payload or {}
                     context_resolution = debug_payload.get("context_resolution") if isinstance(debug_payload, dict) else None
                     resolution_dict = (
@@ -251,6 +255,8 @@ def main() -> None:
                         answer_text=response.final_result.get("answer_text", ""),
                         metadata=turn_metadata,
                     )
+                    st.session_state.pending_query_input_clear = True
+                    st.rerun()
                 except BackendAdapterError as exc:
                     st.warning(f"Backend adapter warning: {exc}")
                     st.session_state.last_run = {

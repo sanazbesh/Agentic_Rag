@@ -51,15 +51,18 @@ def initialize_session_state() -> None:
     """Initialize session defaults for local debugging workflow."""
 
     defaults: dict[str, Any] = {
-        "query": "",
-        "conversation_summary": "",
-        "recent_messages_json": "[]",
+        "current_query_input": "",
+        "conversation_summary_input": "",
+        "recent_messages_override": "[]",
         "conversation_history": [],
         "selected_document_ids": [],
         "selected_documents": [],
         "uploaded_documents": [],
         "use_mock_backend": True,
         "show_debug": True,
+        "latest_result": None,
+        "latest_debug_payload": None,
+        "pending_query_input_clear": False,
         "last_run": None,
     }
     for key, value in defaults.items():
@@ -218,58 +221,62 @@ def render_sidebar(
 
 
 def render_query_input() -> dict[str, Any]:
-    """Render query and optional context input form."""
+    """Render query form with independent state for input vs conversation memory.
+
+    `current_query_input` is intentionally separate from `conversation_history` and
+    latest result payloads so normal multi-turn runs do not require manual reset.
+    """
 
     st.subheader("Run Legal RAG Query")
     with st.form("rag_query_form", clear_on_submit=False):
-        query = st.text_area(
+        st.text_area(
             "Query",
-            value=st.session_state.query,
+            key="current_query_input",
             height=100,
             placeholder="Ask a legal question to test retrieval and grounding...",
         )
-        conversation_summary = st.text_area(
+        st.text_area(
             "Conversation summary (optional)",
-            value=st.session_state.conversation_summary,
+            key="conversation_summary_input",
             height=100,
         )
-        recent_messages_json = st.text_area(
+        st.text_area(
             "recent_messages JSON (optional)",
-            value=st.session_state.recent_messages_json,
+            key="recent_messages_override",
             height=130,
             help='Expected: [{"role": "user", "content": "..."}, ...]',
         )
 
         col_run, col_reset = st.columns([1, 1])
         run_clicked = col_run.form_submit_button("Run", use_container_width=True)
-        reset_clicked = col_reset.form_submit_button("Clear Conversation", use_container_width=True)
+        reset_clicked = col_reset.form_submit_button("Start New Conversation", use_container_width=True)
 
     if reset_clicked:
-        st.session_state.query = ""
-        st.session_state.conversation_summary = ""
-        st.session_state.recent_messages_json = "[]"
+        st.session_state.current_query_input = ""
+        st.session_state.conversation_summary_input = ""
+        st.session_state.recent_messages_override = "[]"
         st.session_state.conversation_history = []
+        st.session_state.latest_result = None
+        st.session_state.latest_debug_payload = None
         st.session_state.last_run = None
         st.rerun()
-
-    st.session_state.query = query
-    st.session_state.conversation_summary = conversation_summary
-    st.session_state.recent_messages_json = recent_messages_json
 
     parse_error = None
     recent_messages = None
     try:
-        recent_messages = parse_recent_messages(recent_messages_json)
+        recent_messages = parse_recent_messages(st.session_state.recent_messages_override)
     except BackendAdapterError as exc:
         parse_error = str(exc)
 
     return {
         "run_clicked": run_clicked,
         "clear_clicked": reset_clicked,
-        "query": query,
-        "conversation_summary": conversation_summary or None,
+        "query": st.session_state.current_query_input,
+        "conversation_summary": st.session_state.conversation_summary_input or None,
         "recent_messages": recent_messages,
-        "recent_messages_override_used": bool(recent_messages_json.strip() and recent_messages_json.strip() != "[]"),
+        "recent_messages_override_used": bool(
+            st.session_state.recent_messages_override.strip() and st.session_state.recent_messages_override.strip() != "[]"
+        ),
         "recent_messages_parse_error": parse_error,
     }
 
