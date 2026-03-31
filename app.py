@@ -255,8 +255,7 @@ def main() -> None:
                         answer_text=response.final_result.get("answer_text", ""),
                         metadata=turn_metadata,
                     )
-                    st.session_state.pending_query_input_clear = True
-                    st.rerun()
+                    st.session_state.current_query_input = ""
                 except BackendAdapterError as exc:
                     st.warning(f"Backend adapter warning: {exc}")
                     st.session_state.last_run = {

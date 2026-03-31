@@ -62,7 +62,6 @@ def initialize_session_state() -> None:
         "show_debug": True,
         "latest_result": None,
         "latest_debug_payload": None,
-        "pending_query_input_clear": False,
         "last_run": None,
     }
     for key, value in defaults.items():
