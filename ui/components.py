@@ -54,6 +54,8 @@ def initialize_session_state() -> None:
         "current_query_input": "",
         "conversation_summary_input": "",
         "recent_messages_override": "[]",
+        "pending_query_input_clear": False,
+        "pending_full_reset": False,
         "conversation_history": [],
         "selected_document_ids": [],
         "selected_documents": [],
@@ -251,13 +253,9 @@ def render_query_input() -> dict[str, Any]:
         reset_clicked = col_reset.form_submit_button("Start New Conversation", use_container_width=True)
 
     if reset_clicked:
-        st.session_state.current_query_input = ""
-        st.session_state.conversation_summary_input = ""
-        st.session_state.recent_messages_override = "[]"
-        st.session_state.conversation_history = []
-        st.session_state.latest_result = None
-        st.session_state.latest_debug_payload = None
-        st.session_state.last_run = None
+        # Defer widget-backed state mutation until next rerun to avoid
+        # Streamlit's "cannot be modified after widget is instantiated" error.
+        st.session_state.pending_full_reset = True
         st.rerun()
 
     parse_error = None

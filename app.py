@@ -184,6 +184,15 @@ def main() -> None:
     st.caption("Local-first Streamlit UI for testing retrieval, grounding, citations, and debug state.")
 
     initialize_session_state()
+    if st.session_state.get("pending_full_reset"):
+        st.session_state.current_query_input = ""
+        st.session_state.conversation_summary_input = ""
+        st.session_state.recent_messages_override = "[]"
+        st.session_state.conversation_history = []
+        st.session_state.latest_result = None
+        st.session_state.latest_debug_payload = None
+        st.session_state.last_run = None
+        st.session_state.pending_full_reset = False
     if st.session_state.get("pending_query_input_clear"):
         st.session_state.current_query_input = ""
         st.session_state.pending_query_input_clear = False
@@ -255,7 +264,8 @@ def main() -> None:
                         answer_text=response.final_result.get("answer_text", ""),
                         metadata=turn_metadata,
                     )
-                    st.session_state.current_query_input = ""
+                    st.session_state.pending_query_input_clear = True
+                    st.rerun()
                 except BackendAdapterError as exc:
                     st.warning(f"Backend adapter warning: {exc}")
                     st.session_state.last_run = {
