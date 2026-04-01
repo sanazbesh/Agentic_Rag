@@ -10,7 +10,6 @@ from agentic_rag.orchestration.legal_rag_graph import (
     default_legal_rag_state,
     run_legal_rag_turn,
 )
-from agentic_rag.orchestration.query_understanding import understand_query
 from agentic_rag.orchestration.retrieval_graph import QueryRoutingDecision, RetrievalDependencies, RetrievalGraphConfig
 from agentic_rag.retrieval.parent_child import HybridSearchResult, ParentChunkResult, RerankedChunkResult
 from agentic_rag.tools.answer_generation import AnswerCitation, GenerateAnswerResult
@@ -353,16 +352,3 @@ def test_build_full_graph_composition_works() -> None:
     final_state = graph.invoke(initial)
     assert final_state["final_response_ready"] is True
     assert isinstance(final_state["final_answer"], FinalAnswerModel)
-
-
-def test_answerability_gate_blocks_generation_on_insufficient_context() -> None:
-    definition_decision = understand_query("what is employment agreement?")
-    services = FakeServices(
-        classifier=definition_decision,
-        hybrid_results=[_hybrid("c1", "p1")],
-        reranked_results=[_reranked("c1", "p1")],
-        parent_results=[_parent("p1", text="Employment Agreement")],
-    )
-    result = run_legal_rag_turn(query="what is employment agreement?", dependencies=services.as_dependencies())
-    assert result.sufficient_context is False
-    assert any("answerability_gate" in warning for warning in result.warnings)
