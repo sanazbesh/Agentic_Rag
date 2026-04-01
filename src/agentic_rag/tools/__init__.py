@@ -8,7 +8,6 @@ from .context_processing import (
     compress_context,
 )
 from .answer_generation import AnswerCitation, GenerateAnswerResult, LegalAnswerSynthesizer, generate_answer
-from .answerability import AnswerabilityAssessment, AnswerabilityAssessor, assess_answerability
 from .query_intelligence import (
     LegalEntityExtractionResult,
     LegalEntityExtractor,
@@ -32,9 +31,6 @@ __all__ = [
     "GenerateAnswerResult",
     "LegalAnswerSynthesizer",
     "generate_answer",
-    "AnswerabilityAssessment",
-    "AnswerabilityAssessor",
-    "assess_answerability",
     "QueryRewriteResult",
     "QueryDecompositionResult",
     "QueryTransformationService",

@@ -25,7 +25,6 @@ from agentic_rag.orchestration.retrieval_graph import (
 )
 from agentic_rag.retrieval.parent_child import ParentChunkResult
 from agentic_rag.tools.answer_generation import AnswerCitation, GenerateAnswerResult, generate_answer
-from agentic_rag.tools.answerability import AnswerabilityAssessment, assess_answerability
 from agentic_rag.tools.context_processing import CompressedParentChunk
 
 logger = logging.getLogger(__name__)
@@ -67,15 +66,10 @@ class LegalRagState(RetrievalStageState, total=False):
     citations: list[AnswerCitation]
     sufficient_context: bool | None
     grounded: bool | None
-    answerability_assessment: AnswerabilityAssessment | None
 
 
 class AnswerGenerator(Protocol):
     def __call__(self, context: Sequence[object], query: str) -> GenerateAnswerResult: ...
-
-
-class AnswerabilityEvaluator(Protocol):
-    def __call__(self, query: str, query_understanding: object, retrieved_context: Sequence[object]) -> AnswerabilityAssessment: ...
 
 
 @dataclass(slots=True)
@@ -84,7 +78,6 @@ class LegalRagDependencies:
 
     retrieval: RetrievalDependencies
     generate_grounded_answer: AnswerGenerator = generate_answer
-    assess_answerability: AnswerabilityEvaluator = assess_answerability
 
 
 EMPTY_CONTEXT_MESSAGE = (
@@ -123,7 +116,6 @@ def default_legal_rag_state(
             "citations": [],
             "sufficient_context": None,
             "grounded": None,
-            "answerability_assessment": None,
         }
     )
     return cast(LegalRagState, merged)
@@ -220,9 +212,8 @@ class AnswerStageNodes:
     handling, and finalization are code-driven without free-form tool loops.
     """
 
-    def __init__(self, answer_generator: AnswerGenerator, answerability_evaluator: AnswerabilityEvaluator) -> None:
+    def __init__(self, answer_generator: AnswerGenerator) -> None:
         self.answer_generator = answer_generator
-        self.answerability_evaluator = answerability_evaluator
 
     def prepare_answer_context(self, state: LegalRagState) -> LegalRagState:
         """Select answer context deterministically: compressed context first, then parent chunks."""
@@ -256,34 +247,6 @@ class AnswerStageNodes:
         updated["warnings"] = warnings
         return cast(LegalRagState, updated)
 
-
-    def assess_answerability(self, state: LegalRagState) -> LegalRagState:
-        """Assess whether retrieved context is sufficient before answer generation."""
-
-        logger.info("node_enter name=assess_answerability")
-        updated = dict(state)
-        warnings = list(updated.get("warnings", []))
-        query = str(updated.get("effective_query") or updated.get("original_query") or "").strip()
-        query_understanding = updated.get("query_classification")
-        context = list(updated.get("answer_context", []))
-
-        if query_understanding is None:
-            warnings.append("answerability_assessment_missing_query_understanding")
-            updated["warnings"] = warnings
-            logger.info("node_exit name=assess_answerability skipped=true reason=missing_query_understanding")
-            return cast(LegalRagState, updated)
-
-        assessment = self.answerability_evaluator(query, query_understanding, context)
-        updated["answerability_assessment"] = assessment
-        updated["warnings"] = [*warnings, *assessment.warnings]
-        logger.info(
-            "node_exit name=assess_answerability sufficient=%s should_answer=%s support_level=%s",
-            assessment.sufficient_context,
-            assessment.should_answer,
-            assessment.support_level,
-        )
-        return cast(LegalRagState, updated)
-
     def generate_grounded_answer(self, state: LegalRagState) -> LegalRagState:
         """Call `generate_answer(context, effective_query)` and persist structured output."""
 
@@ -291,7 +254,6 @@ class AnswerStageNodes:
         updated = dict(state)
         warnings = list(updated.get("warnings", []))
         answer_context = list(updated.get("answer_context", []))
-        assessment = updated.get("answerability_assessment")
 
         if not answer_context:
             fallback = FinalAnswerModel(
@@ -307,28 +269,6 @@ class AnswerStageNodes:
             updated["sufficient_context"] = False
             updated["warnings"] = list(fallback.warnings)
             logger.info("node_exit name=generate_grounded_answer success=true empty_context=true")
-            return cast(LegalRagState, updated)
-
-        if isinstance(assessment, AnswerabilityAssessment) and not assessment.should_answer:
-            fallback = FinalAnswerModel(
-                answer_text=(
-                    "Direct answer: The retrieved context is not sufficiently answerable for this query. "
-                    "A safe response requires clarification or additional evidence."
-                ),
-                grounded=False,
-                sufficient_context=False,
-                citations=[],
-                warnings=[
-                    *warnings,
-                    f"answerability_gate:{assessment.insufficiency_reason or 'other'}",
-                ],
-            )
-            updated["final_answer"] = fallback
-            updated["citations"] = []
-            updated["grounded"] = False
-            updated["sufficient_context"] = False
-            updated["warnings"] = list(fallback.warnings)
-            logger.info("node_exit name=generate_grounded_answer gated=true reason=%s", assessment.insufficiency_reason)
             return cast(LegalRagState, updated)
 
         effective_query = str(updated.get("effective_query") or updated.get("original_query") or "").strip()
@@ -404,33 +344,26 @@ class _FallbackAnswerGraph:
     def invoke(self, state: LegalRagState) -> LegalRagState:
         current = state
         current = self._nodes.prepare_answer_context(current)
-        current = self._nodes.assess_answerability(current)
         current = self._nodes.generate_grounded_answer(current)
         current = self._nodes.finalize_response(current)
         return current
 
 
-def build_answer_graph(
-    *,
-    answer_generator: AnswerGenerator = generate_answer,
-    answerability_evaluator: AnswerabilityEvaluator = assess_answerability,
-) -> Any:
+def build_answer_graph(*, answer_generator: AnswerGenerator = generate_answer) -> Any:
     """Build explicit answer-stage graph without autonomous agent loops."""
 
-    nodes = AnswerStageNodes(answer_generator=answer_generator, answerability_evaluator=answerability_evaluator)
+    nodes = AnswerStageNodes(answer_generator=answer_generator)
 
     if StateGraph is None:  # pragma: no cover
         return _FallbackAnswerGraph(nodes)
 
     graph = StateGraph(LegalRagState)
     graph.add_node("prepare_answer_context", nodes.prepare_answer_context)
-    graph.add_node("assess_answerability", nodes.assess_answerability)
     graph.add_node("generate_grounded_answer", nodes.generate_grounded_answer)
     graph.add_node("finalize_response", nodes.finalize_response)
 
     graph.add_edge(START, "prepare_answer_context")
-    graph.add_edge("prepare_answer_context", "assess_answerability")
-    graph.add_edge("assess_answerability", "generate_grounded_answer")
+    graph.add_edge("prepare_answer_context", "generate_grounded_answer")
     graph.add_edge("generate_grounded_answer", "finalize_response")
     graph.add_edge("finalize_response", END)
     return graph.compile()
@@ -458,10 +391,7 @@ def build_full_legal_rag_graph(
     """Build end-to-end deterministic graph composition for legal RAG turns."""
 
     retrieval_app = build_retrieval_graph(dependencies.retrieval, config=retrieval_config)
-    answer_app = build_answer_graph(
-        answer_generator=dependencies.generate_grounded_answer,
-        answerability_evaluator=dependencies.assess_answerability,
-    )
+    answer_app = build_answer_graph(answer_generator=dependencies.generate_grounded_answer)
     return _ComposedLegalRagApp(retrieval_app=retrieval_app, answer_app=answer_app)
 
 
