@@ -95,6 +95,8 @@ def default_legal_rag_state(
     query: str,
     conversation_summary: str | None = None,
     recent_messages: Sequence[Mapping[str, Any]] | None = None,
+    active_documents: Sequence[Any] | None = None,
+    selected_documents: Sequence[Any] | None = None,
 ) -> LegalRagState:
     """Build initial end-to-end graph state with explicit defaults."""
 
@@ -102,6 +104,8 @@ def default_legal_rag_state(
         query=query,
         conversation_summary=conversation_summary,
         recent_messages=recent_messages,
+        active_documents=active_documents,
+        selected_documents=selected_documents,
     )
     merged = dict(retrieval_state)
     merged.update(
@@ -397,6 +401,8 @@ def run_legal_rag_turn(
     dependencies: LegalRagDependencies,
     conversation_summary: str | None = None,
     recent_messages: Sequence[Mapping[str, Any]] | None = None,
+    active_documents: Sequence[Any] | None = None,
+    selected_documents: Sequence[Any] | None = None,
     retrieval_config: RetrievalGraphConfig | None = None,
 ) -> FinalAnswerModel:
     """Run one full legal RAG graph turn and return only the final typed answer.
@@ -409,6 +415,8 @@ def run_legal_rag_turn(
         query=query,
         conversation_summary=conversation_summary,
         recent_messages=recent_messages,
+        active_documents=active_documents,
+        selected_documents=selected_documents,
     )
     app = build_full_legal_rag_graph(dependencies=dependencies, retrieval_config=retrieval_config)
     final_state = cast(LegalRagState, app.invoke(initial))
@@ -424,6 +432,8 @@ def run_legal_rag_turn_with_state(
     dependencies: LegalRagDependencies,
     conversation_summary: str | None = None,
     recent_messages: Sequence[Mapping[str, Any]] | None = None,
+    active_documents: Sequence[Any] | None = None,
+    selected_documents: Sequence[Any] | None = None,
     retrieval_config: RetrievalGraphConfig | None = None,
 ) -> tuple[FinalAnswerModel, LegalRagState]:
     """Run one legal RAG turn and return both final answer and full state for debug/session memory."""
@@ -432,6 +442,8 @@ def run_legal_rag_turn_with_state(
         query=query,
         conversation_summary=conversation_summary,
         recent_messages=recent_messages,
+        active_documents=active_documents,
+        selected_documents=selected_documents,
     )
     app = build_full_legal_rag_graph(dependencies=dependencies, retrieval_config=retrieval_config)
     final_state = cast(LegalRagState, app.invoke(initial))
