@@ -17,6 +17,7 @@ try:  # pragma: no cover - optional runtime dependency
 except Exception:  # pragma: no cover - fallback for constrained envs
     from agentic_rag._compat_pydantic import BaseModel, ConfigDict, Field
 
+from agentic_rag.orchestration.query_understanding import QueryUnderstandingResult, understand_query
 from agentic_rag.retrieval.parent_child import HybridSearchResult, ParentChunkResult, RerankedChunkResult
 from agentic_rag.tools.context_processing import CompressContextResult, CompressedParentChunk
 from agentic_rag.tools.query_intelligence import LegalEntityExtractionResult, QueryRewriteResult
@@ -31,20 +32,7 @@ except Exception:  # pragma: no cover - deterministic fallback used in tests
     StateGraph = None
 
 
-class QueryRoutingDecision(BaseModel):
-    """Strict routing output for deterministic query-state classification."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    is_followup: bool
-    is_ambiguous: bool
-    is_context_dependent: bool
-    use_conversation_context: bool
-    should_rewrite: bool
-    should_extract_entities: bool
-    refers_to_prior_document_scope: bool
-    refers_to_prior_clause_or_topic: bool
-    routing_notes: list[str] = Field(default_factory=list)
+QueryRoutingDecision = QueryUnderstandingResult
 
 
 class QueryContextResolution(BaseModel):
@@ -66,6 +54,8 @@ class RetrievalStageState(TypedDict):
     original_query: str
     conversation_summary: str | None
     recent_messages: list[Mapping[str, Any]]
+    active_documents: list[Any]
+    selected_documents: list[Any]
     use_conversation_context: bool
 
     rewritten_query: str | None
@@ -105,6 +95,8 @@ class QueryClassifier(Protocol):
         *,
         conversation_summary: str | None,
         recent_messages: Sequence[Mapping[str, Any]],
+        active_documents: Sequence[Any] | None = None,
+        selected_documents: Sequence[Any] | None = None,
     ) -> QueryRoutingDecision: ...
 
 
@@ -136,6 +128,8 @@ def default_retrieval_state(
     query: str,
     conversation_summary: str | None = None,
     recent_messages: Sequence[Mapping[str, Any]] | None = None,
+    active_documents: Sequence[Any] | None = None,
+    selected_documents: Sequence[Any] | None = None,
 ) -> RetrievalStageState:
     """Build strict initial state with explicit defaults for all list fields."""
 
@@ -144,6 +138,8 @@ def default_retrieval_state(
         original_query=normalized_query,
         conversation_summary=conversation_summary,
         recent_messages=list(recent_messages or []),
+        active_documents=list(active_documents or []),
+        selected_documents=list(selected_documents or []),
         use_conversation_context=False,
         rewritten_query=None,
         resolved_query=normalized_query,
@@ -175,102 +171,17 @@ def heuristic_query_classifier(
     *,
     conversation_summary: str | None,
     recent_messages: Sequence[Mapping[str, Any]],
+    active_documents: Sequence[Any] | None = None,
+    selected_documents: Sequence[Any] | None = None,
 ) -> QueryRoutingDecision:
-    """Conservative deterministic classifier used when no LLM classifier is injected."""
+    """Conservative deterministic classifier backed by strict understand_query()."""
 
-    lowered = (query or "").strip().lower()
-    followup_starters = (
-        "what about",
-        "how about",
-        "does that",
-        "is that",
-        "compare that",
-        "what does it say",
-    )
-    followup_markers = {"that", "those", "it", "they", "this", "these", "above", "previous"}
-    legal_filter_markers = {
-        "court",
-        "statute",
-        "regulation",
-        "clause",
-        "law",
-        "jurisdiction",
-        "ontario",
-        "california",
-        "delaware",
-        "new york",
-        "federal",
-        "section",
-        "article",
-        "agreement",
-        "contract",
-    }
-    ambiguous_markers = {"exception", "that", "this", "it", "still apply", "what about"}
-    pronoun_markers = {
-        "it",
-        "this",
-        "that",
-        "the document",
-        "this document",
-        "that document",
-        "the clause",
-        "that clause",
-        "this agreement",
-        "that agreement",
-    }
-    explicit_scope_markers = {
-        " in the nda",
-        " in the msa",
-        " in the lease",
-        " in the agreement",
-        " in the contract",
-        " in the statute",
-    }
-
-    token_set = set(lowered.split())
-    has_recent_context = bool((conversation_summary and conversation_summary.strip()) or recent_messages)
-    is_followup = lowered.startswith(followup_starters) or bool(token_set.intersection(followup_markers))
-    is_context_dependent = any(marker in lowered for marker in pronoun_markers) or lowered.startswith(
-        ("what about", "does it", "compare that")
-    )
-    has_explicit_new_scope = any(marker in f" {lowered}" for marker in explicit_scope_markers) and "that agreement" not in lowered
-    is_ambiguous = any(marker in lowered for marker in ambiguous_markers) and len(token_set) <= 10
-    use_context = has_recent_context and (is_followup or is_ambiguous or is_context_dependent) and not has_explicit_new_scope
-    refers_to_prior_document_scope = is_context_dependent and any(
-        marker in lowered
-        for marker in ("it", "document", "that agreement", "this agreement")
-    )
-    refers_to_prior_clause_or_topic = is_context_dependent and any(
-        marker in lowered for marker in ("clause", "what about", "compare that", "still apply")
-    )
-
-    should_rewrite = is_followup or is_ambiguous or is_context_dependent or len(token_set) <= 3
-    should_extract = any(marker in lowered for marker in legal_filter_markers)
-
-    notes: list[str] = []
-    if is_followup:
-        notes.append("followup_like_query")
-    if is_ambiguous:
-        notes.append("ambiguous_or_elliptical")
-    if is_context_dependent:
-        notes.append("context_dependent")
-    if use_context:
-        notes.append("use_conversation_context")
-    if should_rewrite:
-        notes.append("rewrite_recommended")
-    if should_extract:
-        notes.append("entity_extraction_useful")
-
-    return QueryRoutingDecision(
-        is_followup=is_followup,
-        is_ambiguous=is_ambiguous,
-        is_context_dependent=is_context_dependent,
-        use_conversation_context=use_context,
-        should_rewrite=should_rewrite,
-        should_extract_entities=should_extract,
-        refers_to_prior_document_scope=refers_to_prior_document_scope,
-        refers_to_prior_clause_or_topic=refers_to_prior_clause_or_topic,
-        routing_notes=notes,
+    return understand_query(
+        query,
+        conversation_summary=conversation_summary,
+        recent_messages=recent_messages,
+        active_documents=active_documents,
+        selected_documents=selected_documents,
     )
 
 
@@ -354,6 +265,8 @@ class RetrievalGraphNodes:
             updated["original_query"],
             conversation_summary=updated["conversation_summary"],
             recent_messages=updated["recent_messages"],
+            active_documents=updated.get("active_documents"),
+            selected_documents=updated.get("selected_documents"),
         )
         updated["query_classification"] = decision
         updated["use_conversation_context"] = decision.use_conversation_context
@@ -362,7 +275,7 @@ class RetrievalGraphNodes:
         logger.info(
             "node_exit name=classify_query_state followup=%s ambiguous=%s rewrite=%s extract=%s",
             decision.is_followup,
-            decision.is_ambiguous,
+            decision.question_type == "ambiguous_query",
             decision.should_rewrite,
             decision.should_extract_entities,
         )
@@ -719,6 +632,8 @@ def run_retrieval_stage(
     dependencies: RetrievalDependencies,
     conversation_summary: str | None = None,
     recent_messages: Sequence[Mapping[str, Any]] | None = None,
+    active_documents: Sequence[Any] | None = None,
+    selected_documents: Sequence[Any] | None = None,
     config: RetrievalGraphConfig | None = None,
 ) -> RetrievalStageState:
     """Invoke retrieval graph and return state ready for downstream answer synthesis."""
@@ -727,6 +642,8 @@ def run_retrieval_stage(
         query=query,
         conversation_summary=conversation_summary,
         recent_messages=recent_messages,
+        active_documents=active_documents,
+        selected_documents=selected_documents,
     )
     app = build_retrieval_graph(dependencies=dependencies, config=config)
     return cast(RetrievalStageState, app.invoke(initial_state))

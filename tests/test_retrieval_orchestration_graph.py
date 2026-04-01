@@ -144,15 +144,26 @@ def _parent(parent_id: str, text: str = "short legal text") -> ParentChunkResult
 
 def _decision(*, followup: bool, ambiguous: bool, use_context: bool, rewrite: bool, extract: bool) -> QueryRoutingDecision:
     return QueryRoutingDecision(
+        original_query="q",
+        normalized_query="q",
+        question_type="ambiguous_query" if ambiguous else "other_query",
         is_followup=followup,
-        is_ambiguous=ambiguous,
         is_context_dependent=followup or ambiguous,
         use_conversation_context=use_context,
+        is_document_scoped=False,
         should_rewrite=rewrite,
         should_extract_entities=extract,
+        should_retrieve=True,
+        may_need_decomposition=False,
+        resolved_document_hints=[],
+        resolved_topic_hints=[],
+        resolved_clause_hints=[],
+        answerability_expectation="general_grounded_response",
         refers_to_prior_document_scope=followup,
         refers_to_prior_clause_or_topic=followup,
+        ambiguity_notes=[],
         routing_notes=["test"],
+        warnings=[],
     )
 
 

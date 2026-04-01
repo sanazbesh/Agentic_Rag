@@ -125,15 +125,26 @@ class FakeServices:
 
 def _decision(*, rewrite: bool = False) -> QueryRoutingDecision:
     return QueryRoutingDecision(
+        original_query="q",
+        normalized_query="q",
+        question_type="other_query",
         is_followup=False,
-        is_ambiguous=False,
         is_context_dependent=False,
         use_conversation_context=False,
+        is_document_scoped=False,
         should_rewrite=rewrite,
         should_extract_entities=False,
+        should_retrieve=True,
+        may_need_decomposition=False,
+        resolved_document_hints=[],
+        resolved_topic_hints=[],
+        resolved_clause_hints=[],
+        answerability_expectation="general_grounded_response",
         refers_to_prior_document_scope=False,
         refers_to_prior_clause_or_topic=False,
+        ambiguity_notes=[],
         routing_notes=["test"],
+        warnings=[],
     )
 
 

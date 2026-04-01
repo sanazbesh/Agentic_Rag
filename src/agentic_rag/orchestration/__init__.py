@@ -10,6 +10,7 @@ from .legal_rag_graph import (
     default_legal_rag_state,
     run_legal_rag_turn,
 )
+from .query_understanding import QueryUnderstandingResult, understand_query
 
 from .retrieval_graph import (
     QueryRoutingDecision,
@@ -33,6 +34,8 @@ __all__ = [
     "heuristic_query_classifier",
     "build_retrieval_graph",
     "run_retrieval_stage",
+    "QueryUnderstandingResult",
+    "understand_query",
     "FinalAnswerModel",
     "LegalRagState",
     "LegalRagDependencies",
