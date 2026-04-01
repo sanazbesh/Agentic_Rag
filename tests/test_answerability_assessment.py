@@ -123,3 +123,13 @@ def test_no_heading_only_false_positive() -> None:
     assert result.has_relevant_context is True
     assert result.sufficient_context is False
     assert result.insufficiency_reason == "only_title_or_heading_match"
+
+
+def test_relevance_requires_token_match_not_substring() -> None:
+    from agentic_rag.tools.answerability import AnswerabilityAssessor
+
+    assessor = AnswerabilityAssessor()
+    query_terms = {"law"}
+    item = {"heading": "Drafting Notes", "text": "This section discusses a flaw in drafting quality controls."}
+
+    assert assessor._is_relevant(item, query_terms) is False

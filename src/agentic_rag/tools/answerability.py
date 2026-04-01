@@ -382,7 +382,8 @@ class AnswerabilityAssessor:
 
     def _is_relevant(self, item: Mapping[str, str], query_terms: set[str]) -> bool:
         haystack = f"{item.get('heading', '').lower()} {item.get('text', '').lower()}"
-        return any(term in haystack for term in query_terms)
+        tokens = set(re.findall(r"[a-z0-9]+", haystack))
+        return any(term in tokens for term in query_terms)
 
     def _is_heading_or_title_only(self, item: Mapping[str, str]) -> bool:
         body = (item.get("text") or "").strip()
