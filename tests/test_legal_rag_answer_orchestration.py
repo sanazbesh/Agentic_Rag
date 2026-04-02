@@ -13,6 +13,7 @@ from agentic_rag.orchestration.legal_rag_graph import (
 from agentic_rag.orchestration.query_understanding import understand_query
 from agentic_rag.orchestration.retrieval_graph import QueryRoutingDecision, RetrievalDependencies, RetrievalGraphConfig
 from agentic_rag.retrieval.parent_child import HybridSearchResult, ParentChunkResult, RerankedChunkResult
+from agentic_rag.tools.answerability import AnswerabilityAssessment, assess_answerability
 from agentic_rag.tools.answer_generation import AnswerCitation, GenerateAnswerResult
 from agentic_rag.tools.context_processing import CompressContextResult, CompressedParentChunk
 from agentic_rag.tools.query_intelligence import LegalEntityExtractionResult, LegalEntityFilters, QueryRewriteResult
@@ -31,6 +32,8 @@ class FakeServices:
     answer_raises: bool = False
 
     answer_calls: list[dict[str, Any]] = field(default_factory=list)
+    answerability_raises: bool = False
+    answerability_result: AnswerabilityAssessment | None = None
 
     def retrieval_dependencies(self) -> RetrievalDependencies:
         return RetrievalDependencies(
@@ -47,6 +50,7 @@ class FakeServices:
         return LegalRagDependencies(
             retrieval=self.retrieval_dependencies(),
             generate_grounded_answer=self.generate_answer,
+            assess_answerability=self.assess_answerability,
         )
 
     def classify(self, *_: Any, **__: Any) -> QueryRoutingDecision:
@@ -122,6 +126,13 @@ class FakeServices:
             ],
             warnings=[],
         )
+
+    def assess_answerability(self, query: str, query_understanding: Any, retrieved_context: list[object]) -> AnswerabilityAssessment:
+        if self.answerability_raises:
+            raise RuntimeError("answerability_fail")
+        if self.answerability_result is not None:
+            return self.answerability_result
+        return assess_answerability(query=query, query_understanding=query_understanding, retrieved_context=retrieved_context)
 
 
 def _decision(*, rewrite: bool = False) -> QueryRoutingDecision:
@@ -240,7 +251,7 @@ def test_empty_context_insufficiency_response() -> None:
     assert result.grounded is False
     assert result.sufficient_context is False
     assert result.citations == []
-    assert "No relevant information was retrieved" in result.answer_text
+    assert "does not contain enough information" in result.answer_text
 
 
 def test_partial_context_flags_preserved() -> None:
@@ -365,4 +376,141 @@ def test_answerability_gate_blocks_generation_on_insufficient_context() -> None:
     )
     result = run_legal_rag_turn(query="what is employment agreement?", dependencies=services.as_dependencies())
     assert result.sufficient_context is False
+    assert len(services.answer_calls) == 0
     assert any("answerability_gate" in warning for warning in result.warnings)
+
+
+def test_clause_lookup_success_routes_to_generation() -> None:
+    services = FakeServices(
+        classifier=_decision(),
+        hybrid_results=[_hybrid("c1", "p1")],
+        reranked_results=[_reranked("c1", "p1")],
+        parent_results=[_parent("p1", text="Confidentiality obligations survive termination.")],
+        answerability_result=AnswerabilityAssessment(
+            original_query="what does the document say about confidentiality?",
+            question_type="document_content_query",
+            answerability_expectation="clause_lookup",
+            has_relevant_context=True,
+            sufficient_context=True,
+            partially_supported=False,
+            should_answer=True,
+            support_level="sufficient",
+            insufficiency_reason=None,
+            matched_parent_chunk_ids=["p1"],
+            matched_headings=["Confidentiality"],
+            evidence_notes=[],
+            warnings=[],
+        ),
+    )
+    result = run_legal_rag_turn(query="what does the document say about confidentiality?", dependencies=services.as_dependencies())
+    assert len(services.answer_calls) == 1
+    assert result.grounded is True
+
+
+def test_fact_extraction_insufficiency_skips_generation() -> None:
+    services = FakeServices(
+        classifier=_decision(),
+        hybrid_results=[_hybrid("c1", "p1")],
+        reranked_results=[_reranked("c1", "p1")],
+        parent_results=[_parent("p1", text="General terms only")],
+        answerability_result=AnswerabilityAssessment(
+            original_query="who are the parties?",
+            question_type="extractive_fact_query",
+            answerability_expectation="fact_extraction",
+            has_relevant_context=True,
+            sufficient_context=False,
+            partially_supported=False,
+            should_answer=False,
+            support_level="weak",
+            insufficiency_reason="fact_not_found",
+            matched_parent_chunk_ids=["p1"],
+            matched_headings=[],
+            evidence_notes=["requested_fact_missing_from_context"],
+            warnings=[],
+        ),
+    )
+    result = run_legal_rag_turn(query="who are the parties?", dependencies=services.as_dependencies())
+    assert len(services.answer_calls) == 0
+    assert result.sufficient_context is False
+
+
+def test_summary_insufficiency_is_not_treated_as_sufficient() -> None:
+    services = FakeServices(
+        classifier=_decision(),
+        hybrid_results=[_hybrid("c1", "p1")],
+        reranked_results=[_reranked("c1", "p1")],
+        parent_results=[_parent("p1", text="Only one clause available")],
+        answerability_result=AnswerabilityAssessment(
+            original_query="summarize this agreement",
+            question_type="document_summary_query",
+            answerability_expectation="summary",
+            has_relevant_context=True,
+            sufficient_context=False,
+            partially_supported=True,
+            should_answer=False,
+            support_level="partial",
+            insufficiency_reason="summary_not_supported",
+            matched_parent_chunk_ids=["p1"],
+            matched_headings=[],
+            evidence_notes=["single_chunk_insufficient_for_summary"],
+            warnings=[],
+        ),
+    )
+    result = run_legal_rag_turn(query="summarize this agreement", dependencies=services.as_dependencies())
+    assert len(services.answer_calls) == 0
+    assert result.sufficient_context is False
+    assert any("answerability_gate:summary_not_supported" == warning for warning in result.warnings)
+
+
+def test_partial_support_routes_to_insufficient_response_for_v1_policy() -> None:
+    services = FakeServices(
+        classifier=_decision(),
+        hybrid_results=[_hybrid("c1", "p1")],
+        reranked_results=[_reranked("c1", "p1")],
+        parent_results=[_parent("p1", text="Topic mention without full answer")],
+        answerability_result=AnswerabilityAssessment(
+            original_query="compare obligations",
+            question_type="comparison_query",
+            answerability_expectation="comparison",
+            has_relevant_context=True,
+            sufficient_context=False,
+            partially_supported=True,
+            should_answer=False,
+            support_level="partial",
+            insufficiency_reason="comparison_not_supported",
+            matched_parent_chunk_ids=["p1"],
+            matched_headings=[],
+            evidence_notes=["one_sided_evidence_only"],
+            warnings=[],
+        ),
+    )
+    result = run_legal_rag_turn(query="compare obligations", dependencies=services.as_dependencies())
+    assert len(services.answer_calls) == 0
+    assert result.sufficient_context is False
+
+
+def test_answerability_failure_falls_back_to_safe_insufficiency() -> None:
+    services = FakeServices(
+        classifier=_decision(),
+        hybrid_results=[_hybrid("c1", "p1")],
+        reranked_results=[_reranked("c1", "p1")],
+        parent_results=[_parent("p1", text="some context")],
+        answerability_raises=True,
+    )
+    result = run_legal_rag_turn(query="Q", dependencies=services.as_dependencies())
+    assert len(services.answer_calls) == 0
+    assert result.sufficient_context is False
+    assert any("answerability_assessment_failed" in warning for warning in result.warnings)
+
+
+def test_regression_definition_title_only_does_not_generate_clause_answer() -> None:
+    definition_decision = understand_query("what is employment agreement?")
+    services = FakeServices(
+        classifier=definition_decision,
+        hybrid_results=[_hybrid("c1", "p1")],
+        reranked_results=[_reranked("c1", "p1")],
+        parent_results=[_parent("p1", text="Employment Agreement\nTermination Without Cause...")],
+    )
+    result = run_legal_rag_turn(query="what is employment agreement?", dependencies=services.as_dependencies())
+    assert len(services.answer_calls) == 0
+    assert "Termination Without Cause" not in result.answer_text

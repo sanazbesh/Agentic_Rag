@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol, TypedDict, cast
+from typing import Any, Literal, Protocol, cast
 
 try:  # pragma: no cover - optional runtime dependency
     from pydantic import BaseModel, ConfigDict, Field
@@ -62,12 +62,16 @@ class LegalRagState(RetrievalStageState, total=False):
     """
 
     answer_context: list[ParentChunkResult | CompressedParentChunk]
+    answerability_result: AnswerabilityAssessment | None
     final_answer: FinalAnswerModel | None
     final_response_ready: bool
     citations: list[AnswerCitation]
     sufficient_context: bool | None
     grounded: bool | None
     answerability_assessment: AnswerabilityAssessment | None
+    should_generate_answer: bool
+    should_return_partial_response: bool
+    should_return_insufficient_response: bool
 
 
 class AnswerGenerator(Protocol):
@@ -124,6 +128,10 @@ def default_legal_rag_state(
             "sufficient_context": None,
             "grounded": None,
             "answerability_assessment": None,
+            "answerability_result": None,
+            "should_generate_answer": False,
+            "should_return_partial_response": False,
+            "should_return_insufficient_response": True,
         }
     )
     return cast(LegalRagState, merged)
@@ -258,7 +266,13 @@ class AnswerStageNodes:
 
 
     def assess_answerability(self, state: LegalRagState) -> LegalRagState:
-        """Assess whether retrieved context is sufficient before answer generation."""
+        """Hard gating node for answer generation.
+
+        Why this gate exists:
+        - relevance alone is not enough to answer safely,
+        - definition queries must not pass on title-only support,
+        - insufficient/partial evidence must route to a safe final response.
+        """
 
         logger.info("node_enter name=assess_answerability")
         updated = dict(state)
@@ -269,19 +283,41 @@ class AnswerStageNodes:
 
         if query_understanding is None:
             warnings.append("answerability_assessment_missing_query_understanding")
+            updated["answerability_assessment"] = None
+            updated["answerability_result"] = None
+            updated["should_generate_answer"] = False
+            updated["should_return_partial_response"] = False
+            updated["should_return_insufficient_response"] = True
             updated["warnings"] = warnings
             logger.info("node_exit name=assess_answerability skipped=true reason=missing_query_understanding")
             return cast(LegalRagState, updated)
 
-        assessment = self.answerability_evaluator(query, query_understanding, context)
-        updated["answerability_assessment"] = assessment
-        updated["warnings"] = [*warnings, *assessment.warnings]
-        logger.info(
-            "node_exit name=assess_answerability sufficient=%s should_answer=%s support_level=%s",
-            assessment.sufficient_context,
-            assessment.should_answer,
-            assessment.support_level,
-        )
+        try:
+            assessment = self.answerability_evaluator(query, query_understanding, context)
+            updated["answerability_assessment"] = assessment
+            updated["answerability_result"] = assessment
+            should_generate_answer = bool(assessment.sufficient_context and assessment.should_answer)
+            should_return_partial_response = bool((not assessment.sufficient_context) and assessment.partially_supported)
+            should_return_insufficient_response = not should_generate_answer
+            updated["should_generate_answer"] = should_generate_answer
+            updated["should_return_partial_response"] = should_return_partial_response
+            updated["should_return_insufficient_response"] = should_return_insufficient_response
+            updated["warnings"] = [*warnings, *assessment.warnings]
+            logger.info(
+                "node_exit name=assess_answerability support_level=%s sufficient_context=%s partially_supported=%s should_answer=%s",
+                assessment.support_level,
+                assessment.sufficient_context,
+                assessment.partially_supported,
+                assessment.should_answer,
+            )
+        except Exception as exc:
+            updated["answerability_assessment"] = None
+            updated["answerability_result"] = None
+            updated["should_generate_answer"] = False
+            updated["should_return_partial_response"] = False
+            updated["should_return_insufficient_response"] = True
+            updated["warnings"] = [*warnings, f"answerability_assessment_failed:{type(exc).__name__}"]
+            logger.info("node_exit name=assess_answerability success=false reason=%s", type(exc).__name__)
         return cast(LegalRagState, updated)
 
     def generate_grounded_answer(self, state: LegalRagState) -> LegalRagState:
@@ -291,7 +327,7 @@ class AnswerStageNodes:
         updated = dict(state)
         warnings = list(updated.get("warnings", []))
         answer_context = list(updated.get("answer_context", []))
-        assessment = updated.get("answerability_assessment")
+        should_generate_answer = bool(updated.get("should_generate_answer", False))
 
         if not answer_context:
             fallback = FinalAnswerModel(
@@ -309,26 +345,16 @@ class AnswerStageNodes:
             logger.info("node_exit name=generate_grounded_answer success=true empty_context=true")
             return cast(LegalRagState, updated)
 
-        if isinstance(assessment, AnswerabilityAssessment) and not assessment.should_answer:
-            fallback = FinalAnswerModel(
-                answer_text=(
-                    "Direct answer: The retrieved context is not sufficiently answerable for this query. "
-                    "A safe response requires clarification or additional evidence."
-                ),
-                grounded=False,
-                sufficient_context=False,
-                citations=[],
-                warnings=[
-                    *warnings,
-                    f"answerability_gate:{assessment.insufficiency_reason or 'other'}",
-                ],
+        if not should_generate_answer:
+            fallback = _safe_fallback(
+                warnings=[*warnings, "routing_violation:generate_without_answerability_approval"],
             )
             updated["final_answer"] = fallback
             updated["citations"] = []
             updated["grounded"] = False
             updated["sufficient_context"] = False
             updated["warnings"] = list(fallback.warnings)
-            logger.info("node_exit name=generate_grounded_answer gated=true reason=%s", assessment.insufficiency_reason)
+            logger.info("node_exit name=generate_grounded_answer success=false reason=routing_violation")
             return cast(LegalRagState, updated)
 
         effective_query = str(updated.get("effective_query") or updated.get("original_query") or "").strip()
@@ -359,6 +385,50 @@ class AnswerStageNodes:
             updated["warnings"] = list(failure.warnings)
             logger.info("node_exit name=generate_grounded_answer success=false reason=%s", type(exc).__name__)
             return cast(LegalRagState, updated)
+
+    def build_insufficient_response(self, state: LegalRagState) -> LegalRagState:
+        """Build a strict final response when answerability blocks normal generation."""
+
+        logger.info("node_enter name=build_insufficient_response")
+        updated = dict(state)
+        warnings = list(updated.get("warnings", []))
+        assessment = updated.get("answerability_result")
+
+        insufficiency_message = (
+            "Direct answer: The retrieved context does not contain enough information to answer the question fully."
+        )
+        if isinstance(assessment, AnswerabilityAssessment):
+            if assessment.insufficiency_reason == "definition_not_supported":
+                insufficiency_message = (
+                    "Direct answer: The retrieved context includes related material, but it does not define the term itself."
+                )
+            elif assessment.insufficiency_reason == "fact_not_found":
+                insufficiency_message = (
+                    "Direct answer: The retrieved context does not contain enough information to identify the requested fact."
+                )
+            elif assessment.partially_supported:
+                insufficiency_message = (
+                    "Direct answer: The retrieved context only partially supports the question and is not sufficient for a full answer."
+                )
+
+            reason = assessment.insufficiency_reason or "other"
+            warnings.append(f"answerability_gate:{reason}")
+            warnings.extend(list(assessment.evidence_notes))
+
+        final = FinalAnswerModel(
+            answer_text=insufficiency_message,
+            grounded=False,
+            sufficient_context=False,
+            citations=[],
+            warnings=warnings,
+        )
+        updated["final_answer"] = final
+        updated["citations"] = []
+        updated["grounded"] = False
+        updated["sufficient_context"] = False
+        updated["warnings"] = list(final.warnings)
+        logger.info("node_exit name=build_insufficient_response route=insufficient_response")
+        return cast(LegalRagState, updated)
 
     def finalize_response(self, state: LegalRagState) -> LegalRagState:
         """Validate/correct final answer so graph always exits with one typed output object."""
@@ -396,6 +466,15 @@ class AnswerStageNodes:
         )
         return cast(LegalRagState, updated)
 
+    def route_after_answerability(self, state: LegalRagState) -> Literal["generate_grounded_answer", "build_insufficient_response"]:
+        """Deterministic routing based on answerability gate output."""
+
+        if bool(state.get("should_generate_answer", False)):
+            logger.info("answerability_route selected=generate_answer")
+            return "generate_grounded_answer"
+        logger.info("answerability_route selected=insufficient_response")
+        return "build_insufficient_response"
+
 
 class _FallbackAnswerGraph:
     def __init__(self, nodes: AnswerStageNodes) -> None:
@@ -405,7 +484,11 @@ class _FallbackAnswerGraph:
         current = state
         current = self._nodes.prepare_answer_context(current)
         current = self._nodes.assess_answerability(current)
-        current = self._nodes.generate_grounded_answer(current)
+        route = self._nodes.route_after_answerability(current)
+        if route == "generate_grounded_answer":
+            current = self._nodes.generate_grounded_answer(current)
+        else:
+            current = self._nodes.build_insufficient_response(current)
         current = self._nodes.finalize_response(current)
         return current
 
@@ -426,12 +509,21 @@ def build_answer_graph(
     graph.add_node("prepare_answer_context", nodes.prepare_answer_context)
     graph.add_node("assess_answerability", nodes.assess_answerability)
     graph.add_node("generate_grounded_answer", nodes.generate_grounded_answer)
+    graph.add_node("build_insufficient_response", nodes.build_insufficient_response)
     graph.add_node("finalize_response", nodes.finalize_response)
 
     graph.add_edge(START, "prepare_answer_context")
     graph.add_edge("prepare_answer_context", "assess_answerability")
-    graph.add_edge("assess_answerability", "generate_grounded_answer")
+    graph.add_conditional_edges(
+        "assess_answerability",
+        nodes.route_after_answerability,
+        {
+            "generate_grounded_answer": "generate_grounded_answer",
+            "build_insufficient_response": "build_insufficient_response",
+        },
+    )
     graph.add_edge("generate_grounded_answer", "finalize_response")
+    graph.add_edge("build_insufficient_response", "finalize_response")
     graph.add_edge("finalize_response", END)
     return graph.compile()
 
