@@ -15,6 +15,7 @@ DEBUG_SECTIONS = [
     ("adapter_meta", "Adapter Meta"),
     ("query_classification", "Query Classification"),
     ("context_resolution", "Conversation Resolution"),
+    ("answerability_result", "Answerability Assessment"),
     ("resolved_query", "Resolved Query"),
     ("effective_query", "Effective Query"),
     ("resolved_document_scope", "Resolved Document Scope"),

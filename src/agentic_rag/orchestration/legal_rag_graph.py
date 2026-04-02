@@ -69,6 +69,7 @@ class LegalRagState(RetrievalStageState, total=False):
     sufficient_context: bool | None
     grounded: bool | None
     answerability_assessment: AnswerabilityAssessment | None
+    answerability_assessment_invoked: bool
     should_generate_answer: bool
     should_return_partial_response: bool
     should_return_insufficient_response: bool
@@ -128,6 +129,7 @@ def default_legal_rag_state(
             "sufficient_context": None,
             "grounded": None,
             "answerability_assessment": None,
+            "answerability_assessment_invoked": False,
             "answerability_result": None,
             "should_generate_answer": False,
             "should_return_partial_response": False,
@@ -277,6 +279,7 @@ class AnswerStageNodes:
         logger.info("node_enter name=assess_answerability")
         updated = dict(state)
         warnings = list(updated.get("warnings", []))
+        updated["answerability_assessment_invoked"] = True
         query = str(updated.get("effective_query") or updated.get("original_query") or "").strip()
         query_understanding = updated.get("query_classification")
         context = list(updated.get("answer_context", []))
