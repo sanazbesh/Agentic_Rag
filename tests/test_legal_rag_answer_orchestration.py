@@ -370,9 +370,15 @@ def test_answerability_gate_blocks_generation_on_insufficient_context() -> None:
     definition_decision = understand_query("what is employment agreement?")
     services = FakeServices(
         classifier=definition_decision,
-        hybrid_results=[_hybrid("c1", "p1")],
-        reranked_results=[_reranked("c1", "p1")],
-        parent_results=[_parent("p1", text="Employment Agreement")],
+        hybrid_results=[_hybrid("c1", "p1"), _hybrid("c2", "p2")],
+        reranked_results=[_reranked("c1", "p1"), _reranked("c2", "p2")],
+        parent_results=[
+            _parent("p1", text="Employment Agreement"),
+            _parent(
+                "p2",
+                text="This agreement is governed by New York law and may be terminated with thirty days written notice.",
+            ),
+        ],
     )
     result = run_legal_rag_turn(query="what is employment agreement?", dependencies=services.as_dependencies())
     assert result.sufficient_context is False
