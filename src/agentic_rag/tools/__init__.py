@@ -8,7 +8,15 @@ from .context_processing import (
     compress_context,
 )
 from .answer_generation import AnswerCitation, GenerateAnswerResult, LegalAnswerSynthesizer, generate_answer
-from .answerability import CoverageEvaluation, AnswerabilityAssessment, AnswerabilityAssessor, assess_answerability, evaluate_coverage
+from .answerability import (
+    CoverageEvaluation,
+    EvidenceStrengthEvaluation,
+    AnswerabilityAssessment,
+    AnswerabilityAssessor,
+    assess_answerability,
+    evaluate_coverage,
+    evaluate_evidence_strength,
+)
 from .query_intelligence import (
     LegalEntityExtractionResult,
     LegalEntityExtractor,
@@ -33,10 +41,12 @@ __all__ = [
     "LegalAnswerSynthesizer",
     "generate_answer",
     "CoverageEvaluation",
+    "EvidenceStrengthEvaluation",
     "AnswerabilityAssessment",
     "AnswerabilityAssessor",
     "assess_answerability",
     "evaluate_coverage",
+    "evaluate_evidence_strength",
     "QueryRewriteResult",
     "QueryDecompositionResult",
     "QueryTransformationService",
