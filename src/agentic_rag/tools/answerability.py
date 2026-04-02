@@ -246,6 +246,10 @@ class AnswerabilityAssessor:
 
         if expectation == "definition_required":
             if heading_only:
+                logger.debug(
+                    "evaluate_coverage_definition branch=heading_only sufficient_coverage=false matched_items=%s",
+                    len(matched),
+                )
                 return build(
                     status="weak",
                     has_any_coverage=True,
@@ -255,7 +259,12 @@ class AnswerabilityAssessor:
                     missing_requirements=["explicit_definitional_language"],
                     warnings=["heading_only_context"],
                 )
-            has_def_lang = bool(re.search(r"\b(is|means|refers to|defined as|definition of)\b", body_text))
+            has_def_lang = self._has_definition_support(original_query, substantive)
+            logger.debug(
+                "evaluate_coverage_definition branch=substantive has_definitional_support=%s substantive_items=%s",
+                has_def_lang,
+                len(substantive),
+            )
             if has_def_lang:
                 return build(
                     status="sufficient",
@@ -496,6 +505,54 @@ class AnswerabilityAssessor:
         if len(side_terms) < 2:
             return 0
         return sum(1 for terms in side_terms[:2] if any(term in context_text for term in terms))
+
+    def _has_definition_support(self, query: str, substantive: Sequence[Mapping[str, str]]) -> bool:
+        targets = self._definition_targets(query)
+        if not targets:
+            return False
+
+        for item in substantive:
+            text = (item.get("text") or "").lower()
+            if not text:
+                continue
+            for target in targets:
+                escaped = re.escape(target)
+                patterns = (
+                    rf"\b{escaped}\b\s+means\b",
+                    rf"\b{escaped}\b\s+refers\s+to\b",
+                    rf"\b{escaped}\b\s+is\s+defined\s+as\b",
+                    rf"\b{escaped}\b\s+is\s+(?:an?|the)\b",
+                    rf"\bdefinition\s+of\s+{escaped}\b",
+                    rf"[\"“']{escaped}[\"”']\s+means\b",
+                )
+                if any(re.search(pattern, text) for pattern in patterns):
+                    return True
+        return False
+
+    def _definition_targets(self, query: str) -> tuple[str, ...]:
+        normalized = " ".join((query or "").lower().strip().split())
+        if not normalized:
+            return ()
+
+        leads = (
+            r"^(?:what|who)\s+(?:is|are)\s+",
+            r"^define\s+",
+            r"^what\s+does\s+.+?\s+mean\s*$",
+            r"^meaning\s+of\s+",
+            r"^definition\s+of\s+",
+        )
+        candidate = normalized
+        for lead in leads:
+            candidate = re.sub(lead, "", candidate)
+        candidate = candidate.rstrip(" ?.!")
+        candidate = re.sub(r"\b(?:in|under|for)\s+this\s+agreement\b.*$", "", candidate).strip()
+        if not candidate:
+            return ()
+
+        targets: list[str] = [candidate]
+        if " " in candidate:
+            targets.append(candidate.split()[-1])
+        return tuple(dict.fromkeys(t for t in targets if t))
 
     def _field(self, item: object, key: str) -> Any:
         if isinstance(item, Mapping):

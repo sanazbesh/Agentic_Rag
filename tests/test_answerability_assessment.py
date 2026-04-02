@@ -63,6 +63,46 @@ def test_definition_success_with_explanatory_language() -> None:
     assert result.sufficient_coverage is True
 
 
+def test_definition_regression_title_and_clauses_without_definition_not_sufficient() -> None:
+    query = "what is employment agreement?"
+    understanding = understand_query(query)
+    context = [
+        _parent("p1", "Employment Agreement", heading="Employment Agreement"),
+        _parent(
+            "p2",
+            "Either party may terminate this agreement with thirty (30) days written notice. This agreement is governed by New York law.",
+            heading="Termination",
+        ),
+        _parent(
+            "p3",
+            "The employee must keep Confidential Information confidential during and after employment.",
+            heading="Confidentiality",
+        ),
+    ]
+
+    result = assess_answerability(query, understanding, context)
+
+    assert result.question_type == "definition_query"
+    assert result.answerability_expectation == "definition_required"
+    assert result.has_relevant_context is True
+    assert result.sufficient_context is False
+    assert result.should_answer is False
+    assert result.support_level in {"weak", "partial"}
+    assert result.insufficiency_reason in {"definition_not_supported", "only_title_or_heading_match"}
+
+
+def test_definition_title_only_is_not_sufficient() -> None:
+    query = "what is employment agreement?"
+    understanding = understand_query(query)
+    context = [_parent("p1", "Employment Agreement", heading="Employment Agreement")]
+
+    coverage = evaluate_coverage(query, understanding, context)
+
+    assert coverage.has_any_coverage is True
+    assert coverage.sufficient_coverage is False
+    assert coverage.coverage_reason == "definition_not_supported"
+
+
 def test_summary_insufficiency_on_single_clause() -> None:
     query = "summarize this agreement"
     understanding = understand_query(query)
