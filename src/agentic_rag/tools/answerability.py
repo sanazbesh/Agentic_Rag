@@ -48,6 +48,17 @@ AnswerabilityExpectation = Literal[
 
 SupportLevel = Literal["none", "weak", "partial", "sufficient"]
 CoverageStatus = Literal["none", "weak", "partial", "sufficient"]
+EvidenceStrength = Literal["none", "weak", "moderate", "strong"]
+EvidenceStrengthReason = Literal[
+    "no_context",
+    "title_only_match",
+    "heading_only_match",
+    "thin_single_clause",
+    "single_substantive_clause",
+    "multiple_substantive_sections",
+    "broad_multi_section_support",
+    "other",
+]
 CoverageReason = Literal[
     "no_context",
     "no_relevant_support",
@@ -130,12 +141,51 @@ class CoverageEvaluation(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class EvidenceStrengthEvaluation(BaseModel):
+    """Strict structural evidence-strength contract for answerability composition.
+
+    Strength is intentionally evaluated separately from expectation-based coverage:
+    heading/title matches can be topically related while still weak evidence.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    original_query: str
+    evidence_strength: EvidenceStrength
+
+    has_title_only_match: bool
+    has_heading_only_match: bool
+    has_substantive_clause_text: bool
+    has_multiple_substantive_sections: bool
+
+    distinct_parent_chunk_count: int
+    distinct_heading_count: int
+    approximate_text_span_count: int
+
+    strength_reason: EvidenceStrengthReason | None
+
+    supporting_signals: list[str] = Field(default_factory=list)
+    weakness_signals: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+@dataclass(slots=True, frozen=True)
+class EvidenceStrengthThresholds:
+    """Centralized deterministic thresholds for evidence-strength classification."""
+
+    thin_clause_char_threshold: int = 80
+    substantive_clause_char_threshold: int = 120
+    multiple_substantive_sections_threshold: int = 2
+    broad_parent_chunk_threshold: int = 2
+
+
 @dataclass(slots=True)
 class AnswerabilityAssessor:
     """Deterministic evaluator for evidence coverage versus query expectation."""
 
     min_substantive_chars: int = 40
     summary_min_chunks: int = 2
+    evidence_strength_thresholds: EvidenceStrengthThresholds = EvidenceStrengthThresholds()
 
     def assess(
         self,
@@ -401,6 +451,187 @@ class AnswerabilityAssessor:
             warnings=["heading_only_context"] if heading_only else [],
         )
 
+    def evaluate_evidence_strength(
+        self,
+        *,
+        query: str,
+        query_understanding: QueryUnderstandingResult,
+        context: Sequence[object],
+    ) -> EvidenceStrengthEvaluation:
+        """Evaluate structural/substantive evidence strength independent of coverage.
+
+        This method only inspects retrieved context depth/breadth and explicitly
+        separates titles/headings from substantive clause body text.
+        """
+
+        del query_understanding  # intentionally not a primary strength driver
+        original_query = (query or "").strip()
+        normalized_context = [self._normalize_context_item(item) for item in list(context or [])]
+
+        if not normalized_context:
+            return EvidenceStrengthEvaluation(
+                original_query=original_query,
+                evidence_strength="none",
+                has_title_only_match=False,
+                has_heading_only_match=False,
+                has_substantive_clause_text=False,
+                has_multiple_substantive_sections=False,
+                distinct_parent_chunk_count=0,
+                distinct_heading_count=0,
+                approximate_text_span_count=0,
+                strength_reason="no_context",
+                warnings=["empty_retrieved_context"],
+            )
+
+        threshold = self.evidence_strength_thresholds
+        total_items = len(normalized_context)
+        title_only_items = [item for item in normalized_context if self._is_title_only(item)]
+        heading_only_items = [item for item in normalized_context if self._is_heading_only(item)]
+        substantive_items = [item for item in normalized_context if self._is_substantive_body(item)]
+        thin_body_items = [item for item in normalized_context if self._is_thin_body(item)]
+
+        distinct_parent_chunk_count = len({item["parent_chunk_id"] for item in normalized_context if item["parent_chunk_id"]})
+        distinct_heading_count = len({item["heading"].lower() for item in normalized_context if item["heading"]})
+        substantive_parent_count = len({item["parent_chunk_id"] for item in substantive_items if item["parent_chunk_id"]})
+        substantive_heading_count = len({item["heading"].lower() for item in substantive_items if item["heading"]})
+        # Deterministic definition: number of substantive body blocks.
+        approximate_text_span_count = len(substantive_items)
+
+        has_title_only_match = bool(title_only_items) and not substantive_items and len(title_only_items) == total_items
+        has_heading_only_match = bool(heading_only_items) and not substantive_items and len(heading_only_items) == total_items
+        has_substantive_clause_text = bool(substantive_items)
+        has_multiple_substantive_sections = (
+            substantive_heading_count >= threshold.multiple_substantive_sections_threshold
+            or substantive_parent_count >= threshold.multiple_substantive_sections_threshold
+        )
+
+        supporting_signals: list[str] = []
+        weakness_signals: list[str] = []
+        warnings: list[str] = []
+
+        if has_substantive_clause_text:
+            supporting_signals.append(f"substantive_body_blocks:{len(substantive_items)}")
+        if substantive_heading_count:
+            supporting_signals.append(f"substantive_distinct_headings:{substantive_heading_count}")
+        if substantive_parent_count:
+            supporting_signals.append(f"substantive_distinct_parents:{substantive_parent_count}")
+
+        if has_title_only_match:
+            weakness_signals.append("title_only_signal_without_body")
+        if has_heading_only_match:
+            weakness_signals.append("heading_only_signal_without_body")
+        if thin_body_items and not substantive_items:
+            weakness_signals.append("only_thin_body_fragments_detected")
+        if not substantive_items:
+            warnings.append("no_substantive_clause_text_detected")
+
+        if has_title_only_match:
+            return EvidenceStrengthEvaluation(
+                original_query=original_query,
+                evidence_strength="weak",
+                has_title_only_match=True,
+                has_heading_only_match=False,
+                has_substantive_clause_text=False,
+                has_multiple_substantive_sections=False,
+                distinct_parent_chunk_count=distinct_parent_chunk_count,
+                distinct_heading_count=distinct_heading_count,
+                approximate_text_span_count=approximate_text_span_count,
+                strength_reason="title_only_match",
+                supporting_signals=supporting_signals,
+                weakness_signals=weakness_signals,
+                warnings=warnings,
+            )
+
+        if has_heading_only_match:
+            return EvidenceStrengthEvaluation(
+                original_query=original_query,
+                evidence_strength="weak",
+                has_title_only_match=False,
+                has_heading_only_match=True,
+                has_substantive_clause_text=False,
+                has_multiple_substantive_sections=False,
+                distinct_parent_chunk_count=distinct_parent_chunk_count,
+                distinct_heading_count=distinct_heading_count,
+                approximate_text_span_count=approximate_text_span_count,
+                strength_reason="heading_only_match",
+                supporting_signals=supporting_signals,
+                weakness_signals=weakness_signals,
+                warnings=warnings,
+            )
+
+        if not substantive_items and thin_body_items:
+            return EvidenceStrengthEvaluation(
+                original_query=original_query,
+                evidence_strength="weak",
+                has_title_only_match=False,
+                has_heading_only_match=False,
+                has_substantive_clause_text=False,
+                has_multiple_substantive_sections=False,
+                distinct_parent_chunk_count=distinct_parent_chunk_count,
+                distinct_heading_count=distinct_heading_count,
+                approximate_text_span_count=approximate_text_span_count,
+                strength_reason="thin_single_clause",
+                supporting_signals=supporting_signals,
+                weakness_signals=weakness_signals,
+                warnings=warnings,
+            )
+
+        if approximate_text_span_count == 1 and has_substantive_clause_text:
+            return EvidenceStrengthEvaluation(
+                original_query=original_query,
+                evidence_strength="moderate",
+                has_title_only_match=False,
+                has_heading_only_match=False,
+                has_substantive_clause_text=True,
+                has_multiple_substantive_sections=False,
+                distinct_parent_chunk_count=distinct_parent_chunk_count,
+                distinct_heading_count=distinct_heading_count,
+                approximate_text_span_count=approximate_text_span_count,
+                strength_reason="single_substantive_clause",
+                supporting_signals=supporting_signals,
+                weakness_signals=weakness_signals,
+                warnings=warnings,
+            )
+
+        if has_multiple_substantive_sections:
+            reason: EvidenceStrengthReason = "multiple_substantive_sections"
+            if (
+                substantive_parent_count >= threshold.broad_parent_chunk_threshold
+                and approximate_text_span_count >= threshold.multiple_substantive_sections_threshold
+            ):
+                reason = "broad_multi_section_support"
+            return EvidenceStrengthEvaluation(
+                original_query=original_query,
+                evidence_strength="strong",
+                has_title_only_match=False,
+                has_heading_only_match=False,
+                has_substantive_clause_text=True,
+                has_multiple_substantive_sections=True,
+                distinct_parent_chunk_count=distinct_parent_chunk_count,
+                distinct_heading_count=distinct_heading_count,
+                approximate_text_span_count=approximate_text_span_count,
+                strength_reason=reason,
+                supporting_signals=supporting_signals,
+                weakness_signals=weakness_signals,
+                warnings=warnings,
+            )
+
+        return EvidenceStrengthEvaluation(
+            original_query=original_query,
+            evidence_strength="moderate" if has_substantive_clause_text else "weak",
+            has_title_only_match=False,
+            has_heading_only_match=False,
+            has_substantive_clause_text=has_substantive_clause_text,
+            has_multiple_substantive_sections=False,
+            distinct_parent_chunk_count=distinct_parent_chunk_count,
+            distinct_heading_count=distinct_heading_count,
+            approximate_text_span_count=approximate_text_span_count,
+            strength_reason="other",
+            supporting_signals=supporting_signals,
+            weakness_signals=weakness_signals,
+            warnings=warnings,
+        )
+
     def _coverage_to_assessment(
         self,
         *,
@@ -478,6 +709,45 @@ class AnswerabilityAssessor:
         if heading and body.lower() == heading.lower():
             return True
         return False
+
+    def _is_title_only(self, item: Mapping[str, str]) -> bool:
+        body = (item.get("text") or "").strip()
+        heading = (item.get("heading") or "").strip()
+        source_name = (item.get("source_name") or "").strip()
+        if not body:
+            return False
+        if heading and body.lower() == heading.lower() and source_name and body.lower() == source_name.lower():
+            return True
+        if source_name and body.lower() == source_name.lower() and len(body) <= self.evidence_strength_thresholds.thin_clause_char_threshold:
+            return True
+        return False
+
+    def _is_heading_only(self, item: Mapping[str, str]) -> bool:
+        body = (item.get("text") or "").strip()
+        heading = (item.get("heading") or "").strip()
+        if not body:
+            return False
+        return bool(heading and body.lower() == heading.lower())
+
+    def _is_substantive_body(self, item: Mapping[str, str]) -> bool:
+        text = (item.get("text") or "").strip()
+        heading = (item.get("heading") or "").strip()
+        if not text:
+            return False
+        if heading and text.lower() == heading.lower():
+            return False
+        if len(text) < self.evidence_strength_thresholds.substantive_clause_char_threshold:
+            return False
+        return True
+
+    def _is_thin_body(self, item: Mapping[str, str]) -> bool:
+        text = (item.get("text") or "").strip()
+        heading = (item.get("heading") or "").strip()
+        if not text:
+            return False
+        if heading and text.lower() == heading.lower():
+            return False
+        return len(text) < self.evidence_strength_thresholds.substantive_clause_char_threshold
 
     def _query_terms(self, query: str) -> set[str]:
         stop = {"the", "a", "an", "what", "is", "are", "does", "say", "about", "this", "that", "which", "who", "how"}
@@ -626,6 +896,23 @@ def evaluate_coverage(
     """Return deterministic coverage evaluation for retrieved answer context."""
 
     return _DEFAULT_ANSWERABILITY_ASSESSOR.evaluate_coverage(
+        query=query,
+        query_understanding=query_understanding,
+        context=context,
+    )
+
+
+def evaluate_evidence_strength(
+    query: str,
+    query_understanding: QueryUnderstandingResult,
+    context: Sequence[object],
+) -> EvidenceStrengthEvaluation:
+    """Return deterministic evidence-strength evaluation for retrieved context.
+
+    Unlike coverage, this only measures structural and textual evidence depth.
+    """
+
+    return _DEFAULT_ANSWERABILITY_ASSESSOR.evaluate_evidence_strength(
         query=query,
         query_understanding=query_understanding,
         context=context,
