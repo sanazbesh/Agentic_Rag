@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from agentic_rag.orchestration.query_understanding import understand_query
 from agentic_rag.retrieval.parent_child import ParentChunkResult
-from agentic_rag.tools.answerability import assess_answerability, evaluate_coverage
+from agentic_rag.tools.answerability import CoverageEvaluation, assess_answerability, evaluate_coverage
 
 
 def _parent(pid: str, text: str, heading: str = "") -> ParentChunkResult:
@@ -195,3 +195,73 @@ def test_relevance_requires_token_match_not_substring() -> None:
     item = {"heading": "Drafting Notes", "text": "This section discusses a flaw in drafting quality controls."}
 
     assert assessor._is_relevant(item, query_terms) is False
+
+
+def test_assess_answerability_delegates_to_evaluate_coverage(monkeypatch) -> None:
+    query = "which law governs the agreement?"
+    understanding = understand_query(query)
+
+    def _stub_coverage(*args, **kwargs) -> CoverageEvaluation:
+        return CoverageEvaluation(
+            original_query=query,
+            answerability_expectation=understanding.answerability_expectation,
+            coverage_status="weak",
+            has_any_coverage=True,
+            sufficient_coverage=False,
+            partial_coverage=False,
+            coverage_reason="no_relevant_support",
+            matched_parent_chunk_ids=["p1"],
+            matched_headings=["Governing Law"],
+            supporting_signals=[],
+            missing_requirements=["explicit_fact_statement_in_context"],
+            warnings=[],
+        )
+
+    monkeypatch.setattr("agentic_rag.tools.answerability.evaluate_coverage", _stub_coverage)
+    result = assess_answerability(query, understanding, [])
+
+    assert result.sufficient_context is False
+    assert result.should_answer is False
+
+
+def test_assess_answerability_no_silent_upgrade_for_partial_coverage(monkeypatch) -> None:
+    query = "summarize this agreement"
+    understanding = understand_query(query)
+
+    def _stub_coverage(*args, **kwargs) -> CoverageEvaluation:
+        return CoverageEvaluation(
+            original_query=query,
+            answerability_expectation=understanding.answerability_expectation,
+            coverage_status="partial",
+            has_any_coverage=True,
+            sufficient_coverage=False,
+            partial_coverage=True,
+            coverage_reason="summary_partially_supported",
+            matched_parent_chunk_ids=["p1"],
+            matched_headings=["Termination"],
+            supporting_signals=["single_section_context_only"],
+            missing_requirements=["multi_section_or_multi_parent_coverage"],
+            warnings=[],
+        )
+
+    monkeypatch.setattr("agentic_rag.tools.answerability.evaluate_coverage", _stub_coverage)
+    result = assess_answerability(query, understanding, [])
+
+    assert result.sufficient_context is False
+    assert result.partially_supported is True
+    assert result.should_answer is False
+
+
+def test_assess_answerability_coverage_failure_safe_fallback(monkeypatch) -> None:
+    query = "which law governs the agreement?"
+    understanding = understand_query(query)
+
+    def _raise(*args, **kwargs):
+        raise RuntimeError("coverage engine unavailable")
+
+    monkeypatch.setattr("agentic_rag.tools.answerability.evaluate_coverage", _raise)
+    result = assess_answerability(query, understanding, [])
+
+    assert result.sufficient_context is False
+    assert result.should_answer is False
+    assert any(w.startswith("coverage_evaluation_failed:") for w in result.warnings)

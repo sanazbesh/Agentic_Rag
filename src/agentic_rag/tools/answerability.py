@@ -8,6 +8,7 @@ actually sufficient for the query's answerability expectation.
 from __future__ import annotations
 
 import re
+import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
@@ -19,6 +20,9 @@ except Exception:  # pragma: no cover - fallback for constrained envs
 
 if TYPE_CHECKING:  # pragma: no cover
     from agentic_rag.orchestration.query_understanding import QueryUnderstandingResult
+
+
+logger = logging.getLogger(__name__)
 
 QuestionType = Literal[
     "meta_query",
@@ -507,17 +511,54 @@ def assess_answerability(
     query_understanding: QueryUnderstandingResult,
     retrieved_context: Sequence[object],
 ) -> AnswerabilityAssessment:
-    """Assess whether retrieved evidence is sufficient to answer safely.
+    """Coordinator layer for deterministic answerability gating.
 
-    This function is a thin wrapper used by orchestration nodes; it never
-    performs retrieval or final answer generation.
+    Coverage evaluation is delegated to `evaluate_coverage(...)` as the
+    primary source of truth. This coordinator only maps typed coverage output
+    into the strict `AnswerabilityAssessment` contract and applies final safe
+    routing policy (no silent upgrades from partial/insufficient coverage).
     """
 
-    return _DEFAULT_ANSWERABILITY_ASSESSOR.assess(
-        query=query,
-        query_understanding=query_understanding,
-        retrieved_context=retrieved_context,
-    )
+    logger.info("assess_answerability_started")
+    try:
+        coverage = evaluate_coverage(
+            query=query,
+            query_understanding=query_understanding,
+            context=retrieved_context,
+        )
+        assessment = _DEFAULT_ANSWERABILITY_ASSESSOR._coverage_to_assessment(
+            query_understanding=query_understanding,
+            coverage=coverage,
+        )
+        logger.info(
+            "assess_answerability_mapped support_level=%s sufficient_context=%s partially_supported=%s should_answer=%s insufficiency_reason=%s",
+            assessment.support_level,
+            assessment.sufficient_context,
+            assessment.partially_supported,
+            assessment.should_answer,
+            assessment.insufficiency_reason,
+        )
+        return assessment
+    except Exception as exc:
+        logger.warning("assess_answerability_coverage_failure error_type=%s", type(exc).__name__)
+        expectation = str(getattr(query_understanding, "answerability_expectation", "general_grounded_response"))
+        question_type = str(getattr(query_understanding, "question_type", "other_query"))
+        safe_warning = f"coverage_evaluation_failed:{type(exc).__name__}"
+        return AnswerabilityAssessment(
+            original_query=(query or "").strip(),
+            question_type=question_type,
+            answerability_expectation=expectation,
+            has_relevant_context=False,
+            sufficient_context=False,
+            partially_supported=False,
+            should_answer=False,
+            support_level="none",
+            insufficiency_reason="other",
+            matched_parent_chunk_ids=[],
+            matched_headings=[],
+            evidence_notes=[],
+            warnings=[safe_warning],
+        )
 
 
 def evaluate_coverage(
