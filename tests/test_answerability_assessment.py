@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from agentic_rag.orchestration.query_understanding import understand_query
 from agentic_rag.retrieval.parent_child import ParentChunkResult
-from agentic_rag.tools.answerability import assess_answerability
+from agentic_rag.tools.answerability import assess_answerability, evaluate_coverage
 
 
 def _parent(pid: str, text: str, heading: str = "") -> ParentChunkResult:
@@ -25,7 +25,7 @@ def test_definition_failure_on_title_only_match() -> None:
 
     assert result.has_relevant_context is True
     assert result.sufficient_context is False
-    assert result.partially_supported is True
+    assert result.partially_supported is False
     assert result.insufficiency_reason in {"definition_not_supported", "only_title_or_heading_match"}
 
 
@@ -46,6 +46,23 @@ def test_clause_lookup_success() -> None:
     assert result.should_answer is True
 
 
+def test_definition_success_with_explanatory_language() -> None:
+    query = "what is employment agreement?"
+    understanding = understand_query(query)
+    context = [
+        _parent(
+            "p1",
+            "An employment agreement is a contract between an employer and an employee that defines terms of employment.",
+            heading="Definitions",
+        )
+    ]
+
+    result = evaluate_coverage(query, understanding, context)
+
+    assert result.coverage_status == "sufficient"
+    assert result.sufficient_coverage is True
+
+
 def test_summary_insufficiency_on_single_clause() -> None:
     query = "summarize this agreement"
     understanding = understand_query(query)
@@ -56,6 +73,20 @@ def test_summary_insufficiency_on_single_clause() -> None:
     assert result.sufficient_context is False
     assert result.partially_supported is True
     assert result.insufficiency_reason in {"summary_not_supported", "partial_evidence_only"}
+
+
+def test_summary_multi_section_is_sufficient() -> None:
+    query = "summarize this agreement"
+    understanding = understand_query(query)
+    context = [
+        _parent("p1", "Either party may terminate this agreement with thirty (30) days written notice.", heading="Termination"),
+        _parent("p2", "This agreement is governed by the laws of Ontario.", heading="Governing Law"),
+    ]
+
+    result = evaluate_coverage(query, understanding, context)
+
+    assert result.coverage_status == "sufficient"
+    assert result.sufficient_coverage is True
 
 
 def test_fact_extraction_success() -> None:
@@ -88,7 +119,25 @@ def test_comparison_insufficiency_with_one_sided_evidence() -> None:
     result = assess_answerability(query, understanding, context)
 
     assert result.sufficient_context is False
-    assert result.insufficiency_reason == "comparison_not_supported"
+    assert result.partially_supported is True
+    assert result.insufficiency_reason == "partial_evidence_only"
+
+
+def test_comparison_both_sides_evidence_is_sufficient() -> None:
+    query = "compare this agreement versus ontario law"
+    understanding = understand_query(query)
+    context = [
+        _parent(
+            "p1",
+            "This agreement requires arbitration for disputes, while Ontario law permits civil proceedings absent an arbitration clause.",
+            heading="Dispute Resolution",
+        )
+    ]
+
+    result = evaluate_coverage(query, understanding, context)
+
+    assert result.coverage_status == "sufficient"
+    assert result.coverage_reason == "comparison_supported"
 
 
 def test_empty_context() -> None:
@@ -123,6 +172,19 @@ def test_no_heading_only_false_positive() -> None:
     assert result.has_relevant_context is True
     assert result.sufficient_context is False
     assert result.insufficiency_reason == "only_title_or_heading_match"
+
+
+def test_meta_response_returns_strict_no_context_shape() -> None:
+    query = "what files are loaded?"
+    understanding = understand_query(query)
+
+    result = evaluate_coverage(query, understanding, context=[])
+
+    assert result.coverage_status == "none"
+    assert result.has_any_coverage is False
+    assert result.sufficient_coverage is False
+    assert result.partial_coverage is False
+    assert result.coverage_reason == "no_context"
 
 
 def test_relevance_requires_token_match_not_substring() -> None:

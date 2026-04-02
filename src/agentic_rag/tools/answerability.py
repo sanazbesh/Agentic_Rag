@@ -43,6 +43,23 @@ AnswerabilityExpectation = Literal[
 ]
 
 SupportLevel = Literal["none", "weak", "partial", "sufficient"]
+CoverageStatus = Literal["none", "weak", "partial", "sufficient"]
+CoverageReason = Literal[
+    "no_context",
+    "no_relevant_support",
+    "definition_not_supported",
+    "clause_supported",
+    "summary_not_supported",
+    "summary_partially_supported",
+    "fact_not_found",
+    "fact_supported",
+    "comparison_not_supported",
+    "comparison_partially_supported",
+    "comparison_supported",
+    "clarification_needed",
+    "general_support",
+    "other",
+]
 InsufficiencyReason = Literal[
     "no_relevant_context",
     "only_title_or_heading_match",
@@ -87,6 +104,28 @@ class AnswerabilityAssessment(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class CoverageEvaluation(BaseModel):
+    """Strict evidence-coverage output contract for answerability evaluation."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    original_query: str
+    answerability_expectation: AnswerabilityExpectation
+    coverage_status: CoverageStatus
+
+    has_any_coverage: bool
+    sufficient_coverage: bool
+    partial_coverage: bool
+
+    coverage_reason: CoverageReason | None
+
+    matched_parent_chunk_ids: list[str] = Field(default_factory=list)
+    matched_headings: list[str] = Field(default_factory=list)
+    supporting_signals: list[str] = Field(default_factory=list)
+    missing_requirements: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
 @dataclass(slots=True)
 class AnswerabilityAssessor:
     """Deterministic evaluator for evidence coverage versus query expectation."""
@@ -100,275 +139,308 @@ class AnswerabilityAssessor:
         query_understanding: QueryUnderstandingResult,
         retrieved_context: Sequence[object],
     ) -> AnswerabilityAssessment:
+        coverage = self.evaluate_coverage(
+            query=query,
+            query_understanding=query_understanding,
+            context=retrieved_context,
+        )
+        return self._coverage_to_assessment(query_understanding=query_understanding, coverage=coverage)
+
+    def evaluate_coverage(
+        self,
+        *,
+        query: str,
+        query_understanding: QueryUnderstandingResult,
+        context: Sequence[object],
+    ) -> CoverageEvaluation:
         original_query = (query or "").strip()
         expectation = query_understanding.answerability_expectation
 
-        if expectation == "clarification_needed":
-            return AnswerabilityAssessment(
-                original_query=original_query,
-                question_type=query_understanding.question_type,
-                answerability_expectation=expectation,
-                has_relevant_context=False,
-                sufficient_context=False,
-                partially_supported=False,
-                should_answer=False,
-                support_level="none",
-                insufficiency_reason="ambiguity_requires_clarification",
-                warnings=["clarification_needed_from_query_understanding"],
-            )
-
         if expectation == "meta_response":
-            return AnswerabilityAssessment(
+            return CoverageEvaluation(
                 original_query=original_query,
-                question_type=query_understanding.question_type,
                 answerability_expectation=expectation,
-                has_relevant_context=False,
-                sufficient_context=False,
-                partially_supported=False,
-                should_answer=False,
-                support_level="none",
-                insufficiency_reason="other",
-                warnings=["meta_response_handled_outside_retrieval_answerability"],
+                coverage_status="none",
+                has_any_coverage=False,
+                sufficient_coverage=False,
+                partial_coverage=False,
+                coverage_reason="no_context",
+                warnings=["meta_response_no_retrieval_coverage_required"],
             )
 
-        normalized_context = [self._normalize_context_item(item) for item in list(retrieved_context or [])]
-        if not normalized_context:
-            return AnswerabilityAssessment(
+        if expectation == "clarification_needed":
+            return CoverageEvaluation(
                 original_query=original_query,
-                question_type=query_understanding.question_type,
                 answerability_expectation=expectation,
-                has_relevant_context=False,
-                sufficient_context=False,
-                partially_supported=False,
-                should_answer=False,
-                support_level="none",
-                insufficiency_reason="no_relevant_context",
+                coverage_status="weak",
+                has_any_coverage=False,
+                sufficient_coverage=False,
+                partial_coverage=False,
+                coverage_reason="clarification_needed",
+                missing_requirements=["query_requires_clarification_before_evidence_coverage"],
+            )
+
+        normalized_context = [self._normalize_context_item(item) for item in list(context or [])]
+        if not normalized_context:
+            return CoverageEvaluation(
+                original_query=original_query,
+                answerability_expectation=expectation,
+                coverage_status="none",
+                has_any_coverage=False,
+                sufficient_coverage=False,
+                partial_coverage=False,
+                coverage_reason="no_context",
                 warnings=["empty_retrieved_context"],
             )
 
-        query_terms = self._query_terms(original_query)
-        matched = [item for item in normalized_context if self._is_relevant(item, query_terms)]
-        if not matched and query_understanding.question_type in {
-            "definition_query",
-            "document_content_query",
-            "document_summary_query",
-            "extractive_fact_query",
-            "comparison_query",
-        }:
-            matched = list(normalized_context)
-        if not matched and expectation == "general_grounded_response":
-            matched = list(normalized_context)
+        matched = list(normalized_context)
         heading_only = matched and all(self._is_heading_or_title_only(item) for item in matched)
+        substantive = [item for item in matched if not self._is_heading_or_title_only(item)]
 
         matched_ids = [item["parent_chunk_id"] for item in matched if item["parent_chunk_id"]]
         matched_headings = [item["heading"] for item in matched if item["heading"]]
+        distinct_sections = {item["heading"].lower() for item in substantive if item["heading"]}
+        distinct_parents = {item["parent_chunk_id"] for item in substantive if item["parent_chunk_id"]}
+        body_text = "\n".join(item["text"].lower() for item in substantive)
 
         if not matched:
-            return AnswerabilityAssessment(
+            return CoverageEvaluation(
                 original_query=original_query,
-                question_type=query_understanding.question_type,
                 answerability_expectation=expectation,
-                has_relevant_context=False,
-                sufficient_context=False,
-                partially_supported=False,
-                should_answer=False,
-                support_level="none",
-                insufficiency_reason="no_relevant_context",
-                warnings=["retrieved_context_not_relevant_to_query"],
+                coverage_status="none",
+                has_any_coverage=False,
+                sufficient_coverage=False,
+                partial_coverage=False,
+                coverage_reason="no_context",
             )
-
-        if heading_only and expectation != "general_grounded_response":
-            return AnswerabilityAssessment(
-                original_query=original_query,
-                question_type=query_understanding.question_type,
-                answerability_expectation=expectation,
-                has_relevant_context=True,
-                sufficient_context=False,
-                partially_supported=True,
-                should_answer=False,
-                support_level="weak",
-                insufficiency_reason="only_title_or_heading_match",
-                matched_parent_chunk_ids=matched_ids,
-                matched_headings=matched_headings,
-                evidence_notes=["relevant_heading_or_title_matches_without_substantive_body"],
-            )
-
-        return self._assess_by_expectation(
-            original_query=original_query,
-            question_type=query_understanding.question_type,
-            expectation=expectation,
-            matched=matched,
-            matched_ids=matched_ids,
-            matched_headings=matched_headings,
-        )
-
-    def _assess_by_expectation(
-        self,
-        *,
-        original_query: str,
-        question_type: QuestionType | str,
-        expectation: AnswerabilityExpectation | str,
-        matched: list[dict[str, str]],
-        matched_ids: list[str],
-        matched_headings: list[str],
-    ) -> AnswerabilityAssessment:
-        body_text = "\n".join(item["text"].lower() for item in matched)
-        notes: list[str] = []
 
         def build(
             *,
-            has_relevant_context: bool,
-            sufficient_context: bool,
-            partially_supported: bool,
-            should_answer: bool,
-            support_level: SupportLevel,
-            insufficiency_reason: InsufficiencyReason | None,
-            evidence_notes: list[str] | None = None,
+            status: CoverageStatus,
+            has_any_coverage: bool,
+            sufficient_coverage: bool,
+            partial_coverage: bool,
+            reason: CoverageReason | None,
+            supporting_signals: list[str] | None = None,
+            missing_requirements: list[str] | None = None,
             warnings: list[str] | None = None,
-        ) -> AnswerabilityAssessment:
-            return AnswerabilityAssessment(
+        ) -> CoverageEvaluation:
+            return CoverageEvaluation(
                 original_query=original_query,
-                question_type=question_type,
                 answerability_expectation=expectation,
-                has_relevant_context=has_relevant_context,
-                sufficient_context=sufficient_context,
-                partially_supported=partially_supported,
-                should_answer=should_answer,
-                support_level=support_level,
-                insufficiency_reason=insufficiency_reason,
+                coverage_status=status,
+                has_any_coverage=has_any_coverage,
+                sufficient_coverage=sufficient_coverage,
+                partial_coverage=partial_coverage,
+                coverage_reason=reason,
                 matched_parent_chunk_ids=matched_ids,
                 matched_headings=matched_headings,
-                evidence_notes=evidence_notes or [],
+                supporting_signals=supporting_signals or [],
+                missing_requirements=missing_requirements or [],
                 warnings=warnings or [],
             )
 
         if expectation == "definition_required":
+            if heading_only:
+                return build(
+                    status="weak",
+                    has_any_coverage=True,
+                    sufficient_coverage=False,
+                    partial_coverage=False,
+                    reason="definition_not_supported",
+                    missing_requirements=["explicit_definitional_language"],
+                    warnings=["heading_only_context"],
+                )
             has_def_lang = bool(re.search(r"\b(is|means|refers to|defined as|definition of)\b", body_text))
             if has_def_lang:
-                notes.append("definitional_language_detected")
                 return build(
-                    has_relevant_context=True,
-                    sufficient_context=True,
-                    partially_supported=False,
-                    should_answer=True,
-                    support_level="sufficient",
-                    insufficiency_reason=None,
-                    evidence_notes=notes,
+                    status="sufficient",
+                    has_any_coverage=True,
+                    sufficient_coverage=True,
+                    partial_coverage=False,
+                    reason="general_support",
+                    supporting_signals=["definitional_language_detected"],
                 )
             return build(
-                has_relevant_context=True,
-                sufficient_context=False,
-                partially_supported=True,
-                should_answer=False,
-                support_level="partial",
-                insufficiency_reason="definition_not_supported",
-                evidence_notes=["topic_present_without_definitional_statement"],
+                status="weak",
+                has_any_coverage=bool(substantive),
+                sufficient_coverage=False,
+                partial_coverage=False,
+                reason="definition_not_supported",
+                missing_requirements=["explicit_definitional_language"],
             )
 
         if expectation == "clause_lookup":
-            substantive = [item for item in matched if len(item["text"].strip()) >= self.min_substantive_chars]
             if substantive:
                 return build(
-                    has_relevant_context=True,
-                    sufficient_context=True,
-                    partially_supported=False,
-                    should_answer=True,
-                    support_level="sufficient",
-                    insufficiency_reason=None,
-                    evidence_notes=["substantive_clause_text_present"],
+                    status="sufficient",
+                    has_any_coverage=True,
+                    sufficient_coverage=True,
+                    partial_coverage=False,
+                    reason="clause_supported",
+                    supporting_signals=["substantive_clause_text_present"],
                 )
             return build(
-                has_relevant_context=True,
-                sufficient_context=False,
-                partially_supported=True,
-                should_answer=False,
-                support_level="weak",
-                insufficiency_reason="topic_match_but_not_answer",
+                status="weak",
+                has_any_coverage=bool(matched),
+                sufficient_coverage=False,
+                partial_coverage=False,
+                reason="no_relevant_support",
+                missing_requirements=["substantive_clause_body_text"],
+                warnings=["heading_only_context"] if heading_only else [],
             )
 
         if expectation == "summary":
-            distinct_chunks = {item["parent_chunk_id"] for item in matched if item["parent_chunk_id"]}
-            if len(distinct_chunks) >= self.summary_min_chunks:
+            if len(distinct_sections) >= self.summary_min_chunks or len(distinct_parents) >= self.summary_min_chunks:
                 return build(
-                    has_relevant_context=True,
-                    sufficient_context=True,
-                    partially_supported=False,
-                    should_answer=True,
-                    support_level="sufficient",
-                    insufficiency_reason=None,
-                    evidence_notes=["multiple_substantive_sections_available_for_summary"],
+                    status="sufficient",
+                    has_any_coverage=True,
+                    sufficient_coverage=True,
+                    partial_coverage=False,
+                    reason="general_support",
+                    supporting_signals=["multi_section_context_detected"],
+                )
+            if substantive:
+                return build(
+                    status="partial",
+                    has_any_coverage=True,
+                    sufficient_coverage=False,
+                    partial_coverage=True,
+                    reason="summary_partially_supported",
+                    supporting_signals=["single_section_context_only"],
+                    missing_requirements=["multi_section_or_multi_parent_coverage"],
                 )
             return build(
-                has_relevant_context=True,
-                sufficient_context=False,
-                partially_supported=True,
-                should_answer=False,
-                support_level="partial",
-                insufficiency_reason="summary_not_supported",
-                evidence_notes=["single_clause_or_section_only"],
+                status="weak",
+                has_any_coverage=bool(matched),
+                sufficient_coverage=False,
+                partial_coverage=False,
+                reason="summary_not_supported",
+                missing_requirements=["substantive_multi_section_content"],
+                warnings=["heading_only_context"] if heading_only else [],
             )
 
         if expectation == "fact_extraction":
             fact_markers = self._fact_markers(original_query)
-            found = any(marker in body_text for marker in fact_markers)
+            found = bool(substantive) and any(marker in body_text for marker in fact_markers)
             if found:
                 return build(
-                    has_relevant_context=True,
-                    sufficient_context=True,
-                    partially_supported=False,
-                    should_answer=True,
-                    support_level="sufficient",
-                    insufficiency_reason=None,
-                    evidence_notes=["explicit_fact_statement_detected"],
+                    status="sufficient",
+                    has_any_coverage=True,
+                    sufficient_coverage=True,
+                    partial_coverage=False,
+                    reason="fact_supported",
+                    supporting_signals=["explicit_fact_statement_detected"],
                 )
             return build(
-                has_relevant_context=True,
-                sufficient_context=False,
-                partially_supported=False,
-                should_answer=False,
-                support_level="weak",
-                insufficiency_reason="fact_not_found",
+                status="weak",
+                has_any_coverage=bool(matched),
+                sufficient_coverage=False,
+                partial_coverage=False,
+                reason="fact_not_found",
+                missing_requirements=["explicit_fact_statement_in_context"],
+                warnings=["heading_only_context"] if heading_only else [],
             )
 
         if expectation == "comparison":
-            if self._has_two_sides_signal(original_query, body_text):
+            sides_present = self._comparison_side_hits(original_query, body_text)
+            if sides_present >= 2:
                 return build(
-                    has_relevant_context=True,
-                    sufficient_context=True,
-                    partially_supported=False,
-                    should_answer=True,
-                    support_level="sufficient",
-                    insufficiency_reason=None,
-                    evidence_notes=["comparison_signals_for_both_sides_present"],
+                    status="sufficient",
+                    has_any_coverage=True,
+                    sufficient_coverage=True,
+                    partial_coverage=False,
+                    reason="comparison_supported",
+                    supporting_signals=["comparison_signals_for_both_sides_present"],
+                )
+            if sides_present == 1:
+                return build(
+                    status="partial",
+                    has_any_coverage=True,
+                    sufficient_coverage=False,
+                    partial_coverage=True,
+                    reason="comparison_partially_supported",
+                    missing_requirements=["evidence_for_second_comparison_side"],
                 )
             return build(
-                has_relevant_context=True,
-                sufficient_context=False,
-                partially_supported=True,
-                should_answer=False,
-                support_level="partial",
-                insufficiency_reason="comparison_not_supported",
-                evidence_notes=["one_sided_or_incomplete_comparison_evidence"],
+                status="weak",
+                has_any_coverage=bool(substantive),
+                sufficient_coverage=False,
+                partial_coverage=False,
+                reason="comparison_not_supported",
+                missing_requirements=["evidence_for_both_comparison_sides"],
             )
 
-        # general_grounded_response fallback
-        if matched:
+        if expectation == "general_grounded_response" and substantive:
             return build(
-                has_relevant_context=True,
-                sufficient_context=True,
-                partially_supported=False,
-                should_answer=True,
-                support_level="sufficient",
-                insufficiency_reason=None,
+                status="sufficient",
+                has_any_coverage=True,
+                sufficient_coverage=True,
+                partial_coverage=False,
+                reason="general_support",
             )
         return build(
-            has_relevant_context=False,
-            sufficient_context=False,
-            partially_supported=False,
-            should_answer=False,
-            support_level="none",
-            insufficiency_reason="no_relevant_context",
+            status="weak",
+            has_any_coverage=bool(matched),
+            sufficient_coverage=False,
+            partial_coverage=False,
+            reason="no_relevant_support",
+            warnings=["heading_only_context"] if heading_only else [],
         )
+
+    def _coverage_to_assessment(
+        self,
+        *,
+        query_understanding: QueryUnderstandingResult,
+        coverage: CoverageEvaluation,
+    ) -> AnswerabilityAssessment:
+        should_answer = bool(
+            coverage.sufficient_coverage
+            and query_understanding.answerability_expectation not in {"meta_response", "clarification_needed"}
+        )
+        insufficiency_reason = self._map_coverage_reason(coverage)
+        return AnswerabilityAssessment(
+            original_query=coverage.original_query,
+            question_type=query_understanding.question_type,
+            answerability_expectation=coverage.answerability_expectation,
+            has_relevant_context=coverage.has_any_coverage,
+            sufficient_context=coverage.sufficient_coverage,
+            partially_supported=coverage.partial_coverage,
+            should_answer=should_answer,
+            support_level=coverage.coverage_status,
+            insufficiency_reason=insufficiency_reason,
+            matched_parent_chunk_ids=coverage.matched_parent_chunk_ids,
+            matched_headings=coverage.matched_headings,
+            evidence_notes=list(coverage.supporting_signals),
+            warnings=list(coverage.warnings),
+        )
+
+    def _map_coverage_reason(self, coverage: CoverageEvaluation) -> InsufficiencyReason | None:
+        if coverage.sufficient_coverage:
+            return None
+        if coverage.coverage_reason == "no_context":
+            return "no_relevant_context"
+        if coverage.coverage_reason == "definition_not_supported":
+            if "heading_only_context" in coverage.warnings:
+                return "only_title_or_heading_match"
+            return "definition_not_supported"
+        if coverage.coverage_reason == "summary_not_supported":
+            return "summary_not_supported"
+        if coverage.coverage_reason == "summary_partially_supported":
+            return "partial_evidence_only"
+        if coverage.coverage_reason == "fact_not_found":
+            return "fact_not_found"
+        if coverage.coverage_reason == "comparison_not_supported":
+            return "comparison_not_supported"
+        if coverage.coverage_reason == "comparison_partially_supported":
+            return "partial_evidence_only"
+        if coverage.coverage_reason == "clarification_needed":
+            return "ambiguity_requires_clarification"
+        if coverage.coverage_reason == "no_relevant_support":
+            if "heading_only_context" in coverage.warnings:
+                return "only_title_or_heading_match"
+            return "topic_match_but_not_answer"
+        return "other"
 
     def _normalize_context_item(self, item: object) -> dict[str, str]:
         text = self._field(item, "compressed_text") or self._field(item, "text") or ""
@@ -392,9 +464,6 @@ class AnswerabilityAssessor:
             return True
         if heading and body.lower() == heading.lower():
             return True
-        compact = " ".join(body.split())
-        if len(compact.split()) <= 6 and not re.search(r"[.;:]", compact):
-            return True
         return False
 
     def _query_terms(self, query: str) -> set[str]:
@@ -412,17 +481,17 @@ class AnswerabilityAssessor:
             return ("notice period", "days notice", "written notice")
         return tuple(self._query_terms(query))
 
-    def _has_two_sides_signal(self, query: str, context_text: str) -> bool:
+    def _comparison_side_hits(self, query: str, context_text: str) -> int:
         normalized_query = query.lower()
         comparator_markers = ("compare", "differ", "difference", "versus", "vs")
         if not any(marker in normalized_query for marker in comparator_markers):
-            return False
+            return 0
         sides = re.split(r"\b(?:with|versus|vs)\b", normalized_query)
         side_terms = [set(self._query_terms(side)) for side in sides if side.strip()]
         side_terms = [terms for terms in side_terms if terms]
         if len(side_terms) < 2:
-            return False
-        return all(any(term in context_text for term in terms) for terms in side_terms[:2])
+            return 0
+        return sum(1 for terms in side_terms[:2] if any(term in context_text for term in terms))
 
     def _field(self, item: object, key: str) -> Any:
         if isinstance(item, Mapping):
@@ -448,4 +517,18 @@ def assess_answerability(
         query=query,
         query_understanding=query_understanding,
         retrieved_context=retrieved_context,
+    )
+
+
+def evaluate_coverage(
+    query: str,
+    query_understanding: QueryUnderstandingResult,
+    context: Sequence[object],
+) -> CoverageEvaluation:
+    """Return deterministic coverage evaluation for retrieved answer context."""
+
+    return _DEFAULT_ANSWERABILITY_ASSESSOR.evaluate_coverage(
+        query=query,
+        query_understanding=query_understanding,
+        context=context,
     )
