@@ -7,6 +7,7 @@ answerability expectations (for example, strict definition requirements).
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from typing import Any, Literal
 
@@ -104,6 +105,47 @@ def _known_documents(selected_documents: Sequence[Any] | None, active_documents:
     return labels
 
 
+def _canonicalize_phrase(value: str) -> str:
+    lowered = value.lower().strip()
+    lowered = re.sub(r"[^a-z0-9\s]+", " ", lowered)
+    lowered = " ".join(lowered.split())
+    return lowered
+
+
+def _extract_what_is_subject(normalized_query: str) -> str | None:
+    match = re.match(r"^what\s+is(?:\s+the)?\s+(.+?)(?:\?)?$", normalized_query.strip(), flags=re.IGNORECASE)
+    if not match:
+        return None
+    subject = _canonicalize_phrase(match.group(1))
+    return subject or None
+
+
+def _hint_match_confidence(subject: str, hints: Sequence[str]) -> float:
+    if not subject:
+        return 0.0
+    subject_tokens = subject.split()
+    best = 0.0
+    for hint in hints:
+        canonical_hint = _canonicalize_phrase(hint)
+        if not canonical_hint:
+            continue
+        if canonical_hint == subject:
+            return 1.0
+        if canonical_hint in subject or subject in canonical_hint:
+            hint_tokens = canonical_hint.split()
+            containment_ratio = min(len(subject_tokens), len(hint_tokens)) / max(len(subject_tokens), len(hint_tokens))
+            best = max(best, containment_ratio)
+            continue
+        hint_tokens = canonical_hint.split()
+        if not hint_tokens:
+            continue
+        overlap = len(set(subject_tokens) & set(hint_tokens))
+        if overlap:
+            ratio = overlap / max(len(subject_tokens), len(hint_tokens))
+            best = max(best, ratio)
+    return best
+
+
 def understand_query(
     query: str,
     conversation_summary: str | None = None,
@@ -155,6 +197,15 @@ def understand_query(
     )
 
     resolved_topic_hints = [topic for topic in topic_markers if topic in lowered]
+    what_is_subject = _extract_what_is_subject(normalized)
+    is_canonical_what_is = what_is_subject is not None
+    if is_canonical_what_is and what_is_subject:
+        subject_tokens = set(what_is_subject.split())
+        for topic in topic_markers:
+            if topic in resolved_topic_hints:
+                continue
+            if subject_tokens & set(topic.split()):
+                resolved_topic_hints.append(topic)
     resolved_clause_hints = list(resolved_topic_hints)
     resolved_document_hints = list(explicit_doc_mentions)
 
@@ -184,6 +235,25 @@ def understand_query(
         ambiguity_notes.append("underspecified_followup_query")
     else:
         question_type = "other_query"
+
+    # Deterministic "what is X?" rule insertion point:
+    # apply only after hint extraction and before final answerability assignment.
+    if is_canonical_what_is:
+        available_documents = bool(active_documents or selected_documents)
+        combined_hints = [*resolved_topic_hints, *resolved_clause_hints]
+        best_hint_confidence = _hint_match_confidence(what_is_subject or "", combined_hints)
+        threshold = 0.8
+        is_document_grounded = bool(available_documents and combined_hints and best_hint_confidence >= threshold)
+        has_hint_signal = bool(available_documents and combined_hints)
+
+        if is_document_grounded:
+            question_type = "document_content_query"
+            routing_notes.append("what_is_document_grounded_clause_lookup_override")
+        else:
+            question_type = "definition_query"
+            if has_hint_signal and best_hint_confidence > 0.0:
+                ambiguity_notes.append("ambiguous_definition_vs_clause")
+                routing_notes.append("what_is_hint_match_below_threshold")
 
     # Resolve document hints conservatively when pronoun-based and safe.
     if not resolved_document_hints and is_followup and len(known_documents) == 1 and context_available:
