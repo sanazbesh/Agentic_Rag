@@ -831,6 +831,56 @@ class AnswerabilityAssessor:
 
 
 _DEFAULT_ANSWERABILITY_ASSESSOR = AnswerabilityAssessor()
+ALLOW_MODERATE_STRENGTH_WHEN_COVERAGE_SUFFICIENT = True
+
+
+def _dedupe_preserve_order(values: Sequence[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        ordered.append(value)
+    return ordered
+
+
+def _combine_coverage_and_strength(
+    *,
+    query_understanding: QueryUnderstandingResult,
+    coverage: CoverageEvaluation,
+    strength: EvidenceStrengthEvaluation,
+) -> tuple[SupportLevel, bool, bool, bool, InsufficiencyReason | None]:
+    """Apply one strict, deterministic answerability policy.
+
+    assess_answerability(...) is a coordinator over coverage + evidence strength:
+    - coverage is primary eligibility and cannot be overridden by strength
+    - moderate strength follows one explicit policy constant
+    - weak strength cannot be silently upgraded to sufficient answerability
+    """
+
+    support_level: SupportLevel = coverage.coverage_status
+    sufficient_context = False
+    should_answer = False
+    partially_supported = bool(coverage.partial_coverage)
+    insufficiency_reason = _DEFAULT_ANSWERABILITY_ASSESSOR._map_coverage_reason(coverage)
+
+    if not coverage.sufficient_coverage:
+        return support_level, sufficient_context, should_answer, partially_supported, insufficiency_reason
+
+    partially_supported = False
+    expectation_blocks_answer = query_understanding.answerability_expectation in {"meta_response", "clarification_needed"}
+
+    if strength.evidence_strength == "strong":
+        return "sufficient", True, not expectation_blocks_answer, False, None
+
+    if strength.evidence_strength == "moderate":
+        if ALLOW_MODERATE_STRENGTH_WHEN_COVERAGE_SUFFICIENT:
+            return "sufficient", True, not expectation_blocks_answer, False, None
+        return "moderate", False, False, False, "partial_evidence_only"
+
+    # Explicitly conservative for weak/none structural strength.
+    return "weak", False, False, False, "partial_evidence_only"
 
 
 def assess_answerability(
@@ -902,57 +952,19 @@ def assess_answerability(
             warnings=[safe_warning],
         )
 
-    # Explicit single-place combination policy:
-    # - coverage is primary and cannot be overridden by strength
-    # - moderate strength is allowed only when coverage is sufficient
-    # - weak strength is only allowed when coverage is explicitly sufficient
-    #   and weak-ness is not from title/heading-only structural signals
-    support_level: SupportLevel = coverage.coverage_status
-    sufficient_context = False
-    partially_supported = bool(coverage.partial_coverage)
-    should_answer = False
-    insufficiency_reason = _DEFAULT_ANSWERABILITY_ASSESSOR._map_coverage_reason(coverage)
+    support_level, sufficient_context, should_answer, partially_supported, insufficiency_reason = _combine_coverage_and_strength(
+        query_understanding=query_understanding,
+        coverage=coverage,
+        strength=strength,
+    )
 
-    if coverage.sufficient_coverage:
-        partially_supported = False
-        if strength.evidence_strength == "strong":
-            sufficient_context = True
-            should_answer = query_understanding.answerability_expectation not in {"meta_response", "clarification_needed"}
-            support_level = "sufficient"
-            insufficiency_reason = None
-        elif strength.evidence_strength == "moderate":
-            sufficient_context = True
-            should_answer = query_understanding.answerability_expectation not in {"meta_response", "clarification_needed"}
-            support_level = "sufficient"
-            insufficiency_reason = None
-        else:
-            weak_but_explicitly_supported = (
-                coverage.coverage_reason in {"clause_supported", "fact_supported", "comparison_supported", "general_support"}
-                and "heading_only_context" not in coverage.warnings
-                and strength.strength_reason not in {"title_only_match", "heading_only_match"}
-            )
-            if weak_but_explicitly_supported:
-                sufficient_context = True
-                should_answer = query_understanding.answerability_expectation not in {"meta_response", "clarification_needed"}
-                support_level = "sufficient"
-                insufficiency_reason = None
-            else:
-                sufficient_context = False
-                should_answer = False
-                support_level = "weak"
-                insufficiency_reason = "partial_evidence_only"
-    else:
-        sufficient_context = False
-        should_answer = False
-        support_level = coverage.coverage_status
-
-    evidence_notes = [
+    evidence_notes = _dedupe_preserve_order([
         *list(coverage.supporting_signals),
         f"evidence_strength:{strength.evidence_strength}",
         *(f"strength_signal:{s}" for s in strength.supporting_signals),
         *(f"weakness_signal:{s}" for s in strength.weakness_signals),
-    ]
-    warnings = [*list(coverage.warnings), *list(strength.warnings)]
+    ])
+    warnings = _dedupe_preserve_order([*list(coverage.warnings), *list(strength.warnings)])
 
     assessment = AnswerabilityAssessment(
         original_query=coverage.original_query,
