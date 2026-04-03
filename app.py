@@ -193,6 +193,7 @@ def build_real_backend_runners() -> tuple[Callable[..., Any] | None, Callable[..
             dependencies=wrapped_dependencies,
             conversation_summary=conversation_summary,
             recent_messages=recent_messages,
+            selected_documents=selected_docs,
             retrieval_config=retrieval_config,
         )
         latest_state.clear()
