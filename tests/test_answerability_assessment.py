@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from agentic_rag.orchestration.query_understanding import understand_query
 from agentic_rag.retrieval.parent_child import ParentChunkResult
-from agentic_rag.tools.answerability import CoverageEvaluation, assess_answerability, evaluate_coverage
+from agentic_rag.tools.answerability import (
+    CoverageEvaluation,
+    EvidenceStrengthEvaluation,
+    assess_answerability,
+    evaluate_coverage,
+)
 
 
 def _parent(pid: str, text: str, heading: str = "") -> ParentChunkResult:
@@ -132,7 +137,13 @@ def test_summary_multi_section_is_sufficient() -> None:
 def test_fact_extraction_success() -> None:
     query = "which law governs the agreement?"
     understanding = understand_query(query)
-    context = [_parent("p1", "This agreement is governed by the laws of Ontario.", heading="Governing Law")]
+    context = [
+        _parent(
+            "p1",
+            "This agreement and all disputes, claims, and controversies arising out of or related to it are governed by the laws of Ontario, Canada.",
+            heading="Governing Law",
+        )
+    ]
 
     result = assess_answerability(query, understanding, context)
 
@@ -257,7 +268,25 @@ def test_assess_answerability_delegates_to_evaluate_coverage(monkeypatch) -> Non
             warnings=[],
         )
 
+    def _stub_strength(*args, **kwargs) -> EvidenceStrengthEvaluation:
+        return EvidenceStrengthEvaluation(
+            original_query=query,
+            evidence_strength="strong",
+            has_title_only_match=False,
+            has_heading_only_match=False,
+            has_substantive_clause_text=True,
+            has_multiple_substantive_sections=True,
+            distinct_parent_chunk_count=2,
+            distinct_heading_count=2,
+            approximate_text_span_count=2,
+            strength_reason="broad_multi_section_support",
+            supporting_signals=["substantive_body_blocks:2"],
+            weakness_signals=[],
+            warnings=[],
+        )
+
     monkeypatch.setattr("agentic_rag.tools.answerability.evaluate_coverage", _stub_coverage)
+    monkeypatch.setattr("agentic_rag.tools.answerability.evaluate_evidence_strength", _stub_strength)
     result = assess_answerability(query, understanding, [])
 
     assert result.sufficient_context is False
@@ -284,12 +313,214 @@ def test_assess_answerability_no_silent_upgrade_for_partial_coverage(monkeypatch
             warnings=[],
         )
 
+    def _stub_strength(*args, **kwargs) -> EvidenceStrengthEvaluation:
+        return EvidenceStrengthEvaluation(
+            original_query=query,
+            evidence_strength="strong",
+            has_title_only_match=False,
+            has_heading_only_match=False,
+            has_substantive_clause_text=True,
+            has_multiple_substantive_sections=True,
+            distinct_parent_chunk_count=2,
+            distinct_heading_count=2,
+            approximate_text_span_count=2,
+            strength_reason="multiple_substantive_sections",
+            supporting_signals=["substantive_body_blocks:2"],
+            weakness_signals=[],
+            warnings=[],
+        )
+
     monkeypatch.setattr("agentic_rag.tools.answerability.evaluate_coverage", _stub_coverage)
+    monkeypatch.setattr("agentic_rag.tools.answerability.evaluate_evidence_strength", _stub_strength)
     result = assess_answerability(query, understanding, [])
 
     assert result.sufficient_context is False
     assert result.partially_supported is True
     assert result.should_answer is False
+
+
+def test_assess_answerability_coverage_sufficient_but_heading_only_weak_strength_is_not_sufficient(monkeypatch) -> None:
+    query = "which law governs the agreement?"
+    understanding = understand_query(query)
+
+    def _stub_coverage(*args, **kwargs) -> CoverageEvaluation:
+        return CoverageEvaluation(
+            original_query=query,
+            answerability_expectation=understanding.answerability_expectation,
+            coverage_status="sufficient",
+            has_any_coverage=True,
+            sufficient_coverage=True,
+            partial_coverage=False,
+            coverage_reason="fact_supported",
+            matched_parent_chunk_ids=["p1"],
+            matched_headings=["Governing Law"],
+            supporting_signals=["explicit_fact_statement_detected"],
+            missing_requirements=[],
+            warnings=[],
+        )
+
+    def _stub_strength(*args, **kwargs) -> EvidenceStrengthEvaluation:
+        return EvidenceStrengthEvaluation(
+            original_query=query,
+            evidence_strength="weak",
+            has_title_only_match=False,
+            has_heading_only_match=True,
+            has_substantive_clause_text=False,
+            has_multiple_substantive_sections=False,
+            distinct_parent_chunk_count=1,
+            distinct_heading_count=1,
+            approximate_text_span_count=0,
+            strength_reason="heading_only_match",
+            supporting_signals=[],
+            weakness_signals=["heading_only_signal_without_body"],
+            warnings=["no_substantive_clause_text_detected"],
+        )
+
+    monkeypatch.setattr("agentic_rag.tools.answerability.evaluate_coverage", _stub_coverage)
+    monkeypatch.setattr("agentic_rag.tools.answerability.evaluate_evidence_strength", _stub_strength)
+    result = assess_answerability(query, understanding, [])
+
+    assert result.sufficient_context is False
+    assert result.should_answer is False
+    assert result.support_level == "weak"
+
+
+def test_assess_answerability_coverage_sufficient_plus_thin_weak_strength_can_answer(monkeypatch) -> None:
+    query = "which law governs the agreement?"
+    understanding = understand_query(query)
+
+    def _stub_coverage(*args, **kwargs) -> CoverageEvaluation:
+        return CoverageEvaluation(
+            original_query=query,
+            answerability_expectation=understanding.answerability_expectation,
+            coverage_status="sufficient",
+            has_any_coverage=True,
+            sufficient_coverage=True,
+            partial_coverage=False,
+            coverage_reason="fact_supported",
+            matched_parent_chunk_ids=["p1"],
+            matched_headings=["Governing Law"],
+            supporting_signals=["explicit_fact_statement_detected"],
+            missing_requirements=[],
+            warnings=[],
+        )
+
+    def _stub_strength(*args, **kwargs) -> EvidenceStrengthEvaluation:
+        return EvidenceStrengthEvaluation(
+            original_query=query,
+            evidence_strength="weak",
+            has_title_only_match=False,
+            has_heading_only_match=False,
+            has_substantive_clause_text=False,
+            has_multiple_substantive_sections=False,
+            distinct_parent_chunk_count=1,
+            distinct_heading_count=1,
+            approximate_text_span_count=0,
+            strength_reason="thin_single_clause",
+            supporting_signals=[],
+            weakness_signals=["only_thin_body_fragments_detected"],
+            warnings=["no_substantive_clause_text_detected"],
+        )
+
+    monkeypatch.setattr("agentic_rag.tools.answerability.evaluate_coverage", _stub_coverage)
+    monkeypatch.setattr("agentic_rag.tools.answerability.evaluate_evidence_strength", _stub_strength)
+    result = assess_answerability(query, understanding, [])
+
+    assert result.sufficient_context is True
+    assert result.should_answer is True
+    assert result.support_level == "sufficient"
+
+
+def test_assess_answerability_coverage_sufficient_plus_moderate_strength_is_sufficient(monkeypatch) -> None:
+    query = "which law governs the agreement?"
+    understanding = understand_query(query)
+
+    def _stub_coverage(*args, **kwargs) -> CoverageEvaluation:
+        return CoverageEvaluation(
+            original_query=query,
+            answerability_expectation=understanding.answerability_expectation,
+            coverage_status="sufficient",
+            has_any_coverage=True,
+            sufficient_coverage=True,
+            partial_coverage=False,
+            coverage_reason="fact_supported",
+            matched_parent_chunk_ids=["p1"],
+            matched_headings=["Governing Law"],
+            supporting_signals=["explicit_fact_statement_detected"],
+            missing_requirements=[],
+            warnings=[],
+        )
+
+    def _stub_strength(*args, **kwargs) -> EvidenceStrengthEvaluation:
+        return EvidenceStrengthEvaluation(
+            original_query=query,
+            evidence_strength="moderate",
+            has_title_only_match=False,
+            has_heading_only_match=False,
+            has_substantive_clause_text=True,
+            has_multiple_substantive_sections=False,
+            distinct_parent_chunk_count=1,
+            distinct_heading_count=1,
+            approximate_text_span_count=1,
+            strength_reason="single_substantive_clause",
+            supporting_signals=["substantive_body_blocks:1"],
+            weakness_signals=[],
+            warnings=[],
+        )
+
+    monkeypatch.setattr("agentic_rag.tools.answerability.evaluate_coverage", _stub_coverage)
+    monkeypatch.setattr("agentic_rag.tools.answerability.evaluate_evidence_strength", _stub_strength)
+    result = assess_answerability(query, understanding, [])
+
+    assert result.sufficient_context is True
+    assert result.should_answer is True
+    assert result.support_level == "sufficient"
+
+
+def test_assess_answerability_coverage_sufficient_plus_strong_strength_is_sufficient(monkeypatch) -> None:
+    query = "which law governs the agreement?"
+    understanding = understand_query(query)
+
+    def _stub_coverage(*args, **kwargs) -> CoverageEvaluation:
+        return CoverageEvaluation(
+            original_query=query,
+            answerability_expectation=understanding.answerability_expectation,
+            coverage_status="sufficient",
+            has_any_coverage=True,
+            sufficient_coverage=True,
+            partial_coverage=False,
+            coverage_reason="fact_supported",
+            matched_parent_chunk_ids=["p1", "p2"],
+            matched_headings=["Governing Law", "Definitions"],
+            supporting_signals=["explicit_fact_statement_detected"],
+            missing_requirements=[],
+            warnings=[],
+        )
+
+    def _stub_strength(*args, **kwargs) -> EvidenceStrengthEvaluation:
+        return EvidenceStrengthEvaluation(
+            original_query=query,
+            evidence_strength="strong",
+            has_title_only_match=False,
+            has_heading_only_match=False,
+            has_substantive_clause_text=True,
+            has_multiple_substantive_sections=True,
+            distinct_parent_chunk_count=2,
+            distinct_heading_count=2,
+            approximate_text_span_count=2,
+            strength_reason="broad_multi_section_support",
+            supporting_signals=["substantive_body_blocks:2"],
+            weakness_signals=[],
+            warnings=[],
+        )
+
+    monkeypatch.setattr("agentic_rag.tools.answerability.evaluate_coverage", _stub_coverage)
+    monkeypatch.setattr("agentic_rag.tools.answerability.evaluate_evidence_strength", _stub_strength)
+    result = assess_answerability(query, understanding, [])
+
+    assert result.sufficient_context is True
+    assert result.should_answer is True
+    assert result.support_level == "sufficient"
 
 
 def test_assess_answerability_coverage_failure_safe_fallback(monkeypatch) -> None:
@@ -305,3 +536,18 @@ def test_assess_answerability_coverage_failure_safe_fallback(monkeypatch) -> Non
     assert result.sufficient_context is False
     assert result.should_answer is False
     assert any(w.startswith("coverage_evaluation_failed:") for w in result.warnings)
+
+
+def test_assess_answerability_strength_failure_safe_fallback(monkeypatch) -> None:
+    query = "which law governs the agreement?"
+    understanding = understand_query(query)
+
+    def _raise(*args, **kwargs):
+        raise RuntimeError("strength engine unavailable")
+
+    monkeypatch.setattr("agentic_rag.tools.answerability.evaluate_evidence_strength", _raise)
+    result = assess_answerability(query, understanding, [])
+
+    assert result.sufficient_context is False
+    assert result.should_answer is False
+    assert any(w.startswith("strength_evaluation_failed:") for w in result.warnings)

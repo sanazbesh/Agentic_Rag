@@ -181,7 +181,10 @@ def _reranked(child_id: str, parent_id: str) -> RerankedChunkResult:
     )
 
 
-def _parent(parent_id: str, text: str = "Parent text") -> ParentChunkResult:
+def _parent(
+    parent_id: str,
+    text: str = "This section states that either party may terminate the agreement with written notice, subject to accrued obligations and applicable governing law requirements.",
+) -> ParentChunkResult:
     return ParentChunkResult(
         parent_chunk_id=parent_id,
         document_id="doc-1",
@@ -217,7 +220,7 @@ def test_compressed_context_preference() -> None:
                 document_id="doc-1",
                 source="test",
                 source_name="compressed-source",
-                compressed_text="compressed parent",
+                compressed_text="This compressed section states that either party may terminate with written notice while honoring accrued obligations under governing law.",
             )
         ],
     )
@@ -237,7 +240,12 @@ def test_parent_chunks_fallback_when_compressed_empty() -> None:
         classifier=_decision(),
         hybrid_results=[_hybrid("c1", "p1")],
         reranked_results=[_reranked("c1", "p1")],
-        parent_results=[_parent("p1", text="raw parent")],
+        parent_results=[
+            _parent(
+                "p1",
+                text="Raw parent section states that either party may terminate with written notice and must satisfy accrued obligations under the agreement.",
+            )
+        ],
         compressed_items=[],
     )
     run_legal_rag_turn(query="Q", dependencies=services.as_dependencies())
