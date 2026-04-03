@@ -208,6 +208,8 @@ def understand_query(
                 resolved_topic_hints.append(topic)
     resolved_clause_hints = list(resolved_topic_hints)
     resolved_document_hints = list(explicit_doc_mentions)
+    clause_override_triggered = False
+    clause_hint_match = False
 
     ambiguity_notes: list[str] = []
     warnings: list[str] = []
@@ -245,15 +247,20 @@ def understand_query(
         threshold = 0.8
         is_document_grounded = bool(available_documents and combined_hints and best_hint_confidence >= threshold)
         has_hint_signal = bool(available_documents and combined_hints)
+        clause_hint_match = bool(best_hint_confidence >= threshold and combined_hints)
+        routing_notes.append("debug:canonical_what_is=true")
+        routing_notes.append(f"debug:clause_hint_match={'true' if clause_hint_match else 'false'}")
 
         if is_document_grounded:
             question_type = "document_content_query"
+            clause_override_triggered = True
             routing_notes.append("what_is_document_grounded_clause_lookup_override")
         else:
             question_type = "definition_query"
             if has_hint_signal and best_hint_confidence > 0.0:
                 ambiguity_notes.append("ambiguous_definition_vs_clause")
                 routing_notes.append("what_is_hint_match_below_threshold")
+        routing_notes.append(f"debug:clause_override_triggered={'true' if clause_override_triggered else 'false'}")
 
     # Resolve document hints conservatively when pronoun-based and safe.
     if not resolved_document_hints and is_followup and len(known_documents) == 1 and context_available:
@@ -268,7 +275,12 @@ def understand_query(
             ambiguity_notes.append("multiple_active_documents_scope_unclear")
             warnings.append("ambiguous_document_scope")
 
-    is_document_scoped = explicit_document_scope or bool(resolved_document_hints) or refers_to_prior_document_scope
+    is_document_scoped = (
+        explicit_document_scope
+        or bool(resolved_document_hints)
+        or refers_to_prior_document_scope
+        or clause_override_triggered
+    )
     is_context_dependent = is_followup or refers_to_prior_document_scope or refers_to_prior_clause_or_topic
     use_conversation_context = bool(
         (context_available or (refers_to_prior_document_scope and bool(resolved_document_hints)))

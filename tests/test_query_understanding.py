@@ -23,6 +23,7 @@ def test_what_is_clause_lookup_only_when_document_grounded() -> None:
     )
     assert result.question_type == "document_content_query"
     assert result.answerability_expectation == "clause_lookup"
+    assert result.is_document_scoped is True
 
 
 def test_what_is_remains_definition_without_active_document_context() -> None:

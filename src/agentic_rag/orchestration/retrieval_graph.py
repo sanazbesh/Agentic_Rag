@@ -261,23 +261,38 @@ class RetrievalGraphNodes:
     def classify_query_state(self, state: RetrievalStageState) -> RetrievalStageState:
         logger.info("node_enter name=classify_query_state")
         updated = dict(state)
+        active_docs = list(updated.get("active_documents") or [])
+        selected_docs = list(updated.get("selected_documents") or [])
+        selected_ids = [
+            str(item.get("id"))
+            for item in selected_docs
+            if isinstance(item, Mapping) and item.get("id")
+        ]
+        logger.info(
+            "classify_query_state_inputs active_documents_count=%s selected_documents_count=%s selected_document_ids=%s",
+            len(active_docs),
+            len(selected_docs),
+            selected_ids,
+        )
         decision = self.dependencies.classify_query_state(
             updated["original_query"],
             conversation_summary=updated["conversation_summary"],
             recent_messages=updated["recent_messages"],
-            active_documents=updated.get("active_documents"),
-            selected_documents=updated.get("selected_documents"),
+            active_documents=active_docs,
+            selected_documents=selected_docs,
         )
         updated["query_classification"] = decision
         updated["use_conversation_context"] = decision.use_conversation_context
         updated["should_rewrite"] = decision.should_rewrite
         updated["should_extract_entities"] = decision.should_extract_entities
         logger.info(
-            "node_exit name=classify_query_state followup=%s ambiguous=%s rewrite=%s extract=%s",
+            "node_exit name=classify_query_state followup=%s ambiguous=%s rewrite=%s extract=%s final_question_type=%s final_answerability_expectation=%s",
             decision.is_followup,
             decision.question_type == "ambiguous_query",
             decision.should_rewrite,
             decision.should_extract_entities,
+            decision.question_type,
+            decision.answerability_expectation,
         )
         return cast(RetrievalStageState, updated)
 
