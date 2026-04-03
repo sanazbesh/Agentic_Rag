@@ -905,7 +905,8 @@ def assess_answerability(
     # Explicit single-place combination policy:
     # - coverage is primary and cannot be overridden by strength
     # - moderate strength is allowed only when coverage is sufficient
-    # - weak strength never upgrades to full answerability
+    # - weak strength is only allowed when coverage is explicitly sufficient
+    #   and weak-ness is not from title/heading-only structural signals
     support_level: SupportLevel = coverage.coverage_status
     sufficient_context = False
     partially_supported = bool(coverage.partial_coverage)
@@ -925,10 +926,21 @@ def assess_answerability(
             support_level = "sufficient"
             insufficiency_reason = None
         else:
-            sufficient_context = False
-            should_answer = False
-            support_level = "weak"
-            insufficiency_reason = "partial_evidence_only"
+            weak_but_explicitly_supported = (
+                coverage.coverage_reason in {"clause_supported", "fact_supported", "comparison_supported", "general_support"}
+                and "heading_only_context" not in coverage.warnings
+                and strength.strength_reason not in {"title_only_match", "heading_only_match"}
+            )
+            if weak_but_explicitly_supported:
+                sufficient_context = True
+                should_answer = query_understanding.answerability_expectation not in {"meta_response", "clarification_needed"}
+                support_level = "sufficient"
+                insufficiency_reason = None
+            else:
+                sufficient_context = False
+                should_answer = False
+                support_level = "weak"
+                insufficiency_reason = "partial_evidence_only"
     else:
         sufficient_context = False
         should_answer = False
