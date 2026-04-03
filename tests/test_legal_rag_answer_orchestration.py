@@ -9,6 +9,7 @@ from agentic_rag.orchestration.legal_rag_graph import (
     build_full_legal_rag_graph,
     default_legal_rag_state,
     run_legal_rag_turn,
+    run_legal_rag_turn_with_state,
 )
 from agentic_rag.orchestration.query_understanding import understand_query
 from agentic_rag.orchestration.retrieval_graph import QueryRoutingDecision, RetrievalDependencies, RetrievalGraphConfig
@@ -278,8 +279,9 @@ def test_partial_context_flags_preserved() -> None:
         answer_result=partial,
     )
     result = run_legal_rag_turn(query="Q", dependencies=services.as_dependencies())
-    assert result.grounded is True
+    assert result.grounded is False
     assert result.sufficient_context is False
+    assert any("fallback_after_sufficient_gate:generate_answer_returned_insufficient" in warning for warning in result.warnings)
 
 
 def test_citation_preservation() -> None:
@@ -419,6 +421,82 @@ def test_clause_lookup_success_routes_to_generation() -> None:
     result = run_legal_rag_turn(query="what does the document say about confidentiality?", dependencies=services.as_dependencies())
     assert len(services.answer_calls) == 1
     assert result.grounded is True
+
+
+def test_response_route_is_traceable_for_generate_path() -> None:
+    services = FakeServices(
+        classifier=_decision(),
+        hybrid_results=[_hybrid("c1", "p1")],
+        reranked_results=[_reranked("c1", "p1")],
+        parent_results=[_parent("p1", text="Confidentiality obligations survive termination.")],
+        answerability_result=AnswerabilityAssessment(
+            original_query="what does the document say about confidentiality?",
+            question_type="document_content_query",
+            answerability_expectation="clause_lookup",
+            has_relevant_context=True,
+            sufficient_context=True,
+            partially_supported=False,
+            should_answer=True,
+            support_level="sufficient",
+            insufficiency_reason=None,
+            matched_parent_chunk_ids=["p1"],
+            matched_headings=["Confidentiality"],
+            evidence_notes=[],
+            warnings=[],
+        ),
+    )
+    _, state = run_legal_rag_turn_with_state(query="what does the document say about confidentiality?", dependencies=services.as_dependencies())
+    assert state["response_route"] == "generate_answer"
+
+
+def test_response_route_is_traceable_for_insufficient_path() -> None:
+    definition_decision = understand_query("what is employment agreement?")
+    services = FakeServices(
+        classifier=definition_decision,
+        hybrid_results=[_hybrid("c1", "p1")],
+        reranked_results=[_reranked("c1", "p1")],
+        parent_results=[_parent("p1", text="Employment Agreement")],
+    )
+    _, state = run_legal_rag_turn_with_state(query="what is employment agreement?", dependencies=services.as_dependencies())
+    assert state["response_route"] == "build_insufficient_response"
+
+
+def test_sufficient_gate_cannot_silently_downgrade_to_insufficient() -> None:
+    services = FakeServices(
+        classifier=_decision(),
+        hybrid_results=[_hybrid("c1", "p1")],
+        reranked_results=[_reranked("c1", "p1")],
+        parent_results=[_parent("p1", text="Confidentiality obligations survive termination.")],
+        answerability_result=AnswerabilityAssessment(
+            original_query="what does the document say about confidentiality?",
+            question_type="document_content_query",
+            answerability_expectation="clause_lookup",
+            has_relevant_context=True,
+            sufficient_context=True,
+            partially_supported=False,
+            should_answer=True,
+            support_level="sufficient",
+            insufficiency_reason=None,
+            matched_parent_chunk_ids=["p1"],
+            matched_headings=["Confidentiality"],
+            evidence_notes=[],
+            warnings=[],
+        ),
+        answer_result=GenerateAnswerResult(
+            answer_text="unexpected insufficient",
+            grounded=False,
+            sufficient_context=False,
+            citations=[],
+            warnings=[],
+        ),
+    )
+    result, state = run_legal_rag_turn_with_state(
+        query="what does the document say about confidentiality?",
+        dependencies=services.as_dependencies(),
+    )
+    assert result.sufficient_context is False
+    assert state["response_route"] == "fallback_finalizer:generate_answer_returned_insufficient"
+    assert any("fallback_after_sufficient_gate" in warning for warning in result.warnings)
 
 
 def test_fact_extraction_insufficiency_skips_generation() -> None:

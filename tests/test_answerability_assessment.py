@@ -10,13 +10,14 @@ from agentic_rag.tools.answerability import (
 )
 
 
-def _parent(pid: str, text: str, heading: str = "") -> ParentChunkResult:
+def _parent(pid: str, text: str, heading: str = "", heading_path: tuple[str, ...] = ()) -> ParentChunkResult:
     return ParentChunkResult(
         parent_chunk_id=pid,
         document_id="doc-1",
         text=text,
         source="test",
         source_name="test-source",
+        heading_path=heading_path,
         heading_text=heading,
     )
 
@@ -223,6 +224,23 @@ def test_no_heading_only_false_positive() -> None:
     assert result.has_relevant_context is True
     assert result.sufficient_context is False
     assert result.insufficiency_reason == "only_title_or_heading_match"
+
+
+def test_matched_headings_prefer_section_level_heading_path_over_document_title() -> None:
+    query = "what does the document say about confidentiality?"
+    understanding = understand_query(query)
+    context = [
+        _parent(
+            "p1",
+            "The receiving party shall keep Confidential Information strictly confidential.",
+            heading="Master Agreement",
+            heading_path=("Master Agreement", "Article II", "Confidentiality"),
+        )
+    ]
+
+    result = assess_answerability(query, understanding, context)
+
+    assert result.matched_headings == ["Confidentiality"]
 
 
 def test_meta_response_returns_strict_no_context_shape() -> None:

@@ -9,10 +9,11 @@ This module implements a thin `generate_answer(context, query)` tool that:
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from agentic_rag.tools.evidence_units import EvidenceUnit, build_evidence_units
 
 @dataclass(slots=True, frozen=True)
 class AnswerCitation:
@@ -66,7 +67,7 @@ class LegalAnswerSynthesizer:
 
         try:
             normalized_query = (query or "").strip()
-            normalized_context = [_normalize_context_item(item) for item in context]
+            normalized_context = [_unit_to_context_row(unit) for unit in build_evidence_units(context)]
 
             if not normalized_context:
                 return GenerateAnswerResult(
@@ -264,21 +265,14 @@ def generate_answer(context: Sequence[object], query: str) -> GenerateAnswerResu
     return _DEFAULT_ANSWER_SYNTHESIZER.generate(context=context, query=query)
 
 
-def _normalize_context_item(item: object) -> dict[str, Any]:
-    text = _field(item, "compressed_text") or _field(item, "text") or ""
+def _unit_to_context_row(unit: EvidenceUnit) -> dict[str, Any]:
     return {
-        "parent_chunk_id": str(_field(item, "parent_chunk_id") or ""),
-        "document_id": _as_optional_str(_field(item, "document_id")),
-        "source_name": _as_optional_str(_field(item, "source_name")),
-        "heading": _as_optional_str(_field(item, "heading") or _field(item, "heading_text") or _field(item, "section")),
-        "text": str(text),
+        "parent_chunk_id": unit.parent_chunk_id,
+        "document_id": _as_optional_str(unit.document_id),
+        "source_name": _as_optional_str(unit.source_name),
+        "heading": _as_optional_str(unit.heading),
+        "text": unit.evidence_text,
     }
-
-
-def _field(item: object, key: str, default: Any = None) -> Any:
-    if isinstance(item, Mapping):
-        return item.get(key, default)
-    return getattr(item, key, default)
 
 
 def _as_optional_str(value: Any) -> str | None:

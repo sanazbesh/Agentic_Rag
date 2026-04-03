@@ -73,6 +73,7 @@ class LegalRagState(RetrievalStageState, total=False):
     should_generate_answer: bool
     should_return_partial_response: bool
     should_return_insufficient_response: bool
+    response_route: str
 
 
 class AnswerGenerator(Protocol):
@@ -134,6 +135,7 @@ def default_legal_rag_state(
             "should_generate_answer": False,
             "should_return_partial_response": False,
             "should_return_insufficient_response": True,
+            "response_route": "unresolved",
         }
     )
     return cast(LegalRagState, merged)
@@ -280,6 +282,7 @@ class AnswerStageNodes:
         updated = dict(state)
         warnings = list(updated.get("warnings", []))
         updated["answerability_assessment_invoked"] = True
+        updated["response_route"] = "answerability_gate"
         query = str(updated.get("effective_query") or updated.get("original_query") or "").strip()
         query_understanding = updated.get("query_classification")
         context = list(updated.get("answer_context", []))
@@ -345,6 +348,7 @@ class AnswerStageNodes:
             updated["grounded"] = False
             updated["sufficient_context"] = False
             updated["warnings"] = list(fallback.warnings)
+            updated["response_route"] = "generate_answer:empty_context"
             logger.info("node_exit name=generate_grounded_answer success=true empty_context=true")
             return cast(LegalRagState, updated)
 
@@ -357,6 +361,7 @@ class AnswerStageNodes:
             updated["grounded"] = False
             updated["sufficient_context"] = False
             updated["warnings"] = list(fallback.warnings)
+            updated["response_route"] = "fallback_finalizer:routing_violation"
             logger.info("node_exit name=generate_grounded_answer success=false reason=routing_violation")
             return cast(LegalRagState, updated)
 
@@ -366,11 +371,24 @@ class AnswerStageNodes:
             validated = _validate_answer_payload(raw)
             merged_warnings = [*warnings, *validated.warnings]
             final = _copy_update(validated, warnings=merged_warnings)
+            if should_generate_answer and not final.sufficient_context:
+                fallback = _safe_fallback(
+                    warnings=[*merged_warnings, "fallback_after_sufficient_gate:generate_answer_returned_insufficient"],
+                )
+                updated["final_answer"] = fallback
+                updated["citations"] = []
+                updated["grounded"] = False
+                updated["sufficient_context"] = False
+                updated["warnings"] = list(fallback.warnings)
+                updated["response_route"] = "fallback_finalizer:generate_answer_returned_insufficient"
+                logger.info("node_exit name=generate_grounded_answer success=false reason=inconsistent_sufficient_context")
+                return cast(LegalRagState, updated)
             updated["final_answer"] = final
             updated["citations"] = list(final.citations)
             updated["grounded"] = final.grounded
             updated["sufficient_context"] = final.sufficient_context
             updated["warnings"] = list(final.warnings)
+            updated["response_route"] = "generate_answer"
             logger.info(
                 "node_exit name=generate_grounded_answer success=true citations=%s grounded=%s sufficient_context=%s",
                 len(final.citations),
@@ -386,6 +404,7 @@ class AnswerStageNodes:
             updated["grounded"] = False
             updated["sufficient_context"] = False
             updated["warnings"] = list(failure.warnings)
+            updated["response_route"] = "fallback_finalizer:answer_generation_failed"
             logger.info("node_exit name=generate_grounded_answer success=false reason=%s", type(exc).__name__)
             return cast(LegalRagState, updated)
 
@@ -430,6 +449,7 @@ class AnswerStageNodes:
         updated["grounded"] = False
         updated["sufficient_context"] = False
         updated["warnings"] = list(final.warnings)
+        updated["response_route"] = "build_insufficient_response"
         logger.info("node_exit name=build_insufficient_response route=insufficient_response")
         return cast(LegalRagState, updated)
 
@@ -446,6 +466,7 @@ class AnswerStageNodes:
                     warnings=[*warnings, "finalization_fallback:missing_final_answer"],
                     message=EMPTY_CONTEXT_MESSAGE,
                 )
+                updated["response_route"] = "fallback_finalizer:missing_final_answer"
             else:
                 final = _validate_answer_payload(raw_final)
                 merged_warnings = [*warnings, *final.warnings]
@@ -454,6 +475,7 @@ class AnswerStageNodes:
             final = _safe_fallback(
                 warnings=[*warnings, f"finalization_fallback:{type(exc).__name__}"],
             )
+            updated["response_route"] = f"fallback_finalizer:{type(exc).__name__}"
 
         updated["final_answer"] = final
         updated["citations"] = list(final.citations)
@@ -462,10 +484,11 @@ class AnswerStageNodes:
         updated["warnings"] = list(final.warnings)
         updated["final_response_ready"] = True
         logger.info(
-            "node_exit name=finalize_response ready=true citations=%s grounded=%s sufficient_context=%s",
+            "node_exit name=finalize_response ready=true citations=%s grounded=%s sufficient_context=%s response_route=%s",
             len(final.citations),
             final.grounded,
             final.sufficient_context,
+            updated.get("response_route", "unresolved"),
         )
         return cast(LegalRagState, updated)
 
