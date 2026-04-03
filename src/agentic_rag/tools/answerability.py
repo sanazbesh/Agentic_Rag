@@ -21,6 +21,8 @@ except Exception:  # pragma: no cover - fallback for constrained envs
 if TYPE_CHECKING:  # pragma: no cover
     from agentic_rag.orchestration.query_understanding import QueryUnderstandingResult
 
+from agentic_rag.tools.evidence_units import EvidenceUnit, build_evidence_units
+
 
 logger = logging.getLogger(__name__)
 
@@ -234,7 +236,7 @@ class AnswerabilityAssessor:
                 missing_requirements=["query_requires_clarification_before_evidence_coverage"],
             )
 
-        normalized_context = [self._normalize_context_item(item) for item in list(context or [])]
+        normalized_context = [self._unit_to_item(unit) for unit in build_evidence_units(list(context or []))]
         if not normalized_context:
             return CoverageEvaluation(
                 original_query=original_query,
@@ -466,7 +468,7 @@ class AnswerabilityAssessor:
 
         del query_understanding  # intentionally not a primary strength driver
         original_query = (query or "").strip()
-        normalized_context = [self._normalize_context_item(item) for item in list(context or [])]
+        normalized_context = [self._unit_to_item(unit) for unit in build_evidence_units(list(context or []))]
 
         if not normalized_context:
             return EvidenceStrengthEvaluation(
@@ -686,14 +688,13 @@ class AnswerabilityAssessor:
             return "topic_match_but_not_answer"
         return "other"
 
-    def _normalize_context_item(self, item: object) -> dict[str, str]:
-        text = self._field(item, "compressed_text") or self._field(item, "text") or ""
-        heading = self._field(item, "heading") or self._field(item, "heading_text") or self._field(item, "section") or ""
+    def _unit_to_item(self, unit: EvidenceUnit) -> dict[str, str]:
         return {
-            "parent_chunk_id": str(self._field(item, "parent_chunk_id") or "").strip(),
-            "heading": str(heading or "").strip(),
-            "text": str(text or ""),
-            "source_name": str(self._field(item, "source_name") or "").strip(),
+            "evidence_unit_id": unit.evidence_unit_id,
+            "parent_chunk_id": unit.parent_chunk_id,
+            "heading": unit.heading,
+            "text": unit.evidence_text,
+            "source_name": unit.source_name,
         }
 
     def _is_relevant(self, item: Mapping[str, str], query_terms: set[str]) -> bool:
