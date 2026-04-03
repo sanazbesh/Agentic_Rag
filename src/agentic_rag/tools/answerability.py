@@ -840,10 +840,11 @@ def assess_answerability(
 ) -> AnswerabilityAssessment:
     """Coordinator layer for deterministic answerability gating.
 
-    Coverage evaluation is delegated to `evaluate_coverage(...)` as the
-    primary source of truth. This coordinator only maps typed coverage output
-    into the strict `AnswerabilityAssessment` contract and applies final safe
-    routing policy (no silent upgrades from partial/insufficient coverage).
+    `assess_answerability(...)` is intentionally a strict coordinator:
+    - delegates expectation-fit to `evaluate_coverage(...)` (primary authority)
+    - delegates structural depth to `evaluate_evidence_strength(...)`
+    - combines both typed outputs with one conservative policy
+    - never silently upgrades weak/partial signals into sufficient answerability
     """
 
     logger.info("assess_answerability_started")
@@ -853,19 +854,6 @@ def assess_answerability(
             query_understanding=query_understanding,
             context=retrieved_context,
         )
-        assessment = _DEFAULT_ANSWERABILITY_ASSESSOR._coverage_to_assessment(
-            query_understanding=query_understanding,
-            coverage=coverage,
-        )
-        logger.info(
-            "assess_answerability_mapped support_level=%s sufficient_context=%s partially_supported=%s should_answer=%s insufficiency_reason=%s",
-            assessment.support_level,
-            assessment.sufficient_context,
-            assessment.partially_supported,
-            assessment.should_answer,
-            assessment.insufficiency_reason,
-        )
-        return assessment
     except Exception as exc:
         logger.warning("assess_answerability_coverage_failure error_type=%s", type(exc).__name__)
         expectation = str(getattr(query_understanding, "answerability_expectation", "general_grounded_response"))
@@ -886,6 +874,100 @@ def assess_answerability(
             evidence_notes=[],
             warnings=[safe_warning],
         )
+
+    try:
+        strength = evaluate_evidence_strength(
+            query=query,
+            query_understanding=query_understanding,
+            context=retrieved_context,
+        )
+    except Exception as exc:
+        logger.warning("assess_answerability_strength_failure error_type=%s", type(exc).__name__)
+        expectation = str(getattr(query_understanding, "answerability_expectation", "general_grounded_response"))
+        question_type = str(getattr(query_understanding, "question_type", "other_query"))
+        safe_warning = f"strength_evaluation_failed:{type(exc).__name__}"
+        return AnswerabilityAssessment(
+            original_query=(query or "").strip(),
+            question_type=question_type,
+            answerability_expectation=expectation,
+            has_relevant_context=False,
+            sufficient_context=False,
+            partially_supported=False,
+            should_answer=False,
+            support_level="none",
+            insufficiency_reason="other",
+            matched_parent_chunk_ids=[],
+            matched_headings=[],
+            evidence_notes=[],
+            warnings=[safe_warning],
+        )
+
+    # Explicit single-place combination policy:
+    # - coverage is primary and cannot be overridden by strength
+    # - moderate strength is allowed only when coverage is sufficient
+    # - weak strength never upgrades to full answerability
+    support_level: SupportLevel = coverage.coverage_status
+    sufficient_context = False
+    partially_supported = bool(coverage.partial_coverage)
+    should_answer = False
+    insufficiency_reason = _DEFAULT_ANSWERABILITY_ASSESSOR._map_coverage_reason(coverage)
+
+    if coverage.sufficient_coverage:
+        partially_supported = False
+        if strength.evidence_strength == "strong":
+            sufficient_context = True
+            should_answer = query_understanding.answerability_expectation not in {"meta_response", "clarification_needed"}
+            support_level = "sufficient"
+            insufficiency_reason = None
+        elif strength.evidence_strength == "moderate":
+            sufficient_context = True
+            should_answer = query_understanding.answerability_expectation not in {"meta_response", "clarification_needed"}
+            support_level = "sufficient"
+            insufficiency_reason = None
+        else:
+            sufficient_context = False
+            should_answer = False
+            support_level = "weak"
+            insufficiency_reason = "partial_evidence_only"
+    else:
+        sufficient_context = False
+        should_answer = False
+        support_level = coverage.coverage_status
+
+    evidence_notes = [
+        *list(coverage.supporting_signals),
+        f"evidence_strength:{strength.evidence_strength}",
+        *(f"strength_signal:{s}" for s in strength.supporting_signals),
+        *(f"weakness_signal:{s}" for s in strength.weakness_signals),
+    ]
+    warnings = [*list(coverage.warnings), *list(strength.warnings)]
+
+    assessment = AnswerabilityAssessment(
+        original_query=coverage.original_query,
+        question_type=query_understanding.question_type,
+        answerability_expectation=coverage.answerability_expectation,
+        has_relevant_context=coverage.has_any_coverage,
+        sufficient_context=sufficient_context,
+        partially_supported=partially_supported,
+        should_answer=should_answer,
+        support_level=support_level,
+        insufficiency_reason=insufficiency_reason,
+        matched_parent_chunk_ids=coverage.matched_parent_chunk_ids,
+        matched_headings=coverage.matched_headings,
+        evidence_notes=evidence_notes,
+        warnings=warnings,
+    )
+    logger.info(
+        "assess_answerability_combined coverage_status=%s sufficient_coverage=%s evidence_strength=%s final_support_level=%s sufficient_context=%s should_answer=%s insufficiency_reason=%s",
+        coverage.coverage_status,
+        coverage.sufficient_coverage,
+        strength.evidence_strength,
+        assessment.support_level,
+        assessment.sufficient_context,
+        assessment.should_answer,
+        assessment.insufficiency_reason,
+    )
+    return assessment
 
 
 def evaluate_coverage(
