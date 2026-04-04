@@ -7,6 +7,9 @@ from agentic_rag.orchestration.retrieval_graph import (
     QueryRoutingDecision,
     RetrievalDependencies,
     RetrievalGraphConfig,
+    classify_decomposition_need,
+    build_retrieval_graph,
+    default_retrieval_state,
     run_retrieval_stage,
 )
 from agentic_rag.retrieval.parent_child import HybridSearchResult, ParentChunkResult, RerankedChunkResult
@@ -321,3 +324,91 @@ def test_deterministic_routing_for_same_inputs() -> None:
     assert state_a["query_classification"] == state_b["query_classification"]
     assert state_a["should_rewrite"] == state_b["should_rewrite"]
     assert state_a["should_extract_entities"] == state_b["should_extract_entities"]
+
+
+def test_decomposition_gate_simple_definition_does_not_trigger() -> None:
+    decision = _decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False)
+    needs_decomposition, reasons = classify_decomposition_need(
+        query="What is confidentiality?",
+        query_classification=decision,
+        context_resolution=None,
+    )
+    assert needs_decomposition is False
+    assert reasons == ["simple_single_clause_lookup"]
+
+
+def test_decomposition_gate_conjunctive_query_triggers() -> None:
+    decision = _decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False)
+    needs_decomposition, reasons = classify_decomposition_need(
+        query="Who are the parties involved in this agreement and what are their obligations?",
+        query_classification=decision,
+        context_resolution=None,
+    )
+    assert needs_decomposition is True
+    assert "multi_intent_conjunction" in reasons
+    assert "cross_clause_obligation_condition" in reasons
+
+
+def test_decomposition_gate_comparison_query_triggers() -> None:
+    decision = _decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False)
+    needs_decomposition, reasons = classify_decomposition_need(
+        query="Compare the governing law and dispute resolution clauses.",
+        query_classification=decision,
+        context_resolution=None,
+    )
+    assert needs_decomposition is True
+    assert "comparison_query" in reasons
+
+
+def test_decomposition_gate_amendment_temporal_query_triggers() -> None:
+    decision = _decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False)
+    needs_decomposition, reasons = classify_decomposition_need(
+        query="How did the amendment change the confidentiality obligations?",
+        query_classification=decision,
+        context_resolution=None,
+    )
+    assert needs_decomposition is True
+    assert "amendment_vs_base" in reasons
+
+
+def test_decomposition_gate_context_dependent_followup_can_trigger() -> None:
+    decision = _decision(followup=True, ambiguous=True, use_context=True, rewrite=True, extract=False)
+    state = run_retrieval_stage(
+        query="What about cure rights and notice in that clause?",
+        conversation_summary="Prior turn discussed termination section.",
+        recent_messages=[
+            {
+                "role": "assistant",
+                "content": "Termination notice is 30 days.",
+                "metadata": {"resolved_topic_hints": ["termination"]},
+            }
+        ],
+        dependencies=FakeServices(classifier=decision).as_dependencies(),
+    )
+    assert state["needs_decomposition"] is True
+    assert "context_dependent_followup" in state["decomposition_gate_reasons"]
+
+
+def test_retrieval_state_contains_decomposition_gate_output() -> None:
+    services = FakeServices(
+        classifier=_decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False),
+    )
+    state = run_retrieval_stage(
+        query="What is the governing law?",
+        dependencies=services.as_dependencies(),
+    )
+    assert state["needs_decomposition"] is False
+    assert state["decomposition_gate_reasons"] == ["simple_single_clause_lookup"]
+
+
+def test_fallback_graph_populates_decomposition_gate_output(monkeypatch) -> None:
+    import agentic_rag.orchestration.retrieval_graph as retrieval_graph_module
+
+    monkeypatch.setattr(retrieval_graph_module, "StateGraph", None)
+    services = FakeServices(
+        classifier=_decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False),
+    )
+    app = build_retrieval_graph(dependencies=services.as_dependencies())
+    state = app.invoke(default_retrieval_state(query="Define effective date."))
+    assert state["needs_decomposition"] is False
+    assert state["decomposition_gate_reasons"] == ["simple_single_clause_lookup"]

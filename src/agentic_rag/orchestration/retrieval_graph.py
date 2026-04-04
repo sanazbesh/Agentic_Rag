@@ -63,6 +63,8 @@ class RetrievalStageState(TypedDict):
     effective_query: str
     query_classification: QueryRoutingDecision | None
     context_resolution: QueryContextResolution | None
+    needs_decomposition: bool
+    decomposition_gate_reasons: list[str]
 
     extracted_entities: LegalEntityExtractionResult | None
     filters: dict[str, Any] | None
@@ -146,6 +148,8 @@ def default_retrieval_state(
         effective_query=normalized_query,
         query_classification=None,
         context_resolution=None,
+        needs_decomposition=False,
+        decomposition_gate_reasons=[],
         extracted_entities=None,
         filters=None,
         child_results=[],
@@ -201,6 +205,82 @@ def _derive_filters(extraction: LegalEntityExtractionResult) -> dict[str, Any] |
     if filters.date_to:
         payload["date_to"] = filters.date_to
     return payload or None
+
+
+def classify_decomposition_need(
+    *,
+    query: str,
+    query_classification: QueryRoutingDecision | None,
+    context_resolution: QueryContextResolution | None,
+) -> tuple[bool, list[str]]:
+    """Conservative deterministic gate for future query decomposition routing.
+
+    This is retrieval-layer routing metadata only; it does not alter retrieval
+    inputs or behavior in Phase 1 Step 1.
+    """
+
+    normalized = " ".join((query or "").strip().lower().split())
+    reasons: list[str] = []
+
+    if not normalized:
+        return False, ["simple_single_clause_lookup"]
+
+    comparison_markers = ("compare", "comparison", "difference", "differ", "versus", "vs ")
+    multi_intent_markers = (" and ", " as well as ", " along with ", "also")
+    amendment_markers = ("amendment", "amended", "change", "changed", "modified", "modification", "original agreement")
+    temporal_change_markers = ("before and after", "prior to", "after", "timeline")
+    exception_markers = ("unless", "except", "subject to", "provided that", "notwithstanding")
+    entity_markers = ("party", "parties", "buyer", "seller", "licensor", "licensee", "landlord", "tenant")
+    obligation_markers = ("obligation", "obligations", "duty", "duties", "right", "rights", "condition", "conditions")
+    cross_clause_markers = (
+        "clause",
+        "section",
+        "termination",
+        "notice",
+        "cure",
+        "confidentiality",
+        "governing law",
+        "agreement",
+        "contract",
+    )
+
+    if any(marker in normalized for marker in comparison_markers):
+        reasons.append("comparison_query")
+
+    has_multi_intent = any(marker in normalized for marker in multi_intent_markers) and "?" in normalized
+    if has_multi_intent:
+        reasons.append("multi_intent_conjunction")
+
+    if any(marker in normalized for marker in amendment_markers) and any(
+        marker in normalized for marker in ("change", "changed", "modified", "modification", "compare", "difference", "after")
+    ):
+        reasons.append("amendment_vs_base")
+    elif "amendment" in normalized and any(marker in normalized for marker in temporal_change_markers):
+        reasons.append("amendment_vs_base")
+
+    if any(marker in normalized for marker in exception_markers):
+        reasons.append("exception_chain")
+
+    if (
+        any(marker in normalized for marker in entity_markers)
+        and any(marker in normalized for marker in obligation_markers)
+        and any(marker in normalized for marker in cross_clause_markers)
+    ):
+        reasons.append("cross_clause_obligation_condition")
+
+    # Prioritized context-dependent trigger only after explicit structural signals.
+    context_dependent = bool(query_classification and query_classification.is_context_dependent)
+    used_context = bool(context_resolution and context_resolution.used_conversation_context)
+    unresolved = bool(context_resolution and context_resolution.unresolved_references)
+    if context_dependent and (used_context or unresolved) and has_multi_intent:
+        reasons.append("context_dependent_followup")
+
+    if query_classification and query_classification.may_need_decomposition and not reasons:
+        reasons.append("query_understanding_hint")
+
+    if not reasons:
+        return False, ["simple_single_clause_lookup"]
+    return True, reasons
 
 
 class RetrievalGraphNodes:
@@ -362,6 +442,23 @@ class RetrievalGraphNodes:
             "node_exit name=resolve_query_context used_context=%s unresolved_count=%s",
             resolution.used_conversation_context,
             len(resolution.unresolved_references),
+        )
+        return cast(RetrievalStageState, updated)
+
+    def classify_decomposition_need(self, state: RetrievalStageState) -> RetrievalStageState:
+        logger.info("node_enter name=classify_decomposition_need")
+        updated = dict(state)
+        needs_decomposition, reasons = classify_decomposition_need(
+            query=str(updated.get("resolved_query") or updated.get("original_query") or ""),
+            query_classification=updated.get("query_classification"),
+            context_resolution=updated.get("context_resolution"),
+        )
+        updated["needs_decomposition"] = needs_decomposition
+        updated["decomposition_gate_reasons"] = reasons
+        logger.info(
+            "node_exit name=classify_decomposition_need needs_decomposition=%s reasons=%s",
+            needs_decomposition,
+            ",".join(reasons),
         )
         return cast(RetrievalStageState, updated)
 
@@ -568,6 +665,7 @@ class _FallbackCompiledGraph:
         current = self._nodes.ingest_turn(current)
         current = self._nodes.classify_query_state(current)
         current = self._nodes.resolve_query_context(current)
+        current = self._nodes.classify_decomposition_need(current)
         if _route_after_classification(current) == "rewrite_query_if_needed":
             current = self._nodes.rewrite_query_if_needed(current)
         current = self._nodes.extract_entities_if_needed(current)
@@ -600,6 +698,7 @@ def build_retrieval_graph(
     graph.add_node("ingest_turn", nodes.ingest_turn)
     graph.add_node("classify_query_state", nodes.classify_query_state)
     graph.add_node("resolve_query_context", nodes.resolve_query_context)
+    graph.add_node("classify_decomposition_need", nodes.classify_decomposition_need)
     graph.add_node("rewrite_query_if_needed", nodes.rewrite_query_if_needed)
     graph.add_node("extract_entities_if_needed", nodes.extract_entities_if_needed)
     graph.add_node("run_hybrid_search", nodes.run_hybrid_search)
@@ -613,8 +712,9 @@ def build_retrieval_graph(
     graph.add_edge(START, "ingest_turn")
     graph.add_edge("ingest_turn", "classify_query_state")
     graph.add_edge("classify_query_state", "resolve_query_context")
+    graph.add_edge("resolve_query_context", "classify_decomposition_need")
     graph.add_conditional_edges(
-        "resolve_query_context",
+        "classify_decomposition_need",
         _route_after_classification,
         {
             "rewrite_query_if_needed": "rewrite_query_if_needed",
