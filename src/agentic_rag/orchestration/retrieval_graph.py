@@ -17,6 +17,7 @@ try:  # pragma: no cover - optional runtime dependency
 except Exception:  # pragma: no cover - fallback for constrained envs
     from agentic_rag._compat_pydantic import BaseModel, ConfigDict, Field
 
+from agentic_rag.orchestration.decomposition_gate import decide_decomposition_need
 from agentic_rag.orchestration.query_understanding import QueryUnderstandingResult, understand_query
 from agentic_rag.retrieval.parent_child import HybridSearchResult, ParentChunkResult, RerankedChunkResult
 from agentic_rag.tools.context_processing import CompressContextResult, CompressedParentChunk
@@ -213,74 +214,15 @@ def classify_decomposition_need(
     query_classification: QueryRoutingDecision | None,
     context_resolution: QueryContextResolution | None,
 ) -> tuple[bool, list[str]]:
-    """Conservative deterministic gate for future query decomposition routing.
+    """Compatibility wrapper around the centralized decomposition gate helper."""
 
-    This is retrieval-layer routing metadata only; it does not alter retrieval
-    inputs or behavior in Phase 1 Step 1.
-    """
-
-    normalized = " ".join((query or "").strip().lower().split())
-    reasons: list[str] = []
-
-    if not normalized:
-        return False, ["simple_single_clause_lookup"]
-
-    comparison_markers = ("compare", "comparison", "difference", "differ", "versus", "vs ")
-    multi_intent_markers = (" and ", " as well as ", " along with ", "also")
-    amendment_markers = ("amendment", "amended", "change", "changed", "modified", "modification", "original agreement")
-    temporal_change_markers = ("before and after", "prior to", "after", "timeline")
-    exception_markers = ("unless", "except", "subject to", "provided that", "notwithstanding")
-    entity_markers = ("party", "parties", "buyer", "seller", "licensor", "licensee", "landlord", "tenant")
-    obligation_markers = ("obligation", "obligations", "duty", "duties", "right", "rights", "condition", "conditions")
-    cross_clause_markers = (
-        "clause",
-        "section",
-        "termination",
-        "notice",
-        "cure",
-        "confidentiality",
-        "governing law",
-        "agreement",
-        "contract",
+    context_payload = context_resolution.model_dump() if context_resolution is not None else None
+    decision = decide_decomposition_need(
+        query=query,
+        query_context=context_payload,
+        query_understanding=query_classification,
     )
-
-    if any(marker in normalized for marker in comparison_markers):
-        reasons.append("comparison_query")
-
-    has_multi_intent = any(marker in normalized for marker in multi_intent_markers) and "?" in normalized
-    if has_multi_intent:
-        reasons.append("multi_intent_conjunction")
-
-    if any(marker in normalized for marker in amendment_markers) and any(
-        marker in normalized for marker in ("change", "changed", "modified", "modification", "compare", "difference", "after")
-    ):
-        reasons.append("amendment_vs_base")
-    elif "amendment" in normalized and any(marker in normalized for marker in temporal_change_markers):
-        reasons.append("amendment_vs_base")
-
-    if any(marker in normalized for marker in exception_markers):
-        reasons.append("exception_chain")
-
-    if (
-        any(marker in normalized for marker in entity_markers)
-        and any(marker in normalized for marker in obligation_markers)
-        and any(marker in normalized for marker in cross_clause_markers)
-    ):
-        reasons.append("cross_clause_obligation_condition")
-
-    # Prioritized context-dependent trigger only after explicit structural signals.
-    context_dependent = bool(query_classification and query_classification.is_context_dependent)
-    used_context = bool(context_resolution and context_resolution.used_conversation_context)
-    unresolved = bool(context_resolution and context_resolution.unresolved_references)
-    if context_dependent and (used_context or unresolved) and has_multi_intent:
-        reasons.append("context_dependent_followup")
-
-    if query_classification and query_classification.may_need_decomposition and not reasons:
-        reasons.append("query_understanding_hint")
-
-    if not reasons:
-        return False, ["simple_single_clause_lookup"]
-    return True, reasons
+    return decision.needs_decomposition, list(decision.reasons)
 
 
 class RetrievalGraphNodes:
