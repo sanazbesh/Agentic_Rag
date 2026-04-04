@@ -68,7 +68,27 @@ CATEGORY_REGISTRY: tuple[_CategoryDefinition, ...] = (
 SIMPLE_SINGLE_CLAUSE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^what is [\w\s\-]+[?.]?$"),
     re.compile(r"^define [\w\s\-]+[?.]?$"),
+    re.compile(r"^what does [\w\s\-]+ mean[?.]?$"),
+    re.compile(r"^who is [\w\s\-]+[?.]?$"),
     re.compile(r"^what is the [\w\s\-]+ clause[?.]?$"),
+    re.compile(r"^what is the [\w\s\-]+ provision[?.]?$"),
+)
+
+NON_TRIGGER_SHALLOW_AND_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^what is the [\w\s\-]+ and [\w\s\-]+[?.]?$"),
+    re.compile(r"^[\w\s\-]+ and [\w\s\-]+$"),
+)
+
+NON_TRIGGER_PURE_DATE_MENTION_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^what is the effective date(?: in \d{4})?[?.]?$"),
+    re.compile(r"^what is the date(?: in \d{4})?[?.]?$"),
+    re.compile(r"^when is [\w\s\-]+(?: in \d{4})?[?.]?$"),
+)
+
+NON_TRIGGER_VAGUE_FOLLOWUP_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^what about (that|this|it)(?: [\w\s\-]+)?[?.]?$"),
+    re.compile(r"^and (that|this|it)\??$"),
+    re.compile(r"^anything else\??$"),
 )
 
 COMPARISON_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -159,6 +179,15 @@ def _is_simple_single_clause_lookup(normalized: str) -> bool:
     return any(pattern.match(normalized) for pattern in SIMPLE_SINGLE_CLAUSE_PATTERNS)
 
 
+def _has_non_trigger_protection(normalized: str) -> bool:
+    protections = (
+        NON_TRIGGER_SHALLOW_AND_PATTERNS
+        + NON_TRIGGER_PURE_DATE_MENTION_PATTERNS
+        + NON_TRIGGER_VAGUE_FOLLOWUP_PATTERNS
+    )
+    return any(pattern.match(normalized) for pattern in protections)
+
+
 def _detect_category_labels(
     normalized: str,
     query_context: Mapping[str, Any] | None,
@@ -238,9 +267,10 @@ def decide_decomposition_need(
     if any(label in STRONG_REASONS for label in detected):
         return GateDecision(needs_decomposition=True, reasons=ordered)
 
-    if _is_simple_single_clause_lookup(normalized) or (
-        query_understanding and query_understanding.may_need_decomposition
-    ):
+    has_negative_signal = _is_simple_single_clause_lookup(normalized) or _has_non_trigger_protection(
+        normalized
+    )
+    if has_negative_signal or (query_understanding and query_understanding.may_need_decomposition):
         return GateDecision(needs_decomposition=False, reasons=["simple_single_clause_lookup"])
 
     return GateDecision(needs_decomposition=False, reasons=ordered)
