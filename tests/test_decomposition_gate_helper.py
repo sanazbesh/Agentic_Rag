@@ -47,6 +47,27 @@ def test_simple_single_clause_lookup_is_conservative_false() -> None:
     assert decision.reasons == ["simple_single_clause_lookup"]
 
 
+def test_definition_lookup_variants_stay_false() -> None:
+    decision = decide_decomposition_need(query="What does indemnification mean?")
+    assert decision.needs_decomposition is False
+    assert decision.reasons == ["simple_single_clause_lookup"]
+
+
+def test_single_clause_and_provision_lookup_stay_false() -> None:
+    clause = decide_decomposition_need(query="What is the termination clause?")
+    provision = decide_decomposition_need(query="What is the notice provision?")
+    assert clause.needs_decomposition is False
+    assert clause.reasons == ["simple_single_clause_lookup"]
+    assert provision.needs_decomposition is False
+    assert provision.reasons == ["simple_single_clause_lookup"]
+
+
+def test_single_field_lookup_stays_false() -> None:
+    decision = decide_decomposition_need(query="Who is the employer?")
+    assert decision.needs_decomposition is False
+    assert decision.reasons == ["simple_single_clause_lookup"]
+
+
 def test_comparison_true_positive_is_strong() -> None:
     decision = decide_decomposition_need(query="Compare governing law versus dispute resolution.")
     assert decision.needs_decomposition is True
@@ -82,6 +103,7 @@ def test_temporal_relationship_true_positive_but_conservative_only() -> None:
 def test_temporal_relationship_false_positive_protection_for_pure_date() -> None:
     decision = decide_decomposition_need(query="What is the effective date in 2020?")
     assert decision.needs_decomposition is False
+    assert decision.reasons == ["simple_single_clause_lookup"]
     assert "temporal_relationship" not in decision.reasons
 
 
@@ -119,6 +141,7 @@ def test_followup_alone_does_not_trigger_or_label() -> None:
         query_context={"used_conversation_context": True, "unresolved_references": []},
     )
     assert decision.needs_decomposition is False
+    assert decision.reasons == ["simple_single_clause_lookup"]
     assert "context_dependent_followup" not in decision.reasons
 
 
@@ -172,5 +195,11 @@ def test_may_need_decomposition_hint_does_not_override_gate() -> None:
         query_understanding=second,
         query_context={"used_conversation_context": False, "unresolved_references": []},
     )
+    assert decision.needs_decomposition is False
+    assert decision.reasons == ["simple_single_clause_lookup"]
+
+
+def test_simple_lookup_with_weak_positive_signal_remains_false() -> None:
+    decision = decide_decomposition_need(query="What is the title and governing law?")
     assert decision.needs_decomposition is False
     assert decision.reasons == ["simple_single_clause_lookup"]
