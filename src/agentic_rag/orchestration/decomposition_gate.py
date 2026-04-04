@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any, Literal
 
 try:  # pragma: no cover - optional runtime dependency
@@ -35,6 +36,107 @@ REASON_PRECEDENCE: tuple[DecompositionReason, ...] = (
     "simple_single_clause_lookup",
 )
 
+STRONG_REASONS: frozenset[DecompositionReason] = frozenset(
+    {"comparison_query", "amendment_vs_base", "exception_chain"}
+)
+CONSERVATIVE_REASONS: frozenset[DecompositionReason] = frozenset(
+    {
+        "multi_intent_conjunction",
+        "temporal_relationship",
+        "cross_clause_obligation_condition",
+        "context_dependent_followup",
+    }
+)
+
+
+@dataclass(frozen=True)
+class _CategoryDefinition:
+    label: DecompositionReason
+    strong_by_default: bool
+
+
+CATEGORY_REGISTRY: tuple[_CategoryDefinition, ...] = (
+    _CategoryDefinition(label="comparison_query", strong_by_default=True),
+    _CategoryDefinition(label="multi_intent_conjunction", strong_by_default=False),
+    _CategoryDefinition(label="amendment_vs_base", strong_by_default=True),
+    _CategoryDefinition(label="temporal_relationship", strong_by_default=False),
+    _CategoryDefinition(label="exception_chain", strong_by_default=True),
+    _CategoryDefinition(label="cross_clause_obligation_condition", strong_by_default=False),
+    _CategoryDefinition(label="context_dependent_followup", strong_by_default=False),
+)
+
+SIMPLE_SINGLE_CLAUSE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^what is [\w\s\-]+[?.]?$"),
+    re.compile(r"^define [\w\s\-]+[?.]?$"),
+    re.compile(r"^what is the [\w\s\-]+ clause[?.]?$"),
+)
+
+COMPARISON_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bcompare\b"),
+    re.compile(r"\bcomparison\b"),
+    re.compile(r"\bdifference(?:s)?\s+between\b"),
+    re.compile(r"\bversus\b"),
+    re.compile(r"\bvs\.?\b"),
+    re.compile(r"\bcompared\s+to\b"),
+)
+
+MULTI_INTENT_CONNECTOR_PATTERN = re.compile(r"\b(and|as well as|along with)\b")
+MULTI_INTENT_LEGAL_ASK_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bpart(?:y|ies)\b"),
+    re.compile(r"\bobligations?\b"),
+    re.compile(r"\bright(?:s)?\b"),
+    re.compile(r"\bnotice\b"),
+    re.compile(r"\bcure\b"),
+    re.compile(r"\btermination\b"),
+)
+# ordinary list-like lookups should stay conservative
+MULTI_INTENT_ORDINARY_COORDINATION_PATTERN = re.compile(
+    r"\b(title and date|name and address|title and governing law|date and title)\b"
+)
+
+AMENDMENT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bamend(?:ment|ed)?\b"),
+    re.compile(r"\boriginal agreement\b"),
+    re.compile(r"\bearlier version\b"),
+    re.compile(r"\blater version\b"),
+)
+CHANGE_RELATION_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bhow did\b.*\bchange\b"),
+    re.compile(r"\bchanged\b"),
+    re.compile(r"\bchange(?:d)?\s+from\b"),
+    re.compile(r"\bbefore\b.*\bafter\b"),
+    re.compile(r"\bprior to\b.*\bafter\b"),
+)
+
+TEMPORAL_RELATION_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bbefore\b.*\bafter\b"),
+    re.compile(r"\bhow did\b.*\bchange\b"),
+    re.compile(r"\bchange(?:d)?\s+over\s+time\b"),
+    re.compile(r"\bearlier\b.*\blater\b"),
+)
+TEMPORAL_DATE_ONLY_PATTERN = re.compile(
+    r"\b(effective date|date|year|years|month|months|day|days|\d{4})\b"
+)
+
+EXCEPTION_CHAIN_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bexcept as otherwise provided\b"),
+    re.compile(r"\bsubject to\b"),
+    re.compile(r"\bprovided that\b"),
+    re.compile(r"\bnotwithstanding\b"),
+    re.compile(r"\bunless\b.+\b"),
+    re.compile(r"\bexcept\b.+\b"),
+)
+
+CROSS_CLAUSE_PAIR_PATTERNS: tuple[tuple[re.Pattern[str], re.Pattern[str]], ...] = (
+    (re.compile(r"\bpart(?:y|ies)\b"), re.compile(r"\bobligations?\b")),
+    (re.compile(r"\bright(?:s)?\b"), re.compile(r"\bconditions?\b")),
+    (re.compile(r"\btermination\b"), re.compile(r"\bnotice\b")),
+    (re.compile(r"\bnotice\b"), re.compile(r"\bcure\b")),
+    (re.compile(r"\bindemn(?:ity|ification)\b"), re.compile(r"\blimitation\b")),
+    (re.compile(r"\bgoverning law\b"), re.compile(r"\bdispute resolution\b")),
+)
+CROSS_CLAUSE_STRUCTURE_PATTERN = re.compile(r"\b(clause|clauses|section|agreement|contract)\b")
+
 
 class GateDecision(BaseModel):
     """Stable, typed decomposition gate output for deterministic routing."""
@@ -43,6 +145,71 @@ class GateDecision(BaseModel):
 
     needs_decomposition: bool
     reasons: list[DecompositionReason] = Field(default_factory=list)
+
+
+def _normalize(query: str) -> str:
+    return " ".join((query or "").strip().lower().split())
+
+
+def _matches_any(normalized: str, patterns: tuple[re.Pattern[str], ...]) -> bool:
+    return any(pattern.search(normalized) for pattern in patterns)
+
+
+def _is_simple_single_clause_lookup(normalized: str) -> bool:
+    return any(pattern.match(normalized) for pattern in SIMPLE_SINGLE_CLAUSE_PATTERNS)
+
+
+def _detect_category_labels(
+    normalized: str,
+    query_context: Mapping[str, Any] | None,
+    query_understanding: QueryUnderstandingResult | None,
+) -> set[DecompositionReason]:
+    labels: set[DecompositionReason] = set()
+
+    has_comparison = _matches_any(normalized, COMPARISON_PATTERNS)
+    if has_comparison:
+        labels.add("comparison_query")
+
+    has_connector = bool(MULTI_INTENT_CONNECTOR_PATTERN.search(normalized))
+    legal_ask_hits = sum(1 for pattern in MULTI_INTENT_LEGAL_ASK_PATTERNS if pattern.search(normalized))
+    if (
+        has_connector
+        and legal_ask_hits >= 2
+        and not MULTI_INTENT_ORDINARY_COORDINATION_PATTERN.search(normalized)
+    ):
+        labels.add("multi_intent_conjunction")
+
+    has_amendment = _matches_any(normalized, AMENDMENT_PATTERNS)
+    has_change_relation = _matches_any(normalized, CHANGE_RELATION_PATTERNS)
+    if has_amendment and (has_change_relation or has_comparison):
+        labels.add("amendment_vs_base")
+
+    has_temporal_relation = _matches_any(normalized, TEMPORAL_RELATION_PATTERNS)
+    date_only_signal = bool(TEMPORAL_DATE_ONLY_PATTERN.search(normalized)) and not has_temporal_relation
+    if has_temporal_relation and not date_only_signal:
+        labels.add("temporal_relationship")
+
+    if _matches_any(normalized, EXCEPTION_CHAIN_PATTERNS):
+        labels.add("exception_chain")
+
+    has_cross_clause_pair = any(
+        left.search(normalized) and right.search(normalized)
+        for left, right in CROSS_CLAUSE_PAIR_PATTERNS
+    )
+    if has_cross_clause_pair and CROSS_CLAUSE_STRUCTURE_PATTERN.search(normalized):
+        labels.add("cross_clause_obligation_condition")
+
+    is_context_dependent = bool(query_understanding and query_understanding.is_context_dependent)
+    used_context = bool(query_context and query_context.get("used_conversation_context"))
+    unresolved = bool(query_context and query_context.get("unresolved_references"))
+    if is_context_dependent and (used_context or unresolved) and labels.intersection(STRONG_REASONS):
+        labels.add("context_dependent_followup")
+
+    return labels
+
+
+def _ordered_reasons(labels: set[DecompositionReason]) -> list[DecompositionReason]:
+    return [label for label in REASON_PRECEDENCE if label in labels]
 
 
 def decide_decomposition_need(
@@ -54,95 +221,26 @@ def decide_decomposition_need(
 
     Final v1 rule:
     - `True` only when one or more explicit strong triggers are present.
-    - weak/ambiguous inputs (including follow-up status alone) default to `False`.
+    - Conservative/supporting labels do not independently flip to `True`.
     """
 
-    normalized = " ".join((query or "").strip().lower().split())
+    normalized = _normalize(query)
     if not normalized:
         return GateDecision(needs_decomposition=False, reasons=["simple_single_clause_lookup"])
 
-    padded = f" {normalized} "
-    strong_reasons: set[DecompositionReason] = set()
-
-    comparison_markers = ("compare", "comparison", "difference", "differ", "versus", "vs ")
-    conjunction_markers = (" and ", " as well as ", " along with ")
-    amendment_markers = ("amendment", "amended", "original agreement", "base agreement")
-    change_markers = ("change", "changed", "modified", "modification")
-    temporal_markers = (
-        "before and after",
-        "over time",
-        "since",
-        "prior to",
-        "after",
-        "timeline",
-        "change over time",
+    detected = _detect_category_labels(
+        normalized=normalized,
+        query_context=query_context,
+        query_understanding=query_understanding,
     )
-    exception_markers = ("unless", "except", "subject to", "provided that", "notwithstanding")
-    entity_markers = ("party", "parties", "buyer", "seller", "licensor", "licensee", "landlord", "tenant")
-    obligation_markers = (
-        "obligation",
-        "obligations",
-        "duty",
-        "duties",
-        "right",
-        "rights",
-        "condition",
-        "conditions",
-        "notice",
-        "cure",
-        "termination",
-    )
-    cross_clause_markers = ("clause", "clauses", "section", "agreement", "contract", "obligations")
+    ordered = _ordered_reasons(detected)
 
-    has_comparison = any(marker in normalized for marker in comparison_markers)
-    if has_comparison:
-        strong_reasons.add("comparison_query")
+    if any(label in STRONG_REASONS for label in detected):
+        return GateDecision(needs_decomposition=True, reasons=ordered)
 
-    legal_ask_markers = ("obligation", "obligations", "rights", "notice", "cure", "termination", "confidentiality", "law")
-    has_multi_intent = any(marker in padded for marker in conjunction_markers) and (
-        has_comparison
-        or bool(re.search(r"\b(what|who|when|where|how|are there|does|did)\b", normalized))
-        or sum(1 for marker in legal_ask_markers if marker in normalized) >= 2
-    )
-    if has_multi_intent:
-        strong_reasons.add("multi_intent_conjunction")
-
-    has_amendment = any(marker in normalized for marker in amendment_markers)
-    has_change = any(marker in normalized for marker in change_markers)
-    if has_amendment and (has_change or has_comparison):
-        strong_reasons.add("amendment_vs_base")
-
-    has_temporal = any(marker in normalized for marker in temporal_markers)
-    if has_temporal and (has_change or has_comparison or has_amendment):
-        strong_reasons.add("temporal_relationship")
-
-    if any(marker in normalized for marker in exception_markers):
-        strong_reasons.add("exception_chain")
-
-    if (
-        any(marker in normalized for marker in entity_markers)
-        and any(marker in normalized for marker in obligation_markers)
-        and any(marker in normalized for marker in cross_clause_markers)
+    if _is_simple_single_clause_lookup(normalized) or (
+        query_understanding and query_understanding.may_need_decomposition
     ):
-        strong_reasons.add("cross_clause_obligation_condition")
-
-    is_context_dependent = bool(query_understanding and query_understanding.is_context_dependent)
-    used_context = bool(query_context and query_context.get("used_conversation_context"))
-    unresolved = bool(query_context and query_context.get("unresolved_references"))
-    if is_context_dependent and (used_context or unresolved) and has_multi_intent:
-        strong_reasons.add("context_dependent_followup")
-
-    ordered_strong_reasons = [label for label in REASON_PRECEDENCE if label in strong_reasons]
-    if ordered_strong_reasons:
-        return GateDecision(needs_decomposition=True, reasons=ordered_strong_reasons)
-
-    simple_single_clause_patterns = (
-        r"^what is [\w\s\-]+[?.]?$",
-        r"^define [\w\s\-]+[?.]?$",
-        r"^what is the [\w\s\-]+ clause[?.]?$",
-    )
-    explicit_simple_lookup = any(re.match(pattern, normalized) for pattern in simple_single_clause_patterns)
-    if explicit_simple_lookup or (query_understanding and query_understanding.may_need_decomposition):
         return GateDecision(needs_decomposition=False, reasons=["simple_single_clause_lookup"])
 
-    return GateDecision(needs_decomposition=False, reasons=[])
+    return GateDecision(needs_decomposition=False, reasons=ordered)
