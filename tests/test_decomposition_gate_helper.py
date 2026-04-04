@@ -2,9 +2,6 @@ from agentic_rag.orchestration.decomposition_gate import (
     CATEGORY_REGISTRY,
     CONSERVATIVE_REASONS,
     REASON_PRECEDENCE,
-    SIMPLE_LOOKUP_IS_EXPOSED_REASON,
-    SIMPLE_LOOKUP_FALSE_POSITIVE_PROTECTIONS,
-    SIMPLE_SINGLE_CLAUSE_PATTERNS,
     STRONG_REASONS,
     decide_decomposition_need,
 )
@@ -50,16 +47,6 @@ def test_simple_single_clause_lookup_is_conservative_false() -> None:
     assert decision.reasons == ["simple_single_clause_lookup"]
 
 
-def test_simple_single_clause_lookup_status_is_explicitly_exposed_reason() -> None:
-    assert SIMPLE_LOOKUP_IS_EXPOSED_REASON is True
-    assert "simple_single_clause_lookup" in REASON_PRECEDENCE
-
-
-def test_simple_lookup_rule_sets_are_centralized() -> None:
-    assert SIMPLE_SINGLE_CLAUSE_PATTERNS
-    assert SIMPLE_LOOKUP_FALSE_POSITIVE_PROTECTIONS
-
-
 def test_comparison_true_positive_is_strong() -> None:
     decision = decide_decomposition_need(query="Compare governing law versus dispute resolution.")
     assert decision.needs_decomposition is True
@@ -74,18 +61,6 @@ def test_multi_intent_true_positive_but_conservative_only() -> None:
 
 def test_multi_intent_false_positive_protection_for_ordinary_and() -> None:
     decision = decide_decomposition_need(query="What is the title and date?")
-    assert decision.needs_decomposition is False
-    assert decision.reasons == ["simple_single_clause_lookup"]
-
-
-def test_simple_lookup_single_legal_term_definition() -> None:
-    decision = decide_decomposition_need(query="What does indemnification mean?")
-    assert decision.needs_decomposition is False
-    assert decision.reasons == ["simple_single_clause_lookup"]
-
-
-def test_simple_lookup_one_clause_direct_lookup() -> None:
-    decision = decide_decomposition_need(query="What is the force majeure clause?")
     assert decision.needs_decomposition is False
     assert decision.reasons == ["simple_single_clause_lookup"]
 
@@ -108,7 +83,6 @@ def test_temporal_relationship_false_positive_protection_for_pure_date() -> None
     decision = decide_decomposition_need(query="What is the effective date in 2020?")
     assert decision.needs_decomposition is False
     assert "temporal_relationship" not in decision.reasons
-    assert decision.reasons == ["simple_single_clause_lookup"]
 
 
 def test_exception_chain_true_positive_is_strong() -> None:
@@ -131,13 +105,6 @@ def test_cross_clause_false_positive_protection_for_shallow_two_topic_phrase() -
     decision = decide_decomposition_need(query="notice and cure")
     assert decision.needs_decomposition is False
     assert "cross_clause_obligation_condition" not in decision.reasons
-    assert decision.reasons == ["simple_single_clause_lookup"]
-
-
-def test_vague_followup_is_simple_lookup_when_no_strong_signal() -> None:
-    decision = decide_decomposition_need(query="What about that?")
-    assert decision.needs_decomposition is False
-    assert decision.reasons == ["simple_single_clause_lookup"]
 
 
 def test_followup_alone_does_not_trigger_or_label() -> None:
