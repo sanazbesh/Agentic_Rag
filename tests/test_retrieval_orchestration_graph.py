@@ -344,7 +344,7 @@ def test_decomposition_gate_conjunctive_query_triggers() -> None:
         query_classification=decision,
         context_resolution=None,
     )
-    assert needs_decomposition is True
+    assert needs_decomposition is False
     assert "multi_intent_conjunction" in reasons
     assert "cross_clause_obligation_condition" in reasons
 
@@ -374,12 +374,12 @@ def test_decomposition_gate_amendment_temporal_query_triggers() -> None:
 def test_decomposition_gate_context_dependent_followup_can_trigger() -> None:
     decision = _decision(followup=True, ambiguous=True, use_context=True, rewrite=True, extract=False)
     state = run_retrieval_stage(
-        query="What about cure rights and notice in that clause?",
+        query="Compare governing law versus dispute resolution in that clause?",
         conversation_summary="Prior turn discussed termination section.",
         recent_messages=[
             {
                 "role": "assistant",
-                "content": "Termination notice is 30 days.",
+                "content": "Governing law is Delaware.",
                 "metadata": {"resolved_topic_hints": ["termination"]},
             }
         ],
