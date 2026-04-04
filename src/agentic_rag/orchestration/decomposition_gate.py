@@ -65,10 +65,26 @@ CATEGORY_REGISTRY: tuple[_CategoryDefinition, ...] = (
     _CategoryDefinition(label="context_dependent_followup", strong_by_default=False),
 )
 
+SIMPLE_LOOKUP_IS_EXPOSED_REASON = True
+
 SIMPLE_SINGLE_CLAUSE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^what is [\w\s\-]+[?.]?$"),
     re.compile(r"^define [\w\s\-]+[?.]?$"),
+    re.compile(r"^what does [\w\s\-]+ mean[?.]?$"),
     re.compile(r"^what is the [\w\s\-]+ clause[?.]?$"),
+    re.compile(r"^what is the [\w\s\-]+ provision[?.]?$"),
+    re.compile(r"^who is the employer[?.]?$"),
+    re.compile(r"^what is the effective date(?: in \d{4})?[?.]?$"),
+)
+SIMPLE_LOOKUP_FALSE_POSITIVE_PROTECTIONS: tuple[re.Pattern[str], ...] = (
+    # shallow "and" usage that should remain a local lookup question
+    re.compile(r"^what is the (?:title and date|date and title|name and address)[?.]?$"),
+    # pure date mention should not be treated as temporal decomposition
+    re.compile(r"^what is the effective date(?: in \d{4})?[?.]?$"),
+    # vague follow-up prompts without a strong structural trigger
+    re.compile(r"^(?:what about (?:that|this|it)(?: [\w\s\-]+)?|and what about (?:that|this|it))(?:[?.])?$"),
+    # shallow two-topic phrasing
+    re.compile(r"^[a-z][\w\-]*(?:\s+[a-z][\w\-]*)?\s+and\s+[a-z][\w\-]*(?:\s+[a-z][\w\-]*)?[?.]?$"),
 )
 
 COMPARISON_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -156,7 +172,9 @@ def _matches_any(normalized: str, patterns: tuple[re.Pattern[str], ...]) -> bool
 
 
 def _is_simple_single_clause_lookup(normalized: str) -> bool:
-    return any(pattern.match(normalized) for pattern in SIMPLE_SINGLE_CLAUSE_PATTERNS)
+    return any(pattern.match(normalized) for pattern in SIMPLE_SINGLE_CLAUSE_PATTERNS) or any(
+        pattern.match(normalized) for pattern in SIMPLE_LOOKUP_FALSE_POSITIVE_PROTECTIONS
+    )
 
 
 def _detect_category_labels(
@@ -238,9 +256,7 @@ def decide_decomposition_need(
     if any(label in STRONG_REASONS for label in detected):
         return GateDecision(needs_decomposition=True, reasons=ordered)
 
-    if _is_simple_single_clause_lookup(normalized) or (
-        query_understanding and query_understanding.may_need_decomposition
-    ):
+    if _is_simple_single_clause_lookup(normalized):
         return GateDecision(needs_decomposition=False, reasons=["simple_single_clause_lookup"])
 
     return GateDecision(needs_decomposition=False, reasons=ordered)
