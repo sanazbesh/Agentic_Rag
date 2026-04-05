@@ -326,6 +326,72 @@ def test_deterministic_routing_for_same_inputs() -> None:
     assert state_a["should_extract_entities"] == state_b["should_extract_entities"]
 
 
+
+
+def test_classify_decomposition_need_runs_after_context_resolution(monkeypatch) -> None:
+    import agentic_rag.orchestration.retrieval_graph as retrieval_graph_module
+
+    call_order: list[str] = []
+    original_resolve = retrieval_graph_module.RetrievalGraphNodes.resolve_query_context
+    original_gate = retrieval_graph_module.RetrievalGraphNodes.classify_decomposition_need
+
+    def wrapped_resolve(self, state):
+        call_order.append("resolve_query_context")
+        return original_resolve(self, state)
+
+    def wrapped_gate(self, state):
+        call_order.append("classify_decomposition_need")
+        return original_gate(self, state)
+
+    monkeypatch.setattr(retrieval_graph_module.RetrievalGraphNodes, "resolve_query_context", wrapped_resolve)
+    monkeypatch.setattr(retrieval_graph_module.RetrievalGraphNodes, "classify_decomposition_need", wrapped_gate)
+
+    services = FakeServices(
+        classifier=_decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False),
+    )
+    run_retrieval_stage(query="What is confidentiality?", dependencies=services.as_dependencies())
+
+    assert "resolve_query_context" in call_order
+    assert "classify_decomposition_need" in call_order
+    assert call_order.index("resolve_query_context") < call_order.index("classify_decomposition_need")
+
+
+def test_invalid_helper_result_defaults_to_safe_gate_output(monkeypatch) -> None:
+    import agentic_rag.orchestration.retrieval_graph as retrieval_graph_module
+
+    class InvalidDecision:  # pragma: no cover - local test double
+        needs_decomposition = "yes"
+        reasons = ["comparison_query"]
+
+    monkeypatch.setattr(retrieval_graph_module, "decide_decomposition_need", lambda **_: InvalidDecision())
+
+    needs_decomposition, reasons = retrieval_graph_module.classify_decomposition_need(
+        query="Compare governing law versus dispute resolution.",
+        query_classification=None,
+        context_resolution=None,
+    )
+
+    assert needs_decomposition is False
+    assert reasons == []
+
+
+def test_decomposition_true_does_not_change_downstream_search_inputs() -> None:
+    services = FakeServices(
+        classifier=_decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False),
+        hybrid_results=[_hybrid("c1", "p1")],
+        reranked_results=[_reranked("c1", "p1")],
+        parent_results=[_parent("p1")],
+    )
+    state = run_retrieval_stage(
+        query="Compare governing law versus dispute resolution.",
+        dependencies=services.as_dependencies(),
+    )
+
+    assert state["needs_decomposition"] is True
+    assert services.hybrid_calls[0]["query"] == state["effective_query"]
+    assert state["effective_query"] == state["original_query"]
+
+
 def test_decomposition_gate_simple_definition_does_not_trigger() -> None:
     decision = _decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False)
     needs_decomposition, reasons = classify_decomposition_need(
