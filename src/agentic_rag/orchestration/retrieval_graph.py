@@ -106,6 +106,7 @@ class RetrievalStageState(TypedDict):
     query_classification: QueryRoutingDecision | None
     context_resolution: QueryContextResolution | None
     needs_decomposition: bool
+    decomposition_plan: DecompositionPlan | None
     decomposition_gate_reasons: list[str]
 
     extracted_entities: LegalEntityExtractionResult | None
@@ -191,6 +192,7 @@ def default_retrieval_state(
         query_classification=None,
         context_resolution=None,
         needs_decomposition=False,
+        decomposition_plan=None,
         decomposition_gate_reasons=[],
         extracted_entities=None,
         filters=None,
