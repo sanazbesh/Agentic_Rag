@@ -49,6 +49,47 @@ class QueryContextResolution(BaseModel):
     unresolved_references: list[str] = Field(default_factory=list)
 
 
+class SubQueryPlan(BaseModel):
+    """Typed planner sub-query schema reserved for future decomposition wiring."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    id: str
+    question: str
+    purpose: str
+    expected_answer_type: Literal[
+        "definition",
+        "entity",
+        "date",
+        "obligation",
+        "exception",
+        "comparison",
+        "condition",
+        "cross_reference",
+    ]
+    dependency_ids: list[str] = Field(default_factory=list)
+
+
+class DecompositionPlan(BaseModel):
+    """Typed decomposition plan schema reserved for future planner integration."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    should_decompose: bool
+    root_question: str
+    strategy: Literal[
+        "conjunctive",
+        "comparison",
+        "temporal",
+        "exception_chain",
+        "cross_clause",
+        "definition_plus_application",
+        "amendment_vs_base",
+    ] | None = None
+    subqueries: list[SubQueryPlan] = Field(default_factory=list)
+    planner_notes: list[str] = Field(default_factory=list)
+
+
 class RetrievalStageState(TypedDict):
     """Strict retrieval-stage state shared by all graph nodes."""
 
