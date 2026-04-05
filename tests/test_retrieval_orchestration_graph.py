@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from agentic_rag.orchestration.decomposition_gate import decide_decomposition_need
 from agentic_rag.orchestration.retrieval_graph import (
     QueryRoutingDecision,
     RetrievalDependencies,
@@ -478,3 +479,71 @@ def test_fallback_graph_populates_decomposition_gate_output(monkeypatch) -> None
     state = app.invoke(default_retrieval_state(query="Define effective date."))
     assert state["needs_decomposition"] is False
     assert state["decomposition_gate_reasons"] == ["simple_single_clause_lookup"]
+
+
+def test_fallback_graph_records_decomposition_trigger_for_comparison_query(monkeypatch) -> None:
+    import agentic_rag.orchestration.retrieval_graph as retrieval_graph_module
+
+    monkeypatch.setattr(retrieval_graph_module, "StateGraph", None)
+    services = FakeServices(
+        classifier=_decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False),
+    )
+    app = build_retrieval_graph(dependencies=services.as_dependencies())
+    state = app.invoke(default_retrieval_state(query="Compare governing law and dispute resolution clauses."))
+
+    assert state["needs_decomposition"] is True
+    assert "comparison_query" in state["decomposition_gate_reasons"]
+
+
+def test_fallback_graph_gate_output_matches_shared_helper(monkeypatch) -> None:
+    import agentic_rag.orchestration.retrieval_graph as retrieval_graph_module
+
+    monkeypatch.setattr(retrieval_graph_module, "StateGraph", None)
+    services = FakeServices(
+        classifier=_decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False),
+    )
+    query = "Compare governing law and dispute resolution clauses."
+    app = build_retrieval_graph(dependencies=services.as_dependencies())
+    state = app.invoke(default_retrieval_state(query=query))
+
+    helper_decision = decide_decomposition_need(
+        query=state["resolved_query"],
+        query_context=state["context_resolution"].model_dump() if state["context_resolution"] is not None else None,
+        query_understanding=state["query_classification"],
+    )
+    assert state["needs_decomposition"] == helper_decision.needs_decomposition
+    assert state["decomposition_gate_reasons"] == helper_decision.reasons
+
+
+def test_fallback_graph_continues_existing_retrieval_flow_after_gate(monkeypatch) -> None:
+    import agentic_rag.orchestration.retrieval_graph as retrieval_graph_module
+
+    monkeypatch.setattr(retrieval_graph_module, "StateGraph", None)
+    services = FakeServices(
+        classifier=_decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False),
+        hybrid_results=[_hybrid("c1", "p1")],
+        reranked_results=[_reranked("c1", "p1")],
+        parent_results=[_parent("p1")],
+    )
+    app = build_retrieval_graph(dependencies=services.as_dependencies())
+    state = app.invoke(default_retrieval_state(query="Compare governing law and dispute resolution clauses."))
+
+    assert state["needs_decomposition"] is True
+    assert services.hybrid_calls[0]["query"] == state["effective_query"]
+    assert state["parent_ids"] == ["p1"]
+    assert state["retrieval_stage_complete"] is True
+
+
+def test_fallback_graph_gate_outputs_are_deterministic_for_identical_inputs(monkeypatch) -> None:
+    import agentic_rag.orchestration.retrieval_graph as retrieval_graph_module
+
+    monkeypatch.setattr(retrieval_graph_module, "StateGraph", None)
+    services = FakeServices(
+        classifier=_decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False),
+    )
+    app = build_retrieval_graph(dependencies=services.as_dependencies())
+    first = app.invoke(default_retrieval_state(query="Compare governing law and dispute resolution clauses."))
+    second = app.invoke(default_retrieval_state(query="Compare governing law and dispute resolution clauses."))
+
+    assert first["needs_decomposition"] == second["needs_decomposition"]
+    assert first["decomposition_gate_reasons"] == second["decomposition_gate_reasons"]
