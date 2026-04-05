@@ -113,6 +113,23 @@ def test_real_debug_payload_decomposition_not_derived_from_query_understanding_h
     assert payload["decomposition"]["decomposition_gate_reasons"] == ["simple_single_clause_lookup"]
 
 
+def test_real_debug_payload_decomposition_section_has_stable_runtime_shapes() -> None:
+    payload = build_real_debug_payload(
+        latest_state={
+            "query_classification": {"may_need_decomposition": True},
+            "needs_decomposition": "invalid",
+            "decomposition_gate_reasons": ["ok", 123],
+        },
+        selected_documents=[],
+    )
+
+    assert payload["query_classification"]["may_need_decomposition"] is True
+    assert payload["decomposition"] == {
+        "needs_decomposition": False,
+        "decomposition_gate_reasons": [],
+    }
+
+
 def test_main_and_fallback_modes_surface_same_decomposition_debug_schema(monkeypatch: Any) -> None:
     import agentic_rag.orchestration.retrieval_graph as retrieval_graph_module
 
