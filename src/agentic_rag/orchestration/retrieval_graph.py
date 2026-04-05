@@ -222,7 +222,13 @@ def classify_decomposition_need(
         query_context=context_payload,
         query_understanding=query_classification,
     )
-    return decision.needs_decomposition, list(decision.reasons)
+    needs_decomposition = getattr(decision, "needs_decomposition", None)
+    reasons = getattr(decision, "reasons", None)
+    if not isinstance(needs_decomposition, bool):
+        return False, []
+    if not isinstance(reasons, list) or any(not isinstance(reason, str) for reason in reasons):
+        return False, []
+    return needs_decomposition, list(reasons)
 
 
 class RetrievalGraphNodes:
@@ -581,15 +587,9 @@ class RetrievalGraphNodes:
 
 
 DecisionLiteral = Literal[
-    "rewrite_query_if_needed",
-    "extract_entities_if_needed",
     "compress_context_node",
     "mark_complete_without_compression",
 ]
-
-
-def _route_after_classification(state: RetrievalStageState) -> DecisionLiteral:
-    return "rewrite_query_if_needed" if state["should_rewrite"] else "extract_entities_if_needed"
 
 
 def _route_after_compression_check(state: RetrievalStageState) -> DecisionLiteral:
@@ -608,8 +608,7 @@ class _FallbackCompiledGraph:
         current = self._nodes.classify_query_state(current)
         current = self._nodes.resolve_query_context(current)
         current = self._nodes.classify_decomposition_need(current)
-        if _route_after_classification(current) == "rewrite_query_if_needed":
-            current = self._nodes.rewrite_query_if_needed(current)
+        current = self._nodes.rewrite_query_if_needed(current)
         current = self._nodes.extract_entities_if_needed(current)
         current = self._nodes.run_hybrid_search(current)
         current = self._nodes.rerank_results(current)
@@ -655,14 +654,7 @@ def build_retrieval_graph(
     graph.add_edge("ingest_turn", "classify_query_state")
     graph.add_edge("classify_query_state", "resolve_query_context")
     graph.add_edge("resolve_query_context", "classify_decomposition_need")
-    graph.add_conditional_edges(
-        "classify_decomposition_need",
-        _route_after_classification,
-        {
-            "rewrite_query_if_needed": "rewrite_query_if_needed",
-            "extract_entities_if_needed": "extract_entities_if_needed",
-        },
-    )
+    graph.add_edge("classify_decomposition_need", "rewrite_query_if_needed")
     graph.add_edge("rewrite_query_if_needed", "extract_entities_if_needed")
     graph.add_edge("extract_entities_if_needed", "run_hybrid_search")
     graph.add_edge("run_hybrid_search", "rerank_results")
