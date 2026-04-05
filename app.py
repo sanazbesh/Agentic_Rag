@@ -94,6 +94,10 @@ def build_real_debug_payload(
         resolved_topics = list(getattr(resolution, "resolved_topic_hints", []))
 
     answerability_result = _to_debug_jsonable(latest_state.get("answerability_result"))
+    decomposition = {
+        "needs_decomposition": latest_state.get("needs_decomposition"),
+        "decomposition_gate_reasons": _to_debug_jsonable(latest_state.get("decomposition_gate_reasons")),
+    }
     warnings = list(latest_state.get("warnings", []))
     invoked = bool(latest_state.get("answerability_assessment_invoked", False))
     if not invoked:
@@ -109,6 +113,7 @@ def build_real_debug_payload(
         "scope": dict(scope_meta) if isinstance(scope_meta, dict) else {},
         "query_classification": _to_debug_jsonable(latest_state.get("query_classification")),
         "context_resolution": _to_debug_jsonable(latest_state.get("context_resolution")),
+        "decomposition": decomposition,
         "answerability_result": answerability_result,
         "resolved_query": latest_state.get("resolved_query"),
         "effective_query": latest_state.get("effective_query"),

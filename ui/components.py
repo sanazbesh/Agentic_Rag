@@ -15,6 +15,7 @@ DEBUG_SECTIONS = [
     ("adapter_meta", "Adapter Meta"),
     ("query_classification", "Query Classification"),
     ("context_resolution", "Conversation Resolution"),
+    ("decomposition", "Decomposition Gate"),
     ("answerability_result", "Answerability Assessment"),
     ("resolved_query", "Resolved Query"),
     ("effective_query", "Effective Query"),
