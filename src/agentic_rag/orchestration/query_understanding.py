@@ -207,6 +207,13 @@ def understand_query(
             if subject_tokens & set(topic.split()):
                 resolved_topic_hints.append(topic)
     resolved_clause_hints = list(resolved_topic_hints)
+    if is_canonical_what_is and what_is_subject:
+        # Preserve the full "what is X" subject for clause-label matching when
+        # X is a multi-word phrase. This prevents weak single-token fallbacks
+        # (for example: "termination") from being the only clause hint signal.
+        canonical_subject = _canonicalize_phrase(what_is_subject)
+        if canonical_subject and len(canonical_subject.split()) >= 2 and canonical_subject not in resolved_clause_hints:
+            resolved_clause_hints.insert(0, canonical_subject)
     resolved_document_hints = list(explicit_doc_mentions)
     clause_override_triggered = False
     clause_hint_match = False

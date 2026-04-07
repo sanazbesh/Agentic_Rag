@@ -42,6 +42,16 @@ def test_what_is_weak_hint_match_stays_definition_and_logs_ambiguity() -> None:
     assert "ambiguous_definition_vs_clause" in result.ambiguity_notes
 
 
+def test_what_is_multiword_clause_subject_preserved_for_hint_matching() -> None:
+    result = understand_query(
+        "what is Termination Without Cause?",
+        active_documents=[{"id": "doc-employment", "name": "Employment Agreement"}],
+    )
+    assert "termination without cause" in result.resolved_clause_hints
+    assert result.question_type == "document_content_query"
+    assert "debug:clause_hint_match=true" in result.routing_notes
+
+
 def test_document_content_query() -> None:
     result = understand_query("what does the document say about confidentiality?")
     assert result.question_type == "document_content_query"

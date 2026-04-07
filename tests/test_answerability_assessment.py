@@ -87,6 +87,47 @@ def test_definition_success_with_clause_heading_and_substantive_body_without_exp
     assert "operative_clause_language_detected" in result.supporting_signals
 
 
+def test_definition_success_with_leading_clause_label_when_heading_metadata_is_coarse() -> None:
+    query = "what is Termination Without Cause?"
+    understanding = understand_query(
+        query,
+        active_documents=[{"id": "doc-1", "name": "Employment Agreement"}],
+    )
+    context = [
+        _parent(
+            "p1",
+            "Termination Without Cause. The Company may terminate Employee's employment without Cause by giving thirty (30) days written notice.",
+            heading="employment_agreement.pdf",
+        )
+    ]
+
+    result = evaluate_coverage(query, understanding, context)
+
+    assert result.coverage_status == "sufficient"
+    assert result.sufficient_coverage is True
+    assert "operative_clause_language_detected" in result.supporting_signals
+
+
+def test_definition_multiword_clause_not_satisfied_by_broad_single_word_match() -> None:
+    query = "what is Termination Without Cause?"
+    understanding = understand_query(
+        query,
+        active_documents=[{"id": "doc-1", "name": "Employment Agreement"}],
+    )
+    context = [
+        _parent(
+            "p1",
+            "Termination: Either party may terminate this Agreement with thirty (30) days written notice.",
+            heading="Termination",
+        )
+    ]
+
+    result = evaluate_coverage(query, understanding, context)
+
+    assert result.sufficient_coverage is False
+    assert result.coverage_reason == "definition_not_supported"
+
+
 def test_definition_regression_title_and_clauses_without_definition_not_sufficient() -> None:
     query = "what is employment agreement?"
     understanding = understand_query(query)

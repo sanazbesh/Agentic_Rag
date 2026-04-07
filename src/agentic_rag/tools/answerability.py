@@ -352,6 +352,35 @@ class AnswerabilityAssessor:
 
         if expectation == "clause_lookup":
             if substantive:
+                canonical_what_is = any(
+                    note == "debug:canonical_what_is=true" for note in (query_understanding.routing_notes or [])
+                )
+                has_multiword_clause_hint = any(
+                    len(self._canonical_phrase(hint).split()) >= 2 for hint in (query_understanding.resolved_clause_hints or [])
+                )
+                if canonical_what_is and has_multiword_clause_hint:
+                    has_operational_clause_support = self._has_operational_clause_definition_support(
+                        query=original_query,
+                        query_understanding=query_understanding,
+                        substantive=substantive,
+                    )
+                    if not has_operational_clause_support:
+                        return build(
+                            status="weak",
+                            has_any_coverage=True,
+                            sufficient_coverage=False,
+                            partial_coverage=False,
+                            reason="definition_not_supported",
+                            missing_requirements=["specific_clause_label_match"],
+                        )
+                    return build(
+                        status="sufficient",
+                        has_any_coverage=True,
+                        sufficient_coverage=True,
+                        partial_coverage=False,
+                        reason="clause_supported",
+                        supporting_signals=["substantive_clause_text_present", "operative_clause_language_detected"],
+                    )
                 return build(
                     status="sufficient",
                     has_any_coverage=True,
@@ -855,6 +884,8 @@ class AnswerabilityAssessor:
         }
         candidates = {self._canonical_phrase(value) for value in targets if self._canonical_phrase(value)}
         candidates.update(hint_candidates)
+        if any(len(candidate.split()) >= 2 for candidate in candidates):
+            candidates = {candidate for candidate in candidates if len(candidate.split()) >= 2}
         if not candidates:
             return False
 
@@ -895,6 +926,8 @@ class AnswerabilityAssessor:
         patterns = (
             rf"^\s*(?:section\s+\d+(?:\.\d+)*)?\s*{escaped}\s*[:\-–]\s+\S+",
             rf"^\s*(?:\d+(?:\.\d+)*)\s+{escaped}\s*[:\-–]\s+\S+",
+            rf"^\s*(?:section\s+\d+(?:\.\d+)*)?\s*{escaped}\s*\.\s+\S+",
+            rf"^\s*(?:\d+(?:\.\d+)*)\s+{escaped}\s*\.\s+\S+",
         )
         return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns)
 
