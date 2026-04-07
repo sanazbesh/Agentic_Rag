@@ -355,10 +355,16 @@ class AnswerabilityAssessor:
                 canonical_what_is = any(
                     note == "debug:canonical_what_is=true" for note in (query_understanding.routing_notes or [])
                 )
+                clause_override_triggered = any(
+                    note == "debug:clause_override_triggered=true" for note in (query_understanding.routing_notes or [])
+                )
+                clause_hint_match = any(
+                    note == "debug:clause_hint_match=true" for note in (query_understanding.routing_notes or [])
+                )
                 has_multiword_clause_hint = any(
                     len(self._canonical_phrase(hint).split()) >= 2 for hint in (query_understanding.resolved_clause_hints or [])
                 )
-                if canonical_what_is and has_multiword_clause_hint:
+                if canonical_what_is and clause_override_triggered and clause_hint_match and has_multiword_clause_hint:
                     has_operational_clause_support = self._has_operational_clause_definition_support(
                         query=original_query,
                         query_understanding=query_understanding,
@@ -370,8 +376,8 @@ class AnswerabilityAssessor:
                             has_any_coverage=True,
                             sufficient_coverage=False,
                             partial_coverage=False,
-                            reason="definition_not_supported",
-                            missing_requirements=["specific_clause_label_match"],
+                            reason="no_relevant_support",
+                            missing_requirements=["specific_clause_or_topic_support_in_substantive_text"],
                         )
                     return build(
                         status="sufficient",
@@ -898,6 +904,8 @@ class AnswerabilityAssessor:
                 return True
             if any(self._matches_leading_clause_label(text, candidate) for candidate in candidates):
                 return True
+            if any(self._matches_clause_topic_in_body(text, candidate) for candidate in candidates):
+                return True
         return False
 
     def _canonical_phrase(self, value: str) -> str:
@@ -930,6 +938,19 @@ class AnswerabilityAssessor:
             rf"^\s*(?:\d+(?:\.\d+)*)\s+{escaped}\s*\.\s+\S+",
         )
         return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns)
+
+    def _matches_clause_topic_in_body(self, text: str, candidate: str) -> bool:
+        canonical_text = self._canonical_phrase(text)
+        if not canonical_text or not candidate:
+            return False
+        if candidate in canonical_text:
+            return True
+        candidate_tokens = [token for token in candidate.split() if len(token) >= 4]
+        if len(candidate_tokens) < 2:
+            return False
+        text_tokens = set(canonical_text.split())
+        overlap = [token for token in candidate_tokens if token in text_tokens]
+        return len(overlap) >= 2
 
     def _field(self, item: object, key: str) -> Any:
         if isinstance(item, Mapping):

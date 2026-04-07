@@ -108,6 +108,67 @@ def test_definition_success_with_leading_clause_label_when_heading_metadata_is_c
     assert "operative_clause_language_detected" in result.supporting_signals
 
 
+def test_clause_lookup_override_succeeds_with_substantive_body_topic_match_and_coarse_heading() -> None:
+    query = "what is Termination Without Cause?"
+    understanding = understand_query(
+        query,
+        active_documents=[{"id": "doc-1", "name": "Employment Agreement"}],
+    )
+    context = [
+        _parent(
+            "p1",
+            "The Company may terminate Employee's employment without Cause upon thirty (30) days written notice and payment of any accrued amounts.",
+            heading="employment_agreement.pdf",
+        )
+    ]
+
+    result = assess_answerability(query, understanding, context)
+
+    assert understanding.answerability_expectation == "clause_lookup"
+    assert "debug:clause_hint_match=true" in understanding.routing_notes
+    assert "debug:clause_override_triggered=true" in understanding.routing_notes
+    assert result.sufficient_context is True
+    assert result.should_answer is True
+    assert result.insufficiency_reason is None
+
+
+def test_clause_lookup_override_heading_only_still_fails() -> None:
+    query = "what is Termination Without Cause?"
+    understanding = understand_query(
+        query,
+        active_documents=[{"id": "doc-1", "name": "Employment Agreement"}],
+    )
+    context = [_parent("p1", "employment_agreement.pdf", heading="employment_agreement.pdf")]
+
+    result = assess_answerability(query, understanding, context)
+
+    assert understanding.answerability_expectation == "clause_lookup"
+    assert result.sufficient_context is False
+    assert result.should_answer is False
+    assert result.insufficiency_reason == "only_title_or_heading_match"
+
+
+def test_clause_lookup_override_unrelated_substantive_text_still_fails_without_definition_reason() -> None:
+    query = "what is Termination Without Cause?"
+    understanding = understand_query(
+        query,
+        active_documents=[{"id": "doc-1", "name": "Employment Agreement"}],
+    )
+    context = [
+        _parent(
+            "p1",
+            "All notices under this Agreement must be in writing and sent by certified mail to the addresses listed above.",
+            heading="employment_agreement.pdf",
+        )
+    ]
+
+    result = assess_answerability(query, understanding, context)
+
+    assert understanding.answerability_expectation == "clause_lookup"
+    assert result.sufficient_context is False
+    assert result.insufficiency_reason == "topic_match_but_not_answer"
+
+
 def test_definition_multiword_clause_not_satisfied_by_broad_single_word_match() -> None:
     query = "what is Termination Without Cause?"
     understanding = understand_query(
@@ -125,7 +186,7 @@ def test_definition_multiword_clause_not_satisfied_by_broad_single_word_match() 
     result = evaluate_coverage(query, understanding, context)
 
     assert result.sufficient_coverage is False
-    assert result.coverage_reason == "definition_not_supported"
+    assert result.coverage_reason == "no_relevant_support"
 
 
 def test_definition_regression_title_and_clauses_without_definition_not_sufficient() -> None:
