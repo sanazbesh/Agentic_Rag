@@ -312,9 +312,15 @@ class AnswerabilityAssessor:
                     warnings=["heading_only_context"],
                 )
             has_def_lang = self._has_definition_support(original_query, substantive)
+            has_operational_clause_support = self._has_operational_clause_definition_support(
+                query=original_query,
+                query_understanding=query_understanding,
+                substantive=substantive,
+            )
             logger.debug(
-                "evaluate_coverage_definition branch=substantive has_definitional_support=%s substantive_items=%s",
+                "evaluate_coverage_definition branch=substantive has_definitional_support=%s has_operational_clause_support=%s substantive_items=%s",
                 has_def_lang,
+                has_operational_clause_support,
                 len(substantive),
             )
             if has_def_lang:
@@ -325,6 +331,15 @@ class AnswerabilityAssessor:
                     partial_coverage=False,
                     reason="general_support",
                     supporting_signals=["definitional_language_detected"],
+                )
+            if has_operational_clause_support:
+                return build(
+                    status="sufficient",
+                    has_any_coverage=True,
+                    sufficient_coverage=True,
+                    partial_coverage=False,
+                    reason="general_support",
+                    supporting_signals=["operative_clause_language_detected"],
                 )
             return build(
                 status="weak",
@@ -824,6 +839,64 @@ class AnswerabilityAssessor:
         if " " in candidate:
             targets.append(candidate.split()[-1])
         return tuple(dict.fromkeys(t for t in targets if t))
+
+    def _has_operational_clause_definition_support(
+        self,
+        *,
+        query: str,
+        query_understanding: QueryUnderstandingResult,
+        substantive: Sequence[Mapping[str, str]],
+    ) -> bool:
+        targets = set(self._definition_targets(query))
+        hint_candidates = {
+            self._canonical_phrase(hint)
+            for hint in [*query_understanding.resolved_clause_hints, *query_understanding.resolved_topic_hints]
+            if self._canonical_phrase(hint)
+        }
+        candidates = {self._canonical_phrase(value) for value in targets if self._canonical_phrase(value)}
+        candidates.update(hint_candidates)
+        if not candidates:
+            return False
+
+        for item in substantive:
+            text = (item.get("text") or "").strip()
+            if len(text) < self.min_substantive_chars:
+                continue
+            heading = self._canonical_phrase(item.get("heading") or "")
+            if heading and any(self._is_strong_clause_label_match(heading, candidate) for candidate in candidates):
+                return True
+            if any(self._matches_leading_clause_label(text, candidate) for candidate in candidates):
+                return True
+        return False
+
+    def _canonical_phrase(self, value: str) -> str:
+        lowered = (value or "").lower().strip()
+        lowered = re.sub(r"[^a-z0-9\s]+", " ", lowered)
+        return " ".join(lowered.split())
+
+    def _is_strong_clause_label_match(self, heading: str, candidate: str) -> bool:
+        if not heading or not candidate:
+            return False
+        if heading == candidate:
+            return True
+        if heading in candidate or candidate in heading:
+            heading_tokens = set(heading.split())
+            candidate_tokens = set(candidate.split())
+            if not heading_tokens or not candidate_tokens:
+                return False
+            overlap = len(heading_tokens & candidate_tokens) / max(len(heading_tokens), len(candidate_tokens))
+            return overlap >= 0.8
+        return False
+
+    def _matches_leading_clause_label(self, text: str, candidate: str) -> bool:
+        if not text or not candidate:
+            return False
+        escaped = re.escape(candidate)
+        patterns = (
+            rf"^\s*(?:section\s+\d+(?:\.\d+)*)?\s*{escaped}\s*[:\-–]\s+\S+",
+            rf"^\s*(?:\d+(?:\.\d+)*)\s+{escaped}\s*[:\-–]\s+\S+",
+        )
+        return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns)
 
     def _field(self, item: object, key: str) -> Any:
         if isinstance(item, Mapping):

@@ -69,6 +69,24 @@ def test_definition_success_with_explanatory_language() -> None:
     assert result.sufficient_coverage is True
 
 
+def test_definition_success_with_clause_heading_and_substantive_body_without_explicit_definition_phrase() -> None:
+    query = "what is Termination Without Cause?"
+    understanding = understand_query(query)
+    context = [
+        _parent(
+            "p1",
+            "The Company may terminate Employee's employment at any time without Cause by providing thirty (30) days written notice and any required severance under this Agreement.",
+            heading="Termination Without Cause",
+        )
+    ]
+
+    result = evaluate_coverage(query, understanding, context)
+
+    assert result.coverage_status == "sufficient"
+    assert result.sufficient_coverage is True
+    assert "operative_clause_language_detected" in result.supporting_signals
+
+
 def test_definition_regression_title_and_clauses_without_definition_not_sufficient() -> None:
     query = "what is employment agreement?"
     understanding = understand_query(query)
@@ -101,6 +119,24 @@ def test_definition_title_only_is_not_sufficient() -> None:
     query = "what is employment agreement?"
     understanding = understand_query(query)
     context = [_parent("p1", "Employment Agreement", heading="Employment Agreement")]
+
+    coverage = evaluate_coverage(query, understanding, context)
+
+    assert coverage.has_any_coverage is True
+    assert coverage.sufficient_coverage is False
+    assert coverage.coverage_reason == "definition_not_supported"
+
+
+def test_definition_generic_substantive_text_without_clause_match_still_fails() -> None:
+    query = "what is confidentiality?"
+    understanding = understand_query(query)
+    context = [
+        _parent(
+            "p1",
+            "This agreement sets out the rights and obligations of the parties and includes provisions related to employment, compensation, and workplace conduct.",
+            heading="General Terms",
+        )
+    ]
 
     coverage = evaluate_coverage(query, understanding, context)
 
