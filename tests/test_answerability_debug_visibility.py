@@ -82,6 +82,74 @@ def test_regression_definition_query_debug_contains_answerability_result() -> No
     assert payload["answerability_result"]["question_type"] == "definition_query"
 
 
+def test_real_debug_payload_explicitly_surfaces_decomposition_gate_from_state() -> None:
+    services = _services_with_context(query="Compare governing law and dispute resolution clauses.")
+    _, state = run_legal_rag_turn_with_state(
+        query="Compare governing law and dispute resolution clauses.",
+        dependencies=services.as_dependencies(),
+    )
+
+    payload = build_real_debug_payload(latest_state=dict(state), selected_documents=[])
+
+    assert "decomposition" in payload
+    assert payload["decomposition"] == {
+        "needs_decomposition": state["needs_decomposition"],
+        "decomposition_gate_reasons": state["decomposition_gate_reasons"],
+    }
+
+
+def test_real_debug_payload_decomposition_not_derived_from_query_understanding_hint() -> None:
+    payload = build_real_debug_payload(
+        latest_state={
+            "query_classification": {"may_need_decomposition": True},
+            "needs_decomposition": False,
+            "decomposition_gate_reasons": ["simple_single_clause_lookup"],
+        },
+        selected_documents=[],
+    )
+
+    assert payload["query_classification"]["may_need_decomposition"] is True
+    assert payload["decomposition"]["needs_decomposition"] is False
+    assert payload["decomposition"]["decomposition_gate_reasons"] == ["simple_single_clause_lookup"]
+
+
+def test_real_debug_payload_decomposition_section_has_stable_runtime_shapes() -> None:
+    payload = build_real_debug_payload(
+        latest_state={
+            "query_classification": {"may_need_decomposition": True},
+            "needs_decomposition": "invalid",
+            "decomposition_gate_reasons": ["ok", 123],
+        },
+        selected_documents=[],
+    )
+
+    assert payload["query_classification"]["may_need_decomposition"] is True
+    assert payload["decomposition"] == {
+        "needs_decomposition": False,
+        "decomposition_gate_reasons": [],
+    }
+
+
+def test_main_and_fallback_modes_surface_same_decomposition_debug_schema(monkeypatch: Any) -> None:
+    import agentic_rag.orchestration.retrieval_graph as retrieval_graph_module
+
+    query = "Compare governing law and dispute resolution clauses."
+    classifier = _decision(rewrite=False)
+    main_services = FakeServices(classifier=classifier)
+    _, main_state = run_legal_rag_turn_with_state(query=query, dependencies=main_services.as_dependencies())
+
+    monkeypatch.setattr(retrieval_graph_module, "StateGraph", None)
+    fallback_services = FakeServices(classifier=classifier)
+    _, fallback_state = run_legal_rag_turn_with_state(query=query, dependencies=fallback_services.as_dependencies())
+
+    main_payload = build_real_debug_payload(latest_state=dict(main_state), selected_documents=[])
+    fallback_payload = build_real_debug_payload(latest_state=dict(fallback_state), selected_documents=[])
+
+    assert set(main_payload["decomposition"]) == {"needs_decomposition", "decomposition_gate_reasons"}
+    assert set(fallback_payload["decomposition"]) == {"needs_decomposition", "decomposition_gate_reasons"}
+    assert main_payload["decomposition"] == fallback_payload["decomposition"]
+
+
 class _NoopExpander:
     def __enter__(self) -> "_NoopExpander":
         return self

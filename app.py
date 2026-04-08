@@ -93,7 +93,20 @@ def build_real_debug_payload(
     else:
         resolved_topics = list(getattr(resolution, "resolved_topic_hints", []))
 
+    def _read_decomposition_gate_state(state: dict[str, Any]) -> dict[str, Any]:
+        """Read decomposition gate metadata from runtime state with stable shapes."""
+
+        needs = state.get("needs_decomposition")
+        reasons = state.get("decomposition_gate_reasons")
+        stable_needs = needs if isinstance(needs, bool) else False
+        stable_reasons = reasons if isinstance(reasons, list) and all(isinstance(item, str) for item in reasons) else []
+        return {
+            "needs_decomposition": stable_needs,
+            "decomposition_gate_reasons": list(stable_reasons),
+        }
+
     answerability_result = _to_debug_jsonable(latest_state.get("answerability_result"))
+    decomposition = _read_decomposition_gate_state(latest_state)
     warnings = list(latest_state.get("warnings", []))
     invoked = bool(latest_state.get("answerability_assessment_invoked", False))
     if not invoked:
@@ -109,6 +122,7 @@ def build_real_debug_payload(
         "scope": dict(scope_meta) if isinstance(scope_meta, dict) else {},
         "query_classification": _to_debug_jsonable(latest_state.get("query_classification")),
         "context_resolution": _to_debug_jsonable(latest_state.get("context_resolution")),
+        "decomposition": decomposition,
         "answerability_result": answerability_result,
         "resolved_query": latest_state.get("resolved_query"),
         "effective_query": latest_state.get("effective_query"),
@@ -193,6 +207,7 @@ def build_real_backend_runners() -> tuple[Callable[..., Any] | None, Callable[..
             dependencies=wrapped_dependencies,
             conversation_summary=conversation_summary,
             recent_messages=recent_messages,
+            selected_documents=selected_docs,
             retrieval_config=retrieval_config,
         )
         latest_state.clear()

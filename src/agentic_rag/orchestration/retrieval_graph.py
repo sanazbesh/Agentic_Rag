@@ -17,6 +17,7 @@ try:  # pragma: no cover - optional runtime dependency
 except Exception:  # pragma: no cover - fallback for constrained envs
     from agentic_rag._compat_pydantic import BaseModel, ConfigDict, Field
 
+from agentic_rag.orchestration.decomposition_gate import decide_decomposition_need
 from agentic_rag.orchestration.query_understanding import QueryUnderstandingResult, understand_query
 from agentic_rag.retrieval.parent_child import HybridSearchResult, ParentChunkResult, RerankedChunkResult
 from agentic_rag.tools.context_processing import CompressContextResult, CompressedParentChunk
@@ -48,6 +49,47 @@ class QueryContextResolution(BaseModel):
     unresolved_references: list[str] = Field(default_factory=list)
 
 
+class SubQueryPlan(BaseModel):
+    """Typed planner sub-query schema reserved for future decomposition wiring."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    id: str
+    question: str
+    purpose: str
+    expected_answer_type: Literal[
+        "definition",
+        "entity",
+        "date",
+        "obligation",
+        "exception",
+        "comparison",
+        "condition",
+        "cross_reference",
+    ]
+    dependency_ids: list[str] = Field(default_factory=list)
+
+
+class DecompositionPlan(BaseModel):
+    """Typed decomposition plan schema reserved for future planner integration."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    should_decompose: bool
+    root_question: str
+    strategy: Literal[
+        "conjunctive",
+        "comparison",
+        "temporal",
+        "exception_chain",
+        "cross_clause",
+        "definition_plus_application",
+        "amendment_vs_base",
+    ] | None = None
+    subqueries: list[SubQueryPlan] = Field(default_factory=list)
+    planner_notes: list[str] = Field(default_factory=list)
+
+
 class RetrievalStageState(TypedDict):
     """Strict retrieval-stage state shared by all graph nodes."""
 
@@ -63,6 +105,9 @@ class RetrievalStageState(TypedDict):
     effective_query: str
     query_classification: QueryRoutingDecision | None
     context_resolution: QueryContextResolution | None
+    needs_decomposition: bool
+    decomposition_plan: DecompositionPlan | None
+    decomposition_gate_reasons: list[str]
 
     extracted_entities: LegalEntityExtractionResult | None
     filters: dict[str, Any] | None
@@ -146,6 +191,9 @@ def default_retrieval_state(
         effective_query=normalized_query,
         query_classification=None,
         context_resolution=None,
+        needs_decomposition=False,
+        decomposition_plan=None,
+        decomposition_gate_reasons=[],
         extracted_entities=None,
         filters=None,
         child_results=[],
@@ -201,6 +249,29 @@ def _derive_filters(extraction: LegalEntityExtractionResult) -> dict[str, Any] |
     if filters.date_to:
         payload["date_to"] = filters.date_to
     return payload or None
+
+
+def classify_decomposition_need(
+    *,
+    query: str,
+    query_classification: QueryRoutingDecision | None,
+    context_resolution: QueryContextResolution | None,
+) -> tuple[bool, list[str]]:
+    """Compatibility wrapper around the centralized decomposition gate helper."""
+
+    context_payload = context_resolution.model_dump() if context_resolution is not None else None
+    decision = decide_decomposition_need(
+        query=query,
+        query_context=context_payload,
+        query_understanding=query_classification,
+    )
+    needs_decomposition = getattr(decision, "needs_decomposition", None)
+    reasons = getattr(decision, "reasons", None)
+    if not isinstance(needs_decomposition, bool):
+        return False, []
+    if not isinstance(reasons, list) or any(not isinstance(reason, str) for reason in reasons):
+        return False, []
+    return needs_decomposition, list(reasons)
 
 
 class RetrievalGraphNodes:
@@ -261,23 +332,38 @@ class RetrievalGraphNodes:
     def classify_query_state(self, state: RetrievalStageState) -> RetrievalStageState:
         logger.info("node_enter name=classify_query_state")
         updated = dict(state)
+        active_docs = list(updated.get("active_documents") or [])
+        selected_docs = list(updated.get("selected_documents") or [])
+        selected_ids = [
+            str(item.get("id"))
+            for item in selected_docs
+            if isinstance(item, Mapping) and item.get("id")
+        ]
+        logger.info(
+            "classify_query_state_inputs active_documents_count=%s selected_documents_count=%s selected_document_ids=%s",
+            len(active_docs),
+            len(selected_docs),
+            selected_ids,
+        )
         decision = self.dependencies.classify_query_state(
             updated["original_query"],
             conversation_summary=updated["conversation_summary"],
             recent_messages=updated["recent_messages"],
-            active_documents=updated.get("active_documents"),
-            selected_documents=updated.get("selected_documents"),
+            active_documents=active_docs,
+            selected_documents=selected_docs,
         )
         updated["query_classification"] = decision
         updated["use_conversation_context"] = decision.use_conversation_context
         updated["should_rewrite"] = decision.should_rewrite
         updated["should_extract_entities"] = decision.should_extract_entities
         logger.info(
-            "node_exit name=classify_query_state followup=%s ambiguous=%s rewrite=%s extract=%s",
+            "node_exit name=classify_query_state followup=%s ambiguous=%s rewrite=%s extract=%s final_question_type=%s final_answerability_expectation=%s",
             decision.is_followup,
             decision.question_type == "ambiguous_query",
             decision.should_rewrite,
             decision.should_extract_entities,
+            decision.question_type,
+            decision.answerability_expectation,
         )
         return cast(RetrievalStageState, updated)
 
@@ -347,6 +433,23 @@ class RetrievalGraphNodes:
             "node_exit name=resolve_query_context used_context=%s unresolved_count=%s",
             resolution.used_conversation_context,
             len(resolution.unresolved_references),
+        )
+        return cast(RetrievalStageState, updated)
+
+    def classify_decomposition_need(self, state: RetrievalStageState) -> RetrievalStageState:
+        logger.info("node_enter name=classify_decomposition_need")
+        updated = dict(state)
+        needs_decomposition, reasons = classify_decomposition_need(
+            query=str(updated.get("resolved_query") or updated.get("original_query") or ""),
+            query_classification=updated.get("query_classification"),
+            context_resolution=updated.get("context_resolution"),
+        )
+        updated["needs_decomposition"] = needs_decomposition
+        updated["decomposition_gate_reasons"] = reasons
+        logger.info(
+            "node_exit name=classify_decomposition_need needs_decomposition=%s reasons=%s",
+            needs_decomposition,
+            ",".join(reasons),
         )
         return cast(RetrievalStageState, updated)
 
@@ -527,15 +630,9 @@ class RetrievalGraphNodes:
 
 
 DecisionLiteral = Literal[
-    "rewrite_query_if_needed",
-    "extract_entities_if_needed",
     "compress_context_node",
     "mark_complete_without_compression",
 ]
-
-
-def _route_after_classification(state: RetrievalStageState) -> DecisionLiteral:
-    return "rewrite_query_if_needed" if state["should_rewrite"] else "extract_entities_if_needed"
 
 
 def _route_after_compression_check(state: RetrievalStageState) -> DecisionLiteral:
@@ -553,8 +650,8 @@ class _FallbackCompiledGraph:
         current = self._nodes.ingest_turn(current)
         current = self._nodes.classify_query_state(current)
         current = self._nodes.resolve_query_context(current)
-        if _route_after_classification(current) == "rewrite_query_if_needed":
-            current = self._nodes.rewrite_query_if_needed(current)
+        current = self._nodes.classify_decomposition_need(current)
+        current = self._nodes.rewrite_query_if_needed(current)
         current = self._nodes.extract_entities_if_needed(current)
         current = self._nodes.run_hybrid_search(current)
         current = self._nodes.rerank_results(current)
@@ -585,6 +682,7 @@ def build_retrieval_graph(
     graph.add_node("ingest_turn", nodes.ingest_turn)
     graph.add_node("classify_query_state", nodes.classify_query_state)
     graph.add_node("resolve_query_context", nodes.resolve_query_context)
+    graph.add_node("classify_decomposition_need", nodes.classify_decomposition_need)
     graph.add_node("rewrite_query_if_needed", nodes.rewrite_query_if_needed)
     graph.add_node("extract_entities_if_needed", nodes.extract_entities_if_needed)
     graph.add_node("run_hybrid_search", nodes.run_hybrid_search)
@@ -598,14 +696,8 @@ def build_retrieval_graph(
     graph.add_edge(START, "ingest_turn")
     graph.add_edge("ingest_turn", "classify_query_state")
     graph.add_edge("classify_query_state", "resolve_query_context")
-    graph.add_conditional_edges(
-        "resolve_query_context",
-        _route_after_classification,
-        {
-            "rewrite_query_if_needed": "rewrite_query_if_needed",
-            "extract_entities_if_needed": "extract_entities_if_needed",
-        },
-    )
+    graph.add_edge("resolve_query_context", "classify_decomposition_need")
+    graph.add_edge("classify_decomposition_need", "rewrite_query_if_needed")
     graph.add_edge("rewrite_query_if_needed", "extract_entities_if_needed")
     graph.add_edge("extract_entities_if_needed", "run_hybrid_search")
     graph.add_edge("run_hybrid_search", "rerank_results")

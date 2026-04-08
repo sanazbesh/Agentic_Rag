@@ -3,10 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from agentic_rag.orchestration.decomposition_gate import decide_decomposition_need
 from agentic_rag.orchestration.retrieval_graph import (
     QueryRoutingDecision,
     RetrievalDependencies,
     RetrievalGraphConfig,
+    classify_decomposition_need,
+    build_retrieval_graph,
+    default_retrieval_state,
     run_retrieval_stage,
 )
 from agentic_rag.retrieval.parent_child import HybridSearchResult, ParentChunkResult, RerankedChunkResult
@@ -321,3 +325,283 @@ def test_deterministic_routing_for_same_inputs() -> None:
     assert state_a["query_classification"] == state_b["query_classification"]
     assert state_a["should_rewrite"] == state_b["should_rewrite"]
     assert state_a["should_extract_entities"] == state_b["should_extract_entities"]
+
+
+
+
+def test_classify_decomposition_need_runs_after_context_resolution(monkeypatch) -> None:
+    import agentic_rag.orchestration.retrieval_graph as retrieval_graph_module
+
+    call_order: list[str] = []
+    original_resolve = retrieval_graph_module.RetrievalGraphNodes.resolve_query_context
+    original_gate = retrieval_graph_module.RetrievalGraphNodes.classify_decomposition_need
+
+    def wrapped_resolve(self, state):
+        call_order.append("resolve_query_context")
+        return original_resolve(self, state)
+
+    def wrapped_gate(self, state):
+        call_order.append("classify_decomposition_need")
+        return original_gate(self, state)
+
+    monkeypatch.setattr(retrieval_graph_module.RetrievalGraphNodes, "resolve_query_context", wrapped_resolve)
+    monkeypatch.setattr(retrieval_graph_module.RetrievalGraphNodes, "classify_decomposition_need", wrapped_gate)
+
+    services = FakeServices(
+        classifier=_decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False),
+    )
+    run_retrieval_stage(query="What is confidentiality?", dependencies=services.as_dependencies())
+
+    assert "resolve_query_context" in call_order
+    assert "classify_decomposition_need" in call_order
+    assert call_order.index("resolve_query_context") < call_order.index("classify_decomposition_need")
+
+
+def test_invalid_helper_result_defaults_to_safe_gate_output(monkeypatch) -> None:
+    import agentic_rag.orchestration.retrieval_graph as retrieval_graph_module
+
+    class InvalidDecision:  # pragma: no cover - local test double
+        needs_decomposition = "yes"
+        reasons = ["comparison_query"]
+
+    monkeypatch.setattr(retrieval_graph_module, "decide_decomposition_need", lambda **_: InvalidDecision())
+
+    needs_decomposition, reasons = retrieval_graph_module.classify_decomposition_need(
+        query="Compare governing law versus dispute resolution.",
+        query_classification=None,
+        context_resolution=None,
+    )
+
+    assert needs_decomposition is False
+    assert reasons == []
+
+
+def test_decomposition_true_does_not_change_downstream_search_inputs() -> None:
+    services = FakeServices(
+        classifier=_decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False),
+        hybrid_results=[_hybrid("c1", "p1")],
+        reranked_results=[_reranked("c1", "p1")],
+        parent_results=[_parent("p1")],
+    )
+    state = run_retrieval_stage(
+        query="Compare governing law versus dispute resolution.",
+        dependencies=services.as_dependencies(),
+    )
+
+    assert state["needs_decomposition"] is True
+    assert services.hybrid_calls[0]["query"] == state["effective_query"]
+    assert state["effective_query"] == state["original_query"]
+
+
+def test_decomposition_gate_simple_definition_does_not_trigger() -> None:
+    decision = _decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False)
+    needs_decomposition, reasons = classify_decomposition_need(
+        query="What is confidentiality?",
+        query_classification=decision,
+        context_resolution=None,
+    )
+    assert needs_decomposition is False
+    assert reasons == ["simple_single_clause_lookup"]
+
+
+def test_decomposition_gate_conjunctive_query_triggers() -> None:
+    decision = _decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False)
+    needs_decomposition, reasons = classify_decomposition_need(
+        query="Who are the parties involved in this agreement and what are their obligations?",
+        query_classification=decision,
+        context_resolution=None,
+    )
+    helper_decision = decide_decomposition_need(
+        query="Who are the parties involved in this agreement and what are their obligations?",
+        query_understanding=decision,
+        query_context=None,
+    )
+    assert needs_decomposition is False
+    assert reasons == helper_decision.reasons
+
+
+def test_decomposition_gate_comparison_query_triggers() -> None:
+    decision = _decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False)
+    needs_decomposition, reasons = classify_decomposition_need(
+        query="Compare the governing law and dispute resolution clauses.",
+        query_classification=decision,
+        context_resolution=None,
+    )
+    helper_decision = decide_decomposition_need(
+        query="Compare the governing law and dispute resolution clauses.",
+        query_understanding=decision,
+        query_context=None,
+    )
+    assert needs_decomposition is True
+    assert reasons == helper_decision.reasons
+
+
+def test_decomposition_gate_amendment_temporal_query_triggers() -> None:
+    decision = _decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False)
+    needs_decomposition, reasons = classify_decomposition_need(
+        query="How did the amendment change the confidentiality obligations?",
+        query_classification=decision,
+        context_resolution=None,
+    )
+    helper_decision = decide_decomposition_need(
+        query="How did the amendment change the confidentiality obligations?",
+        query_understanding=decision,
+        query_context=None,
+    )
+    assert needs_decomposition is True
+    assert reasons == helper_decision.reasons
+
+
+def test_decomposition_gate_context_dependent_followup_can_trigger() -> None:
+    decision = _decision(followup=True, ambiguous=True, use_context=True, rewrite=True, extract=False)
+    state = run_retrieval_stage(
+        query="Compare governing law versus dispute resolution in that clause?",
+        conversation_summary="Prior turn discussed termination section.",
+        recent_messages=[
+            {
+                "role": "assistant",
+                "content": "Governing law is Delaware.",
+                "metadata": {"resolved_topic_hints": ["termination"]},
+            }
+        ],
+        dependencies=FakeServices(classifier=decision).as_dependencies(),
+    )
+    assert state["needs_decomposition"] is True
+    helper_decision = decide_decomposition_need(
+        query=state["resolved_query"],
+        query_context=state["context_resolution"].model_dump() if state["context_resolution"] is not None else None,
+        query_understanding=state["query_classification"],
+    )
+    assert state["decomposition_gate_reasons"] == helper_decision.reasons
+
+
+def test_decomposition_gate_followup_without_strong_structure_stays_false() -> None:
+    decision = _decision(followup=True, ambiguous=True, use_context=True, rewrite=True, extract=False)
+    state = run_retrieval_stage(
+        query="What about that clause?",
+        conversation_summary="Prior turn discussed termination section.",
+        recent_messages=[
+            {
+                "role": "assistant",
+                "content": "Termination notice was 30 days.",
+                "metadata": {"resolved_clause_hints": ["termination"]},
+            }
+        ],
+        dependencies=FakeServices(classifier=decision).as_dependencies(),
+    )
+    assert state["needs_decomposition"] is False
+    assert state["decomposition_gate_reasons"] == ["simple_single_clause_lookup"]
+
+
+def test_retrieval_state_contains_decomposition_gate_output() -> None:
+    services = FakeServices(
+        classifier=_decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False),
+    )
+    state = run_retrieval_stage(
+        query="What is the governing law?",
+        dependencies=services.as_dependencies(),
+    )
+    assert state["needs_decomposition"] is False
+    assert state["decomposition_gate_reasons"] == ["simple_single_clause_lookup"]
+
+
+def test_fallback_graph_populates_decomposition_gate_output(monkeypatch) -> None:
+    import agentic_rag.orchestration.retrieval_graph as retrieval_graph_module
+
+    monkeypatch.setattr(retrieval_graph_module, "StateGraph", None)
+    services = FakeServices(
+        classifier=_decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False),
+    )
+    app = build_retrieval_graph(dependencies=services.as_dependencies())
+    state = app.invoke(default_retrieval_state(query="Define effective date."))
+    assert state["needs_decomposition"] is False
+    assert state["decomposition_gate_reasons"] == ["simple_single_clause_lookup"]
+
+
+def test_fallback_graph_records_decomposition_trigger_for_comparison_query(monkeypatch) -> None:
+    import agentic_rag.orchestration.retrieval_graph as retrieval_graph_module
+
+    monkeypatch.setattr(retrieval_graph_module, "StateGraph", None)
+    services = FakeServices(
+        classifier=_decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False),
+    )
+    app = build_retrieval_graph(dependencies=services.as_dependencies())
+    state = app.invoke(default_retrieval_state(query="Compare governing law and dispute resolution clauses."))
+
+    assert state["needs_decomposition"] is True
+    assert "comparison_query" in state["decomposition_gate_reasons"]
+
+
+def test_fallback_graph_gate_output_matches_shared_helper(monkeypatch) -> None:
+    import agentic_rag.orchestration.retrieval_graph as retrieval_graph_module
+
+    monkeypatch.setattr(retrieval_graph_module, "StateGraph", None)
+    services = FakeServices(
+        classifier=_decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False),
+    )
+    query = "Compare governing law and dispute resolution clauses."
+    app = build_retrieval_graph(dependencies=services.as_dependencies())
+    state = app.invoke(default_retrieval_state(query=query))
+
+    helper_decision = decide_decomposition_need(
+        query=state["resolved_query"],
+        query_context=state["context_resolution"].model_dump() if state["context_resolution"] is not None else None,
+        query_understanding=state["query_classification"],
+    )
+    assert state["needs_decomposition"] == helper_decision.needs_decomposition
+    assert state["decomposition_gate_reasons"] == helper_decision.reasons
+
+
+def test_fallback_graph_continues_existing_retrieval_flow_after_gate(monkeypatch) -> None:
+    import agentic_rag.orchestration.retrieval_graph as retrieval_graph_module
+
+    monkeypatch.setattr(retrieval_graph_module, "StateGraph", None)
+    services = FakeServices(
+        classifier=_decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False),
+        hybrid_results=[_hybrid("c1", "p1")],
+        reranked_results=[_reranked("c1", "p1")],
+        parent_results=[_parent("p1")],
+    )
+    app = build_retrieval_graph(dependencies=services.as_dependencies())
+    state = app.invoke(default_retrieval_state(query="Compare governing law and dispute resolution clauses."))
+
+    assert state["needs_decomposition"] is True
+    assert services.hybrid_calls[0]["query"] == state["effective_query"]
+    assert state["parent_ids"] == ["p1"]
+    assert state["retrieval_stage_complete"] is True
+
+
+def test_fallback_graph_gate_outputs_are_deterministic_for_identical_inputs(monkeypatch) -> None:
+    import agentic_rag.orchestration.retrieval_graph as retrieval_graph_module
+
+    monkeypatch.setattr(retrieval_graph_module, "StateGraph", None)
+    services = FakeServices(
+        classifier=_decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False),
+    )
+    app = build_retrieval_graph(dependencies=services.as_dependencies())
+    first = app.invoke(default_retrieval_state(query="Compare governing law and dispute resolution clauses."))
+    second = app.invoke(default_retrieval_state(query="Compare governing law and dispute resolution clauses."))
+
+    assert first["needs_decomposition"] == second["needs_decomposition"]
+    assert first["decomposition_gate_reasons"] == second["decomposition_gate_reasons"]
+
+
+def test_main_graph_and_fallback_gate_outputs_match_for_equivalent_resolved_inputs(monkeypatch) -> None:
+    import agentic_rag.orchestration.retrieval_graph as retrieval_graph_module
+
+    query = "Compare the governing law and dispute resolution clauses."
+    classifier = _decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False)
+
+    main_services = FakeServices(classifier=classifier)
+    main_state = run_retrieval_stage(query=query, dependencies=main_services.as_dependencies())
+
+    monkeypatch.setattr(retrieval_graph_module, "StateGraph", None)
+    fallback_services = FakeServices(classifier=classifier)
+    fallback_app = build_retrieval_graph(dependencies=fallback_services.as_dependencies())
+    fallback_state = fallback_app.invoke(default_retrieval_state(query=query))
+
+    assert main_state["resolved_query"] == fallback_state["resolved_query"]
+    assert main_state["context_resolution"] == fallback_state["context_resolution"]
+    assert main_state["query_classification"] == fallback_state["query_classification"]
+    assert main_state["needs_decomposition"] == fallback_state["needs_decomposition"]
+    assert main_state["decomposition_gate_reasons"] == fallback_state["decomposition_gate_reasons"]

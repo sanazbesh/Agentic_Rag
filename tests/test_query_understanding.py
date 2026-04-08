@@ -16,6 +16,42 @@ def test_definition_query() -> None:
     assert result.answerability_expectation == "definition_required"
 
 
+def test_what_is_clause_lookup_only_when_document_grounded() -> None:
+    result = understand_query(
+        "what is confidentiality?",
+        active_documents=[{"id": "doc-nda", "name": "Mutual NDA"}],
+    )
+    assert result.question_type == "document_content_query"
+    assert result.answerability_expectation == "clause_lookup"
+    assert result.is_document_scoped is True
+
+
+def test_what_is_remains_definition_without_active_document_context() -> None:
+    result = understand_query("what is confidentiality?")
+    assert result.question_type == "definition_query"
+    assert result.answerability_expectation == "definition_required"
+
+
+def test_what_is_weak_hint_match_stays_definition_and_logs_ambiguity() -> None:
+    result = understand_query(
+        "what is law?",
+        active_documents=[{"id": "doc-nda", "name": "Mutual NDA"}],
+    )
+    assert result.question_type == "definition_query"
+    assert result.answerability_expectation == "definition_required"
+    assert "ambiguous_definition_vs_clause" in result.ambiguity_notes
+
+
+def test_what_is_multiword_clause_subject_preserved_for_hint_matching() -> None:
+    result = understand_query(
+        "what is Termination Without Cause?",
+        active_documents=[{"id": "doc-employment", "name": "Employment Agreement"}],
+    )
+    assert "termination without cause" in result.resolved_clause_hints
+    assert result.question_type == "document_content_query"
+    assert "debug:clause_hint_match=true" in result.routing_notes
+
+
 def test_document_content_query() -> None:
     result = understand_query("what does the document say about confidentiality?")
     assert result.question_type == "document_content_query"
