@@ -13,16 +13,20 @@ def test_subquery_plan_accepts_valid_values_and_dependency_ids_default_is_safe()
         id="sq-1",
         question="What is the notice period under the termination clause?",
         purpose="Identify the baseline notice obligation for later comparison.",
+        required=True,
         expected_answer_type="obligation",
     )
     second = SubQueryPlan(
         id="sq-2",
         question="How does the amendment change the notice period?",
         purpose="Capture the amended notice obligation.",
+        required=False,
         expected_answer_type="comparison",
     )
 
     assert first.expected_answer_type == "obligation"
+    assert first.required is True
+    assert second.required is False
     assert first.dependency_ids == []
     assert second.dependency_ids == []
     assert first.dependency_ids is not second.dependency_ids
@@ -52,6 +56,7 @@ def test_decomposition_plan_accepts_decomposed_state_with_one_valid_subquery() -
         id="sq-1",
         question="Which clause defines cause for termination?",
         purpose="Locate the definition before applying exception analysis.",
+        required=True,
         expected_answer_type="definition",
     )
 
@@ -74,6 +79,7 @@ def test_subquery_plan_rejects_invalid_expected_answer_type() -> None:
             id="sq-invalid",
             question="When does payment become overdue?",
             purpose="Identify timing threshold.",
+            required=True,
             expected_answer_type="timeline",
         )
 

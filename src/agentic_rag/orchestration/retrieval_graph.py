@@ -57,6 +57,7 @@ class SubQueryPlan(BaseModel):
     id: str
     question: str
     purpose: str
+    required: bool
     expected_answer_type: Literal[
         "definition",
         "entity",
