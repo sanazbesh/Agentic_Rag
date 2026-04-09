@@ -5,6 +5,7 @@ from typing import Any
 
 from agentic_rag.orchestration.decomposition_gate import decide_decomposition_need
 from agentic_rag.orchestration.retrieval_graph import (
+    DecompositionPlan,
     QueryRoutingDecision,
     RetrievalDependencies,
     RetrievalGraphConfig,
@@ -325,6 +326,55 @@ def test_deterministic_routing_for_same_inputs() -> None:
     assert state_a["query_classification"] == state_b["query_classification"]
     assert state_a["should_rewrite"] == state_b["should_rewrite"]
     assert state_a["should_extract_entities"] == state_b["should_extract_entities"]
+
+
+def test_default_retrieval_state_has_safe_decomposition_wiring_defaults() -> None:
+    state = default_retrieval_state(query="What is confidentiality?")
+
+    assert state["decomposition_plan"] is None
+    assert state["decomposition_validation_errors"] == []
+    assert state["decomposition_validation_errors"] is not default_retrieval_state(query="q")[
+        "decomposition_validation_errors"
+    ]
+
+
+def test_fallback_graph_carries_decomposition_plan_without_using_it(monkeypatch) -> None:
+    import agentic_rag.orchestration.retrieval_graph as retrieval_graph_module
+
+    monkeypatch.setattr(retrieval_graph_module, "StateGraph", None)
+    services = FakeServices(
+        classifier=_decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False),
+    )
+    app = build_retrieval_graph(dependencies=services.as_dependencies())
+    state = default_retrieval_state(query="What is governing law?")
+    state["decomposition_plan"] = DecompositionPlan(
+        should_decompose=False,
+        root_question="What is governing law?",
+    )
+
+    result = app.invoke(state)
+
+    assert result["decomposition_plan"] == state["decomposition_plan"]
+    assert services.hybrid_calls[0]["query"] == result["effective_query"]
+
+
+def test_fallback_graph_normalizes_none_decomposition_validation_errors(monkeypatch) -> None:
+    import agentic_rag.orchestration.retrieval_graph as retrieval_graph_module
+
+    monkeypatch.setattr(retrieval_graph_module, "StateGraph", None)
+    services = FakeServices(
+        classifier=_decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False),
+    )
+    app = build_retrieval_graph(dependencies=services.as_dependencies())
+    state = default_retrieval_state(query="Define effective date.")
+    state["decomposition_plan"] = None
+    state["decomposition_validation_errors"] = None  # type: ignore[assignment]
+
+    result = app.invoke(state)
+
+    assert result["decomposition_plan"] is None
+    assert result["decomposition_validation_errors"] == []
+    assert result["retrieval_stage_complete"] is True
 
 
 
