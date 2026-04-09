@@ -338,7 +338,7 @@ def test_default_retrieval_state_has_safe_decomposition_wiring_defaults() -> Non
     ]
 
 
-def test_fallback_graph_carries_decomposition_plan_without_using_it(monkeypatch) -> None:
+def test_fallback_graph_clears_preexisting_decomposition_plan_when_gate_is_false(monkeypatch) -> None:
     import agentic_rag.orchestration.retrieval_graph as retrieval_graph_module
 
     monkeypatch.setattr(retrieval_graph_module, "StateGraph", None)
@@ -354,7 +354,7 @@ def test_fallback_graph_carries_decomposition_plan_without_using_it(monkeypatch)
 
     result = app.invoke(state)
 
-    assert result["decomposition_plan"] == state["decomposition_plan"]
+    assert result["decomposition_plan"] is None
     assert services.hybrid_calls[0]["query"] == result["effective_query"]
 
 

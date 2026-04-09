@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Mapping, Sequence
+import re
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, TypedDict, cast
 
@@ -277,6 +278,164 @@ def classify_decomposition_need(
     return needs_decomposition, list(reasons)
 
 
+def _pick_strategy(reasons: Sequence[str]) -> Literal[
+    "conjunctive",
+    "comparison",
+    "temporal",
+    "exception_chain",
+    "cross_clause",
+    "definition_plus_application",
+    "amendment_vs_base",
+] | None:
+    ordered = list(reasons)
+    if "amendment_vs_base" in ordered:
+        return "amendment_vs_base"
+    if "comparison_query" in ordered:
+        return "comparison"
+    if "exception_chain" in ordered:
+        return "exception_chain"
+    if "temporal_relationship" in ordered:
+        return "temporal"
+    if "cross_clause_obligation_condition" in ordered:
+        return "cross_clause"
+    if "multi_intent_conjunction" in ordered:
+        return "conjunctive"
+    if "context_dependent_followup" in ordered:
+        return "definition_plus_application"
+    return None
+
+
+def _extract_comparison_terms(query: str) -> tuple[str | None, str | None]:
+    cleaned = " ".join((query or "").split())
+    patterns = (
+        re.compile(r"(?:compare|difference(?:s)?\s+between)\s+(.+?)\s+(?:and|versus|vs\.?|compared\s+to)\s+(.+?)(?:[?.]|$)", re.IGNORECASE),
+        re.compile(r"(.+?)\s+(?:versus|vs\.?|compared\s+to)\s+(.+?)(?:[?.]|$)", re.IGNORECASE),
+    )
+    for pattern in patterns:
+        match = pattern.search(cleaned)
+        if not match:
+            continue
+        left = match.group(1).strip(" ,")
+        right = match.group(2).strip(" ,")
+        if left and right:
+            return left, right
+    return None, None
+
+
+def build_decomposition_plan(
+    *,
+    query: str,
+    needs_decomposition: bool,
+    reasons: Sequence[str],
+    query_classification: QueryRoutingDecision | None,
+    context_resolution: QueryContextResolution | None,
+) -> DecompositionPlan | None:
+    """Build a bounded typed decomposition plan only when the gate requires it."""
+
+    if not needs_decomposition:
+        return None
+
+    root_question = " ".join((query or "").split())
+    strategy = _pick_strategy(reasons)
+    plan_notes = [f"gate_reason:{reason}" for reason in reasons]
+
+    if context_resolution is not None:
+        if context_resolution.resolved_document_ids:
+            plan_notes.append("preserve_document_scope")
+        if context_resolution.resolved_topic_hints:
+            plan_notes.append("preserve_topic_scope")
+
+    if query_classification is not None and query_classification.is_context_dependent:
+        plan_notes.append("context_dependent_query")
+
+    if any(token in root_question.lower() for token in (" not ", " except", " unless", " notwithstanding")):
+        plan_notes.append("preserve_negation_and_exceptions")
+
+    subqueries: list[SubQueryPlan]
+    if strategy == "comparison":
+        left, right = _extract_comparison_terms(root_question)
+        if left and right:
+            subqueries = [
+                SubQueryPlan(
+                    id="sq-1",
+                    question=f"Locate clauses about {left} within the same agreement scope as the root question.",
+                    purpose="Retrieve the first side of the comparison without synthesis.",
+                    required=True,
+                    expected_answer_type="cross_reference",
+                ),
+                SubQueryPlan(
+                    id="sq-2",
+                    question=f"Locate clauses about {right} within the same agreement scope as the root question.",
+                    purpose="Retrieve the second side of the comparison without synthesis.",
+                    required=True,
+                    expected_answer_type="cross_reference",
+                ),
+            ]
+        else:
+            subqueries = [
+                SubQueryPlan(
+                    id="sq-1",
+                    question=f"Locate the clause segments needed to compare the requested items in: {root_question}",
+                    purpose="Collect comparison evidence only.",
+                    required=True,
+                    expected_answer_type="comparison",
+                )
+            ]
+    elif strategy == "amendment_vs_base":
+        subqueries = [
+            SubQueryPlan(
+                id="sq-1",
+                question=f"Locate the base-agreement clause(s) relevant to: {root_question}",
+                purpose="Retrieve baseline clause text before amendment impact analysis.",
+                required=True,
+                expected_answer_type="cross_reference",
+            ),
+            SubQueryPlan(
+                id="sq-2",
+                question=f"Locate the amendment clause(s) relevant to: {root_question}",
+                purpose="Retrieve amendment text scoped to the same issue.",
+                required=True,
+                expected_answer_type="cross_reference",
+            ),
+        ]
+    elif strategy == "exception_chain":
+        subqueries = [
+            SubQueryPlan(
+                id="sq-1",
+                question=f"Locate the primary rule clause implicated by: {root_question}",
+                purpose="Find base obligation/condition text for exception tracing.",
+                required=True,
+                expected_answer_type="obligation",
+            ),
+            SubQueryPlan(
+                id="sq-2",
+                question=f"Locate exception or carve-out language (for example 'unless', 'except', 'notwithstanding') tied to: {root_question}",
+                purpose="Find exception chain text without concluding outcomes.",
+                required=True,
+                expected_answer_type="exception",
+                dependency_ids=["sq-1"],
+            ),
+        ]
+    else:
+        subqueries = [
+            SubQueryPlan(
+                id="sq-1",
+                question=f"Locate clause text needed to resolve: {root_question}",
+                purpose="Collect retrieval evidence only; no answer generation.",
+                required=True,
+                expected_answer_type="cross_reference",
+            )
+        ]
+
+    return DecompositionPlan(
+        should_decompose=True,
+        root_question=root_question,
+        strategy=strategy,
+        subqueries=subqueries,
+        planner_notes=plan_notes,
+    )
+
+
 class RetrievalGraphNodes:
     """Explicit node implementations for a deterministic retrieval workflow graph."""
 
@@ -455,6 +614,24 @@ class RetrievalGraphNodes:
             "node_exit name=classify_decomposition_need needs_decomposition=%s reasons=%s",
             needs_decomposition,
             ",".join(reasons),
+        )
+        return cast(RetrievalStageState, updated)
+
+    def maybe_build_decomposition_plan(self, state: RetrievalStageState) -> RetrievalStageState:
+        logger.info("node_enter name=maybe_build_decomposition_plan")
+        updated = dict(state)
+        plan = build_decomposition_plan(
+            query=str(updated.get("resolved_query") or updated.get("original_query") or ""),
+            needs_decomposition=bool(updated.get("needs_decomposition")),
+            reasons=list(updated.get("decomposition_gate_reasons") or []),
+            query_classification=updated.get("query_classification"),
+            context_resolution=updated.get("context_resolution"),
+        )
+        updated["decomposition_plan"] = plan
+        logger.info(
+            "node_exit name=maybe_build_decomposition_plan plan_created=%s subquery_count=%s",
+            plan is not None,
+            len(plan.subqueries) if plan is not None else 0,
         )
         return cast(RetrievalStageState, updated)
 
@@ -656,6 +833,7 @@ class _FallbackCompiledGraph:
         current = self._nodes.classify_query_state(current)
         current = self._nodes.resolve_query_context(current)
         current = self._nodes.classify_decomposition_need(current)
+        current = self._nodes.maybe_build_decomposition_plan(current)
         current = self._nodes.rewrite_query_if_needed(current)
         current = self._nodes.extract_entities_if_needed(current)
         current = self._nodes.run_hybrid_search(current)
@@ -688,6 +866,7 @@ def build_retrieval_graph(
     graph.add_node("classify_query_state", nodes.classify_query_state)
     graph.add_node("resolve_query_context", nodes.resolve_query_context)
     graph.add_node("classify_decomposition_need", nodes.classify_decomposition_need)
+    graph.add_node("maybe_build_decomposition_plan", nodes.maybe_build_decomposition_plan)
     graph.add_node("rewrite_query_if_needed", nodes.rewrite_query_if_needed)
     graph.add_node("extract_entities_if_needed", nodes.extract_entities_if_needed)
     graph.add_node("run_hybrid_search", nodes.run_hybrid_search)
@@ -702,7 +881,8 @@ def build_retrieval_graph(
     graph.add_edge("ingest_turn", "classify_query_state")
     graph.add_edge("classify_query_state", "resolve_query_context")
     graph.add_edge("resolve_query_context", "classify_decomposition_need")
-    graph.add_edge("classify_decomposition_need", "rewrite_query_if_needed")
+    graph.add_edge("classify_decomposition_need", "maybe_build_decomposition_plan")
+    graph.add_edge("maybe_build_decomposition_plan", "rewrite_query_if_needed")
     graph.add_edge("rewrite_query_if_needed", "extract_entities_if_needed")
     graph.add_edge("extract_entities_if_needed", "run_hybrid_search")
     graph.add_edge("run_hybrid_search", "rerank_results")
