@@ -436,6 +436,105 @@ def build_decomposition_plan(
     )
 
 
+_DECOMPOSITION_MAX_SUBQUERIES = 4
+_VAGUE_SUBQUERY_PATTERNS = (
+    "anything relevant",
+    "everything about",
+    "general overview",
+    "overall summary",
+    "all clauses",
+    "what does it say",
+    "tell me more",
+)
+_ROOT_SCOPE_MARKERS = (
+    "agreement",
+    "contract",
+    "msa",
+    "nda",
+    "lease",
+    "amendment",
+    "clause",
+    "section",
+    "article",
+    "governing law",
+    "jurisdiction",
+)
+_NEGATION_MARKERS = (
+    " not ",
+    " except",
+    " unless",
+    " notwithstanding",
+    " other than",
+)
+
+
+def _normalize_text(value: str) -> str:
+    return " ".join((value or "").strip().split())
+
+
+def _canonical_text(value: str) -> str:
+    normalized = _normalize_text(value).lower()
+    normalized = re.sub(r"[^a-z0-9\s]+", " ", normalized)
+    return " ".join(normalized.split())
+
+
+def _extract_root_entities(root_question: str) -> list[str]:
+    # Capture simple title-cased entity phrases (for example: "Acme Corp").
+    matches = re.findall(r"\b([A-Z][a-z0-9]+(?:\s+[A-Z][a-z0-9]+)+)\b", root_question)
+    entities = sorted({_canonical_text(match) for match in matches if match.strip()})
+    return [entity for entity in entities if entity]
+
+
+def validate_decomposition_plan(plan: DecompositionPlan) -> list[str]:
+    """Deterministic conservative checks to keep broken plans out of retrieval."""
+
+    errors: list[str] = []
+    subqueries = list(plan.subqueries)
+    canonical_subqueries = [_canonical_text(subquery.question) for subquery in subqueries]
+
+    if len(subqueries) > _DECOMPOSITION_MAX_SUBQUERIES:
+        errors.append(f"too_many_subqueries:max_{_DECOMPOSITION_MAX_SUBQUERIES}")
+
+    non_empty_questions = [question for question in canonical_subqueries if question]
+    if len(non_empty_questions) != len(set(non_empty_questions)):
+        errors.append("duplicate_subqueries")
+
+    root_question = _normalize_text(plan.root_question)
+    root_canonical = f" {_canonical_text(root_question)} "
+    joined_subqueries = " ".join(canonical_subqueries)
+    joined_subqueries_padded = f" {joined_subqueries} "
+
+    dropped_entities: list[str] = []
+    for entity in _extract_root_entities(root_question):
+        if entity not in joined_subqueries:
+            dropped_entities.append(entity)
+
+    dropped_scopes: list[str] = []
+    for marker in _ROOT_SCOPE_MARKERS:
+        marker_canonical = _canonical_text(marker)
+        if marker_canonical and marker_canonical in root_canonical and marker_canonical not in joined_subqueries_padded:
+            dropped_scopes.append(marker_canonical)
+
+    if dropped_entities or dropped_scopes:
+        scope_parts = [f"entity={value}" for value in dropped_entities] + [f"scope={value}" for value in dropped_scopes]
+        errors.append("dropped_key_entity_or_scope:" + ",".join(scope_parts))
+
+    root_has_negation = any(marker in root_canonical for marker in _NEGATION_MARKERS)
+    subqueries_preserve_negation = any(marker in joined_subqueries_padded for marker in _NEGATION_MARKERS) or any(
+        token in joined_subqueries for token in ("exception", "carve out", "carveout", "negation", "unless", "except")
+    )
+    if root_has_negation and not subqueries_preserve_negation:
+        errors.append("lost_negation_or_exception_logic")
+
+    for subquery in subqueries:
+        question = _canonical_text(subquery.question)
+        word_count = len(question.split())
+        if word_count < 5 or any(pattern in question for pattern in _VAGUE_SUBQUERY_PATTERNS):
+            errors.append(f"vague_or_overly_broad_subquery:{subquery.id}")
+
+    return errors
+
+
 class RetrievalGraphNodes:
     """Explicit node implementations for a deterministic retrieval workflow graph."""
 
@@ -633,6 +732,30 @@ class RetrievalGraphNodes:
             plan is not None,
             len(plan.subqueries) if plan is not None else 0,
         )
+        return cast(RetrievalStageState, updated)
+
+    def validate_decomposition_plan(self, state: RetrievalStageState) -> RetrievalStageState:
+        """Validate typed decomposition plans and clear invalid plans conservatively."""
+
+        logger.info("node_enter name=validate_decomposition_plan")
+        updated = dict(state)
+        plan = updated.get("decomposition_plan")
+        if plan is None:
+            updated["decomposition_validation_errors"] = []
+            logger.info("node_exit name=validate_decomposition_plan skipped=true")
+            return cast(RetrievalStageState, updated)
+
+        errors = validate_decomposition_plan(plan)
+        updated["decomposition_validation_errors"] = list(errors)
+        if errors:
+            updated["decomposition_plan"] = None
+            logger.info(
+                "node_exit name=validate_decomposition_plan valid=false error_count=%s",
+                len(errors),
+            )
+            return cast(RetrievalStageState, updated)
+
+        logger.info("node_exit name=validate_decomposition_plan valid=true")
         return cast(RetrievalStageState, updated)
 
     def rewrite_query_if_needed(self, state: RetrievalStageState) -> RetrievalStageState:
@@ -834,6 +957,7 @@ class _FallbackCompiledGraph:
         current = self._nodes.resolve_query_context(current)
         current = self._nodes.classify_decomposition_need(current)
         current = self._nodes.maybe_build_decomposition_plan(current)
+        current = self._nodes.validate_decomposition_plan(current)
         current = self._nodes.rewrite_query_if_needed(current)
         current = self._nodes.extract_entities_if_needed(current)
         current = self._nodes.run_hybrid_search(current)
@@ -867,6 +991,7 @@ def build_retrieval_graph(
     graph.add_node("resolve_query_context", nodes.resolve_query_context)
     graph.add_node("classify_decomposition_need", nodes.classify_decomposition_need)
     graph.add_node("maybe_build_decomposition_plan", nodes.maybe_build_decomposition_plan)
+    graph.add_node("validate_decomposition_plan", nodes.validate_decomposition_plan)
     graph.add_node("rewrite_query_if_needed", nodes.rewrite_query_if_needed)
     graph.add_node("extract_entities_if_needed", nodes.extract_entities_if_needed)
     graph.add_node("run_hybrid_search", nodes.run_hybrid_search)
@@ -882,7 +1007,8 @@ def build_retrieval_graph(
     graph.add_edge("classify_query_state", "resolve_query_context")
     graph.add_edge("resolve_query_context", "classify_decomposition_need")
     graph.add_edge("classify_decomposition_need", "maybe_build_decomposition_plan")
-    graph.add_edge("maybe_build_decomposition_plan", "rewrite_query_if_needed")
+    graph.add_edge("maybe_build_decomposition_plan", "validate_decomposition_plan")
+    graph.add_edge("validate_decomposition_plan", "rewrite_query_if_needed")
     graph.add_edge("rewrite_query_if_needed", "extract_entities_if_needed")
     graph.add_edge("extract_entities_if_needed", "run_hybrid_search")
     graph.add_edge("run_hybrid_search", "rerank_results")
