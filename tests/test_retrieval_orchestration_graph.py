@@ -9,6 +9,7 @@ from agentic_rag.orchestration.retrieval_graph import (
     QueryRoutingDecision,
     RetrievalDependencies,
     RetrievalGraphConfig,
+    SubQueryPlan,
     classify_decomposition_need,
     build_retrieval_graph,
     default_retrieval_state,
@@ -374,6 +375,110 @@ def test_fallback_graph_normalizes_none_decomposition_validation_errors(monkeypa
 
     assert result["decomposition_plan"] is None
     assert result["decomposition_validation_errors"] == []
+    assert result["retrieval_stage_complete"] is True
+
+
+def test_fallback_graph_skips_planner_and_validator_when_gate_is_false(monkeypatch) -> None:
+    import agentic_rag.orchestration.retrieval_graph as retrieval_graph_module
+
+    planner_calls: list[str] = []
+    validator_calls: list[str] = []
+
+    monkeypatch.setattr(retrieval_graph_module, "StateGraph", None)
+    original_planner = retrieval_graph_module.RetrievalGraphNodes.maybe_build_decomposition_plan
+    original_validator = retrieval_graph_module.RetrievalGraphNodes.validate_decomposition_plan
+
+    def wrapped_planner(self, state):
+        planner_calls.append("planner")
+        return original_planner(self, state)
+
+    def wrapped_validator(self, state):
+        validator_calls.append("validator")
+        return original_validator(self, state)
+
+    monkeypatch.setattr(retrieval_graph_module.RetrievalGraphNodes, "maybe_build_decomposition_plan", wrapped_planner)
+    monkeypatch.setattr(retrieval_graph_module.RetrievalGraphNodes, "validate_decomposition_plan", wrapped_validator)
+
+    services = FakeServices(
+        classifier=_decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False),
+    )
+    app = build_retrieval_graph(dependencies=services.as_dependencies())
+    result = app.invoke(default_retrieval_state(query="What is governing law?"))
+
+    assert result["needs_decomposition"] is False
+    assert planner_calls == []
+    assert validator_calls == []
+    assert result["decomposition_plan"] is None
+
+
+def test_fallback_graph_runs_planner_then_validator_when_gate_is_true(monkeypatch) -> None:
+    import agentic_rag.orchestration.retrieval_graph as retrieval_graph_module
+
+    call_order: list[str] = []
+
+    monkeypatch.setattr(retrieval_graph_module, "StateGraph", None)
+    original_planner = retrieval_graph_module.RetrievalGraphNodes.maybe_build_decomposition_plan
+    original_validator = retrieval_graph_module.RetrievalGraphNodes.validate_decomposition_plan
+
+    def wrapped_planner(self, state):
+        call_order.append("planner")
+        return original_planner(self, state)
+
+    def wrapped_validator(self, state):
+        call_order.append("validator")
+        return original_validator(self, state)
+
+    monkeypatch.setattr(retrieval_graph_module.RetrievalGraphNodes, "maybe_build_decomposition_plan", wrapped_planner)
+    monkeypatch.setattr(retrieval_graph_module.RetrievalGraphNodes, "validate_decomposition_plan", wrapped_validator)
+
+    services = FakeServices(
+        classifier=_decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False),
+    )
+    app = build_retrieval_graph(dependencies=services.as_dependencies())
+    result = app.invoke(default_retrieval_state(query="Compare governing law and dispute resolution clauses."))
+
+    assert result["needs_decomposition"] is True
+    assert call_order == ["planner", "validator"]
+    assert result["decomposition_plan"] is not None
+    assert result["decomposition_validation_errors"] == []
+
+
+def test_fallback_graph_validation_failure_clears_plan_and_preserves_safe_retrieval(monkeypatch) -> None:
+    import agentic_rag.orchestration.retrieval_graph as retrieval_graph_module
+
+    monkeypatch.setattr(retrieval_graph_module, "StateGraph", None)
+
+    def _forced_plan(**_: Any) -> DecompositionPlan:
+        return DecompositionPlan(
+            should_decompose=True,
+            root_question="Compare governing law and dispute resolution clauses.",
+            strategy="comparison",
+            subqueries=[
+                SubQueryPlan(
+                    id="sq-1",
+                    question="anything relevant",
+                    purpose="bad",
+                    required=True,
+                    expected_answer_type="comparison",
+                )
+            ],
+        )
+
+    monkeypatch.setattr(retrieval_graph_module, "build_decomposition_plan", _forced_plan)
+
+    services = FakeServices(
+        classifier=_decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False),
+        hybrid_results=[_hybrid("c1", "p1")],
+        reranked_results=[_reranked("c1", "p1")],
+        parent_results=[_parent("p1")],
+    )
+    app = build_retrieval_graph(dependencies=services.as_dependencies())
+    result = app.invoke(default_retrieval_state(query="Compare governing law and dispute resolution clauses."))
+
+    assert result["needs_decomposition"] is True
+    assert result["decomposition_plan"] is None
+    assert any(error.startswith("vague_or_overly_broad_subquery") for error in result["decomposition_validation_errors"])
+    assert services.hybrid_calls[0]["query"] == result["effective_query"]
     assert result["retrieval_stage_complete"] is True
 
 
