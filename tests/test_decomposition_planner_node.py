@@ -165,6 +165,26 @@ def test_maybe_build_decomposition_plan_output_is_structurally_typed_and_bounded
     assert [subquery.id for subquery in plan.subqueries] == ["sq-1", "sq-2"]
 
 
+def test_maybe_build_decomposition_plan_creates_valid_plan_for_cross_clause_query() -> None:
+    nodes = _nodes()
+    query = "How do the indemnity obligations interact with the limitation-of-liability clause?"
+    state = default_retrieval_state(query=query)
+    state["query_classification"] = _decision()
+    state["resolved_query"] = query
+    state["needs_decomposition"] = True
+    state["decomposition_gate_reasons"] = ["cross_clause_obligation_condition"]
+
+    updated = nodes.maybe_build_decomposition_plan(state)
+    plan = updated["decomposition_plan"]
+
+    assert isinstance(plan, DecompositionPlan)
+    assert plan is not None
+    assert plan.should_decompose is True
+    assert plan.strategy == "cross_clause"
+    assert len(plan.subqueries) == 1
+    assert isinstance(plan.subqueries[0], SubQueryPlan)
+
+
 def test_maybe_build_decomposition_plan_preserves_scope_dates_and_negation_markers() -> None:
     nodes = _nodes()
     query = "In the MSA dated January 1, 2024, what obligations apply unless terminated for cause?"

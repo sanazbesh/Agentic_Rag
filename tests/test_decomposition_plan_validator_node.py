@@ -314,3 +314,30 @@ def test_validate_decomposition_plan_invalid_plan_clears_plan_and_records_errors
         "dropped_key_entity_or_scope:entity=acme corp",
         "lost_negation_or_exception_logic",
     ]
+
+
+def test_validate_decomposition_plan_rejects_malformed_semantic_plan() -> None:
+    nodes = _nodes()
+    state = default_retrieval_state(query="q")
+    state["decomposition_plan"] = DecompositionPlan(
+        should_decompose=True,
+        root_question="Compare indemnity and limitation of liability obligations in the agreement.",
+        strategy="comparison",
+        subqueries=[
+            SubQueryPlan(
+                id="sq-1",
+                question="General overview.",
+                purpose="p",
+                required=True,
+                expected_answer_type="comparison",
+            )
+        ],
+    )
+
+    updated = nodes.validate_decomposition_plan(state)
+
+    assert updated["decomposition_plan"] is None
+    assert updated["decomposition_validation_errors"] == [
+        "dropped_key_entity_or_scope:scope=agreement",
+        "vague_or_overly_broad_subquery:sq-1",
+    ]

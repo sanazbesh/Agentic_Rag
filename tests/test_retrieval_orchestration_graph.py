@@ -478,7 +478,10 @@ def test_fallback_graph_validation_failure_clears_plan_and_preserves_safe_retrie
     assert result["needs_decomposition"] is True
     assert result["decomposition_plan"] is None
     assert any(error.startswith("vague_or_overly_broad_subquery") for error in result["decomposition_validation_errors"])
+    assert result["effective_query"] == result["original_query"]
+    assert len(services.hybrid_calls) == 1
     assert services.hybrid_calls[0]["query"] == result["effective_query"]
+    assert result["parent_ids"] == ["p1"]
     assert result["retrieval_stage_complete"] is True
 
 
@@ -722,6 +725,29 @@ def test_fallback_graph_continues_existing_retrieval_flow_after_gate(monkeypatch
 
     assert state["needs_decomposition"] is True
     assert services.hybrid_calls[0]["query"] == state["effective_query"]
+    assert state["parent_ids"] == ["p1"]
+    assert state["retrieval_stage_complete"] is True
+
+
+def test_non_decomposition_simple_clause_lookup_stays_stable(monkeypatch) -> None:
+    import agentic_rag.orchestration.retrieval_graph as retrieval_graph_module
+
+    monkeypatch.setattr(retrieval_graph_module, "StateGraph", None)
+    services = FakeServices(
+        classifier=_decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False),
+        hybrid_results=[_hybrid("c1", "p1", text="confidentiality clause text")],
+        reranked_results=[_reranked("c1", "p1")],
+        parent_results=[_parent("p1", text="Confidentiality survives termination.")],
+    )
+    app = build_retrieval_graph(dependencies=services.as_dependencies())
+    state = app.invoke(default_retrieval_state(query="What is the confidentiality clause?"))
+
+    assert state["needs_decomposition"] is False
+    assert state["decomposition_plan"] is None
+    assert state["decomposition_validation_errors"] == []
+    assert state["effective_query"] == state["original_query"]
+    assert len(services.hybrid_calls) == 1
+    assert services.hybrid_calls[0]["query"] == state["original_query"]
     assert state["parent_ids"] == ["p1"]
     assert state["retrieval_stage_complete"] is True
 
