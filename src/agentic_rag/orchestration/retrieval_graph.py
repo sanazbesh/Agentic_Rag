@@ -108,6 +108,7 @@ class RetrievalStageState(TypedDict):
     context_resolution: QueryContextResolution | None
     needs_decomposition: bool
     decomposition_plan: DecompositionPlan | None
+    decomposition_validation_errors: list[str]
     decomposition_gate_reasons: list[str]
 
     extracted_entities: LegalEntityExtractionResult | None
@@ -194,6 +195,7 @@ def default_retrieval_state(
         context_resolution=None,
         needs_decomposition=False,
         decomposition_plan=None,
+        decomposition_validation_errors=[],
         decomposition_gate_reasons=[],
         extracted_entities=None,
         filters=None,
@@ -291,6 +293,8 @@ class RetrievalGraphNodes:
         updated["parent_ids"] = list(updated.get("parent_ids", []))
         updated["parent_chunks"] = list(updated.get("parent_chunks", []))
         updated["compressed_context"] = list(updated.get("compressed_context", []))
+        updated["decomposition_validation_errors"] = list(updated.get("decomposition_validation_errors", []) or [])
+        updated["decomposition_plan"] = updated.get("decomposition_plan")
         self._hydrate_prior_turn_memory(updated)
         logger.info("node_exit name=ingest_turn query_length=%s", len(updated["original_query"]))
         return cast(RetrievalStageState, updated)
