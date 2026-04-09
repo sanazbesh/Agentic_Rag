@@ -940,6 +940,16 @@ DecisionLiteral = Literal[
 ]
 
 
+DecompositionRoutingDecision = Literal[
+    "maybe_build_decomposition_plan",
+    "rewrite_query_if_needed",
+]
+
+
+def _route_after_decomposition_gate(state: RetrievalStageState) -> DecompositionRoutingDecision:
+    return "maybe_build_decomposition_plan" if state["needs_decomposition"] else "rewrite_query_if_needed"
+
+
 def _route_after_compression_check(state: RetrievalStageState) -> DecisionLiteral:
     return "compress_context_node" if state["should_compress"] else "mark_complete_without_compression"
 
@@ -956,8 +966,13 @@ class _FallbackCompiledGraph:
         current = self._nodes.classify_query_state(current)
         current = self._nodes.resolve_query_context(current)
         current = self._nodes.classify_decomposition_need(current)
-        current = self._nodes.maybe_build_decomposition_plan(current)
-        current = self._nodes.validate_decomposition_plan(current)
+        if _route_after_decomposition_gate(current) == "maybe_build_decomposition_plan":
+            current = self._nodes.maybe_build_decomposition_plan(current)
+            current = self._nodes.validate_decomposition_plan(current)
+        else:
+            current = dict(current)
+            current["decomposition_plan"] = None
+            current["decomposition_validation_errors"] = []
         current = self._nodes.rewrite_query_if_needed(current)
         current = self._nodes.extract_entities_if_needed(current)
         current = self._nodes.run_hybrid_search(current)
@@ -1006,7 +1021,14 @@ def build_retrieval_graph(
     graph.add_edge("ingest_turn", "classify_query_state")
     graph.add_edge("classify_query_state", "resolve_query_context")
     graph.add_edge("resolve_query_context", "classify_decomposition_need")
-    graph.add_edge("classify_decomposition_need", "maybe_build_decomposition_plan")
+    graph.add_conditional_edges(
+        "classify_decomposition_need",
+        _route_after_decomposition_gate,
+        {
+            "maybe_build_decomposition_plan": "maybe_build_decomposition_plan",
+            "rewrite_query_if_needed": "rewrite_query_if_needed",
+        },
+    )
     graph.add_edge("maybe_build_decomposition_plan", "validate_decomposition_plan")
     graph.add_edge("validate_decomposition_plan", "rewrite_query_if_needed")
     graph.add_edge("rewrite_query_if_needed", "extract_entities_if_needed")
