@@ -344,6 +344,7 @@ def test_default_retrieval_state_has_safe_decomposition_wiring_defaults() -> Non
     assert state["subquery_results"] == {}
     assert state["root_merged_candidates"] == []
     assert state["subquery_merged_candidates"] == {}
+    assert state["merged_candidates"] == []
 
 
 def test_fallback_graph_clears_preexisting_decomposition_plan_when_gate_is_false(monkeypatch) -> None:
@@ -548,6 +549,7 @@ def test_valid_decomposition_plan_triggers_subquery_retrieval_and_preserves_root
     assert state["subquery_merged_candidates"]["sq-1"][0].hit.metadata["source"] == "test-source"
     assert state["subquery_merged_candidates"]["sq-1"][0].hit.metadata["heading"] == "Governing Law"
     assert state["subquery_merged_candidates"]["sq-1"][0].hit.metadata["page"] == 3
+    assert [candidate.hit.child_chunk_id for candidate in state["merged_candidates"]] == ["root-c1", "sq1-c1", "sq2-c1"]
     assert services.hybrid_calls[0]["query"] == subquery_1
     assert services.hybrid_calls[1]["query"] == subquery_2
     assert services.hybrid_calls[-1]["query"] == state["effective_query"]
@@ -566,6 +568,7 @@ def test_no_decomposition_plan_skips_subquery_retrieval() -> None:
     assert state["decomposition_plan"] is None
     assert state["subquery_results"] == {}
     assert state["subquery_merged_candidates"] == {}
+    assert state["merged_candidates"] == []
     assert len(services.hybrid_calls) == 1
     assert services.hybrid_calls[-1]["query"] == state["effective_query"]
 
@@ -606,6 +609,7 @@ def test_invalid_decomposition_plan_skips_subquery_retrieval(monkeypatch) -> Non
     assert state["decomposition_plan"] is None
     assert state["subquery_results"] == {}
     assert state["subquery_merged_candidates"] == {}
+    assert state["merged_candidates"] == []
     assert len(services.hybrid_calls) == 1
     assert services.hybrid_calls[-1]["query"] == state["effective_query"]
 
@@ -683,6 +687,85 @@ def test_subquery_hit_can_be_represented_as_merged_candidate_shape() -> None:
     assert candidate.provenance.subquery_ids == ["sq-1"]
 
 
+def test_merge_pool_represents_root_only_hits_for_decomposed_path() -> None:
+    query = "Compare governing law versus dispute resolution."
+    services = FakeServices(
+        classifier=_decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False),
+        hybrid_results=[_hybrid("root-c1", "root-p1")],
+        hybrid_results_by_query={
+            "Locate clauses about governing law within the same agreement scope as the root question.": [],
+            "Locate clauses about dispute resolution within the same agreement scope as the root question.": [],
+        },
+        reranked_results=[_reranked("root-c1", "root-p1")],
+        parent_results=[_parent("root-p1")],
+    )
+    state = run_retrieval_stage(query=query, dependencies=services.as_dependencies())
+
+    assert [item.hit.child_chunk_id for item in state["merged_candidates"]] == ["root-c1"]
+    assert state["merged_candidates"][0].provenance.from_root_query is True
+    assert state["merged_candidates"][0].provenance.subquery_ids == []
+
+
+def test_merge_pool_dedupes_child_seen_in_root_and_subqueries_and_accumulates_provenance() -> None:
+    query = "Compare governing law versus dispute resolution."
+    subquery_1 = "Locate clauses about governing law within the same agreement scope as the root question."
+    subquery_2 = "Locate clauses about dispute resolution within the same agreement scope as the root question."
+    services = FakeServices(
+        classifier=_decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False),
+        hybrid_results=[
+            HybridSearchResult(
+                child_chunk_id="shared-c1",
+                parent_chunk_id="root-p1",
+                document_id="doc-1",
+                text="root shared text",
+                hybrid_score=0.9,
+                dense_score=0.7,
+                metadata={"source": "root-source"},
+            )
+        ],
+        hybrid_results_by_query={
+            subquery_1: [
+                HybridSearchResult(
+                    child_chunk_id="shared-c1",
+                    parent_chunk_id="sq-p1",
+                    document_id="doc-1",
+                    text="subquery one text",
+                    hybrid_score=0.8,
+                    sparse_score=0.61,
+                    metadata={"heading": "Governing Law", "page": 2},
+                )
+            ],
+            subquery_2: [
+                HybridSearchResult(
+                    child_chunk_id="shared-c1",
+                    parent_chunk_id="sq-p2",
+                    document_id="doc-1",
+                    text="subquery two text",
+                    hybrid_score=0.77,
+                    sparse_score=0.59,
+                    metadata={"page": 5},
+                )
+            ],
+        },
+        reranked_results=[_reranked("shared-c1", "root-p1")],
+        parent_results=[_parent("root-p1")],
+    )
+    state = run_retrieval_stage(query=query, dependencies=services.as_dependencies())
+
+    assert [item.hit.child_chunk_id for item in state["merged_candidates"]] == ["shared-c1"]
+    merged = state["merged_candidates"][0]
+    assert merged.hit.parent_chunk_id == "root-p1"
+    assert merged.provenance.from_root_query is True
+    assert merged.provenance.subquery_ids == ["sq-1", "sq-2"]
+    assert merged.hit.metadata["source"] == "root-source"
+    assert merged.hit.metadata["heading"] == "Governing Law"
+    assert merged.hit.metadata["page"] == 2
+    assert merged.hit.hybrid_score == 0.9
+    assert merged.hit.dense_score == 0.7
+    assert merged.hit.sparse_score == 0.61
+    assert [item.hybrid_score for item in merged.contributing_hits] == [0.9, 0.8, 0.77]
+
+
 def test_merged_candidate_representation_does_not_change_active_retrieval_path() -> None:
     services = FakeServices(
         classifier=_decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False),
@@ -695,6 +778,7 @@ def test_merged_candidate_representation_does_not_change_active_retrieval_path()
     assert [item.child_chunk_id for item in state["child_results"]] == ["c1", "c2"]
     assert [item.child_chunk_id for item in state["reranked_child_results"]] == ["c2", "c1"]
     assert [item.hit.parent_chunk_id for item in state["root_merged_candidates"]] == ["p1", "p2"]
+    assert state["merged_candidates"] == []
 
 
 def test_fallback_graph_runs_subquery_retrieval_when_plan_is_valid(monkeypatch) -> None:
