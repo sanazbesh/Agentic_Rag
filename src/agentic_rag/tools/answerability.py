@@ -316,6 +316,7 @@ class AnswerabilityAssessor:
                 query=original_query,
                 query_understanding=query_understanding,
                 substantive=substantive,
+                require_label_anchor=True,
             )
             logger.debug(
                 "evaluate_coverage_definition branch=substantive has_definitional_support=%s has_operational_clause_support=%s substantive_items=%s",
@@ -881,6 +882,7 @@ class AnswerabilityAssessor:
         query: str,
         query_understanding: QueryUnderstandingResult,
         substantive: Sequence[Mapping[str, str]],
+        require_label_anchor: bool = False,
     ) -> bool:
         targets = set(self._definition_targets(query))
         hint_candidates = {
@@ -904,6 +906,8 @@ class AnswerabilityAssessor:
                 return True
             if any(self._matches_leading_clause_label(text, candidate) for candidate in candidates):
                 return True
+            if require_label_anchor:
+                continue
             if any(self._matches_clause_topic_in_body(text, candidate) for candidate in candidates):
                 return True
         return False
