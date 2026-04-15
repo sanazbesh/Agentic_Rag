@@ -443,7 +443,11 @@ class AnswerStageNodes:
             "Direct answer: The retrieved context does not contain enough information to answer the question fully."
         )
         if isinstance(assessment, AnswerabilityAssessment):
-            if assessment.insufficiency_reason in {"definition_not_supported", "only_title_or_heading_match"}:
+            is_definition_intent = str(assessment.answerability_expectation) == "definition_required"
+            if is_definition_intent and assessment.insufficiency_reason in {
+                "definition_not_supported",
+                "only_title_or_heading_match",
+            }:
                 asked_term = _extract_definition_subject(assessment.original_query)
                 title_or_label_only = assessment.insufficiency_reason == "only_title_or_heading_match" or any(
                     note == "weakness_signal:title_only_signal_without_body" for note in assessment.evidence_notes
