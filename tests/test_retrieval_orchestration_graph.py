@@ -28,6 +28,7 @@ class FakeServices:
     hybrid_results: list[HybridSearchResult] = field(default_factory=list)
     hybrid_results_by_query: dict[str, list[HybridSearchResult]] = field(default_factory=dict)
     reranked_results: list[RerankedChunkResult] = field(default_factory=list)
+    rerank_passthrough_when_empty: bool = False
     parent_results: list[ParentChunkResult] = field(default_factory=list)
     compressed_items: list[CompressedParentChunk] = field(default_factory=list)
 
@@ -39,6 +40,7 @@ class FakeServices:
     rewrite_calls: list[dict[str, Any]] = field(default_factory=list)
     extract_calls: list[str] = field(default_factory=list)
     hybrid_calls: list[dict[str, Any]] = field(default_factory=list)
+    rerank_calls: list[dict[str, Any]] = field(default_factory=list)
 
     def as_dependencies(self) -> RetrievalDependencies:
         return RetrievalDependencies(
@@ -108,8 +110,22 @@ class FakeServices:
         return self.hybrid_results
 
     def rerank_chunks(self, chunks: list[HybridSearchResult], query: str) -> list[RerankedChunkResult]:
+        self.rerank_calls.append({"query": query, "chunks": list(chunks)})
         if self.fail_rerank:
             raise RuntimeError("rerank failed")
+        if self.rerank_passthrough_when_empty and not self.reranked_results:
+            return [
+                RerankedChunkResult(
+                    child_chunk_id=item.child_chunk_id,
+                    parent_chunk_id=item.parent_chunk_id,
+                    document_id=item.document_id,
+                    text=item.text,
+                    rerank_score=item.hybrid_score,
+                    original_score=item.hybrid_score,
+                    payload=dict(item.payload),
+                )
+                for item in chunks
+            ]
         return self.reranked_results
 
     def retrieve_parent_chunks(self, parent_ids: list[str]) -> list[ParentChunkResult]:
@@ -764,6 +780,107 @@ def test_merge_pool_dedupes_child_seen_in_root_and_subqueries_and_accumulates_pr
     assert merged.hit.dense_score == 0.7
     assert merged.hit.sparse_score == 0.61
     assert [item.hybrid_score for item in merged.contributing_hits] == [0.9, 0.8, 0.77]
+
+
+def test_decomposed_mode_applies_one_global_rerank_over_merged_pool_with_root_anchor() -> None:
+    query = "Compare governing law versus dispute resolution."
+    subquery_1 = "Locate clauses about governing law within the same agreement scope as the root question."
+    subquery_2 = "Locate clauses about dispute resolution within the same agreement scope as the root question."
+    services = FakeServices(
+        classifier=_decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False),
+        hybrid_results=[
+            HybridSearchResult(
+                child_chunk_id="root-c1",
+                parent_chunk_id="root-p1",
+                document_id="doc-1",
+                text="root text",
+                hybrid_score=0.91,
+                metadata={"source": "root-source", "heading": "Root Heading", "page": 1},
+            )
+        ],
+        hybrid_results_by_query={
+            subquery_1: [
+                HybridSearchResult(
+                    child_chunk_id="sq1-c1",
+                    parent_chunk_id="sq1-p1",
+                    document_id="doc-1",
+                    text="governing law text",
+                    hybrid_score=0.81,
+                    metadata={"source": "sq-source", "heading": "Governing Law", "page": 3},
+                )
+            ],
+            subquery_2: [
+                HybridSearchResult(
+                    child_chunk_id="sq2-c1",
+                    parent_chunk_id="sq2-p1",
+                    document_id="doc-1",
+                    text="dispute resolution text",
+                    hybrid_score=0.79,
+                    metadata={"source": "sq-source", "heading": "Dispute Resolution", "page": 5},
+                )
+            ],
+        },
+        rerank_passthrough_when_empty=True,
+        parent_results=[_parent("root-p1"), _parent("sq1-p1"), _parent("sq2-p1")],
+    )
+    state = run_retrieval_stage(query=query, dependencies=services.as_dependencies())
+
+    assert len(services.rerank_calls) == 1
+    assert services.rerank_calls[0]["query"] == state["original_query"]
+    assert [item.child_chunk_id for item in services.rerank_calls[0]["chunks"]] == ["root-c1", "sq1-c1", "sq2-c1"]
+    assert [item.child_chunk_id for item in state["reranked_child_results"]] == ["root-c1", "sq1-c1", "sq2-c1"]
+    assert state["parent_ids"] == ["root-p1", "sq1-p1", "sq2-p1"]
+    sq1_payload = state["reranked_child_results"][1].payload
+    assert sq1_payload["source"] == "sq-source"
+    assert sq1_payload["heading"] == "Governing Law"
+    assert sq1_payload["page"] == 3
+    assert sq1_payload["retrieval_provenance"] == {"from_root_query": False, "subquery_ids": ["sq-1"]}
+    assert sq1_payload["retrieval_scores"]["hybrid_score"] == 0.81
+
+
+def test_non_decomposition_rerank_behavior_unchanged_uses_effective_query_and_root_children() -> None:
+    services = FakeServices(
+        classifier=_decision(followup=False, ambiguous=True, use_context=False, rewrite=True, extract=False),
+        rewritten_query="Rewritten governing law question",
+        hybrid_results=[_hybrid("root-c1", "root-p1")],
+        rerank_passthrough_when_empty=True,
+        parent_results=[_parent("root-p1")],
+    )
+    state = run_retrieval_stage(query="What is governing law?", dependencies=services.as_dependencies())
+
+    assert state["decomposition_plan"] is None
+    assert len(services.rerank_calls) == 1
+    assert services.rerank_calls[0]["query"] == state["effective_query"]
+    assert [item.child_chunk_id for item in services.rerank_calls[0]["chunks"]] == ["root-c1"]
+    assert state["merged_candidates"] == []
+
+
+def test_fallback_executor_matches_global_rerank_behavior_for_decomposed_mode(monkeypatch) -> None:
+    import agentic_rag.orchestration.retrieval_graph as retrieval_graph_module
+
+    monkeypatch.setattr(retrieval_graph_module, "StateGraph", None)
+    services = FakeServices(
+        classifier=_decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False),
+        hybrid_results=[_hybrid("root-c1", "root-p1")],
+        hybrid_results_by_query={
+            "Locate clauses about governing law within the same agreement scope as the root question.": [
+                _hybrid("sq-c1", "sq-p1")
+            ],
+            "Locate clauses about dispute resolution within the same agreement scope as the root question.": [
+                _hybrid("sq-c2", "sq-p2")
+            ],
+        },
+        rerank_passthrough_when_empty=True,
+        parent_results=[_parent("root-p1"), _parent("sq-p1"), _parent("sq-p2")],
+    )
+
+    app = build_retrieval_graph(dependencies=services.as_dependencies())
+    state = app.invoke(default_retrieval_state(query="Compare governing law versus dispute resolution."))
+
+    assert len(services.rerank_calls) == 1
+    assert services.rerank_calls[0]["query"] == state["original_query"]
+    assert [item.child_chunk_id for item in services.rerank_calls[0]["chunks"]] == ["root-c1", "sq-c1", "sq-c2"]
+    assert state["parent_ids"] == ["root-p1", "sq-p1", "sq-p2"]
 
 
 def test_merged_candidate_representation_does_not_change_active_retrieval_path() -> None:

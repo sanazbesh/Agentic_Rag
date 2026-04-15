@@ -362,6 +362,51 @@ def _merge_root_and_subquery_candidates(
     return list(by_child_chunk_id.values())
 
 
+def _to_global_rerank_hit(candidate: MergedRetrievalCandidate) -> HybridSearchResult:
+    """Convert a merged candidate to a rerank input hit while preserving provenance."""
+
+    metadata = dict(candidate.hit.metadata)
+    metadata["retrieval_provenance"] = candidate.provenance.model_dump()
+    metadata["retrieval_scores"] = {
+        "hybrid_score": candidate.hit.hybrid_score,
+        "dense_score": candidate.hit.dense_score,
+        "sparse_score": candidate.hit.sparse_score,
+        "dense_rank": candidate.hit.dense_rank,
+        "sparse_rank": candidate.hit.sparse_rank,
+        "matched_in_dense": candidate.hit.matched_in_dense,
+        "matched_in_sparse": candidate.hit.matched_in_sparse,
+    }
+    metadata["contributing_retrieval_scores"] = [
+        {
+            "child_chunk_id": hit.child_chunk_id,
+            "parent_chunk_id": hit.parent_chunk_id,
+            "document_id": hit.document_id,
+            "hybrid_score": hit.hybrid_score,
+            "dense_score": hit.dense_score,
+            "sparse_score": hit.sparse_score,
+            "dense_rank": hit.dense_rank,
+            "sparse_rank": hit.sparse_rank,
+            "matched_in_dense": hit.matched_in_dense,
+            "matched_in_sparse": hit.matched_in_sparse,
+        }
+        for hit in candidate.contributing_hits
+    ]
+    return HybridSearchResult(
+        child_chunk_id=candidate.hit.child_chunk_id,
+        parent_chunk_id=candidate.hit.parent_chunk_id,
+        document_id=candidate.hit.document_id,
+        text=candidate.hit.text,
+        hybrid_score=candidate.hit.hybrid_score,
+        metadata=metadata,
+        dense_score=candidate.hit.dense_score,
+        sparse_score=candidate.hit.sparse_score,
+        dense_rank=candidate.hit.dense_rank,
+        sparse_rank=candidate.hit.sparse_rank,
+        matched_in_dense=candidate.hit.matched_in_dense,
+        matched_in_sparse=candidate.hit.matched_in_sparse,
+    )
+
+
 def _derive_filters(extraction: LegalEntityExtractionResult) -> dict[str, Any] | None:
     filters = extraction.filters
     payload: dict[str, Any] = {}
@@ -1044,12 +1089,25 @@ class RetrievalGraphNodes:
     def rerank_results(self, state: RetrievalStageState) -> RetrievalStageState:
         logger.info("node_enter name=rerank_results child_count=%s", len(state["child_results"]))
         updated = dict(state)
-        if not updated["child_results"]:
+        has_valid_decomposition = updated.get("decomposition_plan") is not None
+        has_merged_candidates = bool(updated.get("merged_candidates"))
+        use_global_merged_pool = has_valid_decomposition and has_merged_candidates
+
+        rerank_input: list[HybridSearchResult]
+        rerank_query: str
+        if use_global_merged_pool:
+            rerank_input = [_to_global_rerank_hit(candidate) for candidate in updated["merged_candidates"]]
+            rerank_query = str(updated.get("original_query") or "")
+        else:
+            rerank_input = list(updated["child_results"])
+            rerank_query = str(updated.get("effective_query") or "")
+
+        if not rerank_input:
             updated["reranked_child_results"] = []
             logger.info("node_exit name=rerank_results skipped=true")
             return cast(RetrievalStageState, updated)
         try:
-            reranked = self.dependencies.rerank_chunks(updated["child_results"], updated["effective_query"])
+            reranked = self.dependencies.rerank_chunks(rerank_input, rerank_query)
             if not reranked:
                 updated["warnings"] = [*updated["warnings"], "rerank_empty_fallback_to_child_results"]
                 fallback = [
@@ -1062,7 +1120,7 @@ class RetrievalGraphNodes:
                         original_score=item.hybrid_score,
                         payload=dict(item.payload),
                     )
-                    for item in updated["child_results"]
+                    for item in rerank_input
                 ]
                 updated["reranked_child_results"] = fallback
             else:
@@ -1079,7 +1137,7 @@ class RetrievalGraphNodes:
                     original_score=item.hybrid_score,
                     payload=dict(item.payload),
                 )
-                for item in updated["child_results"]
+                for item in rerank_input
             ]
         logger.info("node_exit name=rerank_results reranked_count=%s", len(updated["reranked_child_results"]))
         return cast(RetrievalStageState, updated)
