@@ -261,6 +261,68 @@ def test_definition_regression_title_and_clauses_without_definition_not_sufficie
     assert result.insufficiency_reason in {"definition_not_supported", "only_title_or_heading_match"}
 
 
+def test_definition_required_unrelated_substantive_with_term_phrase_is_not_sufficient_coverage() -> None:
+    query = "what is employment agreement?"
+    understanding = understand_query(query)
+    context = [
+        _parent(
+            "p1",
+            (
+                "Either party may terminate this employment agreement with thirty (30) days written notice. "
+                "The Company may also place the employee on garden leave during the notice period."
+            ),
+            heading="Termination",
+        )
+    ]
+
+    coverage = evaluate_coverage(query, understanding, context)
+
+    assert understanding.answerability_expectation == "definition_required"
+    assert coverage.sufficient_coverage is False
+    assert coverage.coverage_reason == "definition_not_supported"
+
+
+def test_definition_required_unrelated_substantive_with_term_phrase_is_not_sufficient_assessment() -> None:
+    query = "what is employment agreement?"
+    understanding = understand_query(query)
+    context = [
+        _parent(
+            "p1",
+            (
+                "Either party may terminate this employment agreement with thirty (30) days written notice. "
+                "The Company may also place the employee on garden leave during the notice period."
+            ),
+            heading="Termination",
+        )
+    ]
+
+    assessment = assess_answerability(query, understanding, context)
+
+    assert understanding.answerability_expectation == "definition_required"
+    assert assessment.sufficient_context is False
+    assert assessment.should_answer is False
+    assert assessment.insufficiency_reason == "definition_not_supported"
+
+
+def test_definition_required_operational_fallback_still_allows_label_anchored_clause_definition() -> None:
+    query = "what is termination without cause?"
+    understanding = understand_query(query)
+    context = [
+        _parent(
+            "p1",
+            "The Company may terminate Employee's employment without Cause by giving thirty (30) days written notice.",
+            heading="Termination Without Cause",
+        )
+    ]
+
+    coverage = evaluate_coverage(query, understanding, context)
+
+    assert understanding.answerability_expectation == "definition_required"
+    assert coverage.sufficient_coverage is True
+    assert coverage.coverage_status == "sufficient"
+    assert "operative_clause_language_detected" in coverage.supporting_signals
+
+
 def test_definition_title_only_is_not_sufficient() -> None:
     query = "what is employment agreement?"
     understanding = understand_query(query)
