@@ -25,6 +25,7 @@ class FakeServices:
     classifier: QueryRoutingDecision
     rewritten_query: str = ""
     hybrid_results: list[HybridSearchResult] = field(default_factory=list)
+    hybrid_results_by_query: dict[str, list[HybridSearchResult]] = field(default_factory=dict)
     reranked_results: list[RerankedChunkResult] = field(default_factory=list)
     parent_results: list[ParentChunkResult] = field(default_factory=list)
     compressed_items: list[CompressedParentChunk] = field(default_factory=list)
@@ -101,6 +102,8 @@ class FakeServices:
 
     def hybrid_search(self, query: str, *, filters: dict[str, Any] | None = None, top_k: int = 10) -> list[HybridSearchResult]:
         self.hybrid_calls.append({"query": query, "filters": filters, "top_k": top_k})
+        if query in self.hybrid_results_by_query:
+            return self.hybrid_results_by_query[query]
         return self.hybrid_results
 
     def rerank_chunks(self, chunks: list[HybridSearchResult], query: str) -> list[RerankedChunkResult]:
@@ -337,6 +340,7 @@ def test_default_retrieval_state_has_safe_decomposition_wiring_defaults() -> Non
     assert state["decomposition_validation_errors"] is not default_retrieval_state(query="q")[
         "decomposition_validation_errors"
     ]
+    assert state["subquery_results"] == {}
 
 
 def test_fallback_graph_clears_preexisting_decomposition_plan_when_gate_is_false(monkeypatch) -> None:
@@ -487,6 +491,138 @@ def test_fallback_graph_validation_failure_clears_plan_and_preserves_safe_retrie
 
 
 
+
+def test_valid_decomposition_plan_triggers_subquery_retrieval_and_preserves_root_path() -> None:
+    query = "Compare governing law versus dispute resolution."
+    subquery_1 = "Locate clauses about governing law within the same agreement scope as the root question."
+    subquery_2 = "Locate clauses about dispute resolution within the same agreement scope as the root question."
+
+    services = FakeServices(
+        classifier=_decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False),
+        hybrid_results=[_hybrid("root-c1", "root-p1")],
+        hybrid_results_by_query={
+            subquery_1: [
+                HybridSearchResult(
+                    child_chunk_id="sq1-c1",
+                    parent_chunk_id="sq1-p1",
+                    document_id="doc-1",
+                    text="governing law text",
+                    hybrid_score=0.81,
+                    metadata={"source": "test-source", "heading": "Governing Law", "page": 3},
+                )
+            ],
+            subquery_2: [
+                HybridSearchResult(
+                    child_chunk_id="sq2-c1",
+                    parent_chunk_id="sq2-p1",
+                    document_id="doc-1",
+                    text="dispute resolution text",
+                    hybrid_score=0.79,
+                    metadata={"source": "test-source", "heading": "Dispute Resolution", "page": 5},
+                )
+            ],
+        },
+        reranked_results=[_reranked("root-c1", "root-p1")],
+        parent_results=[_parent("root-p1")],
+    )
+
+    state = run_retrieval_stage(query=query, dependencies=services.as_dependencies())
+
+    assert state["decomposition_plan"] is not None
+    assert set(state["subquery_results"]) == {"sq-1", "sq-2"}
+    assert state["subquery_results"]["sq-1"].subquery_id == "sq-1"
+    assert state["subquery_results"]["sq-1"].hits[0].child_chunk_id == "sq1-c1"
+    assert state["subquery_results"]["sq-1"].hits[0].parent_chunk_id == "sq1-p1"
+    assert state["subquery_results"]["sq-1"].hits[0].metadata["source"] == "test-source"
+    assert state["subquery_results"]["sq-1"].hits[0].metadata["heading"] == "Governing Law"
+    assert state["subquery_results"]["sq-1"].hits[0].metadata["page"] == 3
+    assert services.hybrid_calls[0]["query"] == subquery_1
+    assert services.hybrid_calls[1]["query"] == subquery_2
+    assert services.hybrid_calls[-1]["query"] == state["effective_query"]
+
+
+def test_no_decomposition_plan_skips_subquery_retrieval() -> None:
+    services = FakeServices(
+        classifier=_decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False),
+        hybrid_results=[_hybrid("c1", "p1")],
+        reranked_results=[_reranked("c1", "p1")],
+        parent_results=[_parent("p1")],
+    )
+
+    state = run_retrieval_stage(query="What is confidentiality?", dependencies=services.as_dependencies())
+
+    assert state["decomposition_plan"] is None
+    assert state["subquery_results"] == {}
+    assert len(services.hybrid_calls) == 1
+    assert services.hybrid_calls[-1]["query"] == state["effective_query"]
+
+
+def test_invalid_decomposition_plan_skips_subquery_retrieval(monkeypatch) -> None:
+    import agentic_rag.orchestration.retrieval_graph as retrieval_graph_module
+
+    def _forced_plan(**_: Any) -> DecompositionPlan:
+        return DecompositionPlan(
+            should_decompose=True,
+            root_question="Compare governing law and dispute resolution clauses.",
+            strategy="comparison",
+            subqueries=[
+                SubQueryPlan(
+                    id="sq-1",
+                    question="anything relevant",
+                    purpose="bad",
+                    required=True,
+                    expected_answer_type="comparison",
+                )
+            ],
+        )
+
+    monkeypatch.setattr(retrieval_graph_module, "build_decomposition_plan", _forced_plan)
+
+    services = FakeServices(
+        classifier=_decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False),
+        hybrid_results=[_hybrid("c1", "p1")],
+        reranked_results=[_reranked("c1", "p1")],
+        parent_results=[_parent("p1")],
+    )
+
+    state = run_retrieval_stage(
+        query="Compare governing law and dispute resolution clauses.",
+        dependencies=services.as_dependencies(),
+    )
+
+    assert state["decomposition_plan"] is None
+    assert state["subquery_results"] == {}
+    assert len(services.hybrid_calls) == 1
+    assert services.hybrid_calls[-1]["query"] == state["effective_query"]
+
+
+def test_fallback_graph_runs_subquery_retrieval_when_plan_is_valid(monkeypatch) -> None:
+    import agentic_rag.orchestration.retrieval_graph as retrieval_graph_module
+
+    monkeypatch.setattr(retrieval_graph_module, "StateGraph", None)
+    services = FakeServices(
+        classifier=_decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False),
+        hybrid_results=[_hybrid("root-c1", "root-p1")],
+        hybrid_results_by_query={
+            "Locate clauses about governing law within the same agreement scope as the root question.": [
+                _hybrid("sq-c1", "sq-p1")
+            ],
+            "Locate clauses about dispute resolution within the same agreement scope as the root question.": [
+                _hybrid("sq-c2", "sq-p2")
+            ],
+        },
+        reranked_results=[_reranked("root-c1", "root-p1")],
+        parent_results=[_parent("root-p1")],
+    )
+
+    app = build_retrieval_graph(dependencies=services.as_dependencies())
+    state = app.invoke(default_retrieval_state(query="Compare governing law versus dispute resolution."))
+
+    assert set(state["subquery_results"].keys()) == {"sq-1", "sq-2"}
+    assert state["subquery_results"]["sq-1"].hits[0].parent_chunk_id == "sq-p1"
+    assert services.hybrid_calls[-1]["query"] == state["effective_query"]
+
+
 def test_classify_decomposition_need_runs_after_context_resolution(monkeypatch) -> None:
     import agentic_rag.orchestration.retrieval_graph as retrieval_graph_module
 
@@ -547,7 +683,7 @@ def test_decomposition_true_does_not_change_downstream_search_inputs() -> None:
     )
 
     assert state["needs_decomposition"] is True
-    assert services.hybrid_calls[0]["query"] == state["effective_query"]
+    assert services.hybrid_calls[-1]["query"] == state["effective_query"]
     assert state["effective_query"] == state["original_query"]
 
 
@@ -724,7 +860,7 @@ def test_fallback_graph_continues_existing_retrieval_flow_after_gate(monkeypatch
     state = app.invoke(default_retrieval_state(query="Compare governing law and dispute resolution clauses."))
 
     assert state["needs_decomposition"] is True
-    assert services.hybrid_calls[0]["query"] == state["effective_query"]
+    assert services.hybrid_calls[-1]["query"] == state["effective_query"]
     assert state["parent_ids"] == ["p1"]
     assert state["retrieval_stage_complete"] is True
 

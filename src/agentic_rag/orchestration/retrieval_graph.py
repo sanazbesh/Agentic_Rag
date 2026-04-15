@@ -92,6 +92,18 @@ class DecompositionPlan(BaseModel):
     planner_notes: list[str] = Field(default_factory=list)
 
 
+
+
+class SubqueryRetrievalResult(BaseModel):
+    """Stored retrieval output for a validated decomposition subquery."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    subquery_id: str
+    subquery_question: str
+    hits: list[HybridSearchResult] = Field(default_factory=list)
+
+
 class RetrievalStageState(TypedDict):
     """Strict retrieval-stage state shared by all graph nodes."""
 
@@ -116,6 +128,7 @@ class RetrievalStageState(TypedDict):
     filters: dict[str, Any] | None
 
     child_results: list[HybridSearchResult]
+    subquery_results: dict[str, SubqueryRetrievalResult]
     reranked_child_results: list[RerankedChunkResult]
     parent_ids: list[str]
     parent_chunks: list[ParentChunkResult]
@@ -201,6 +214,7 @@ def default_retrieval_state(
         extracted_entities=None,
         filters=None,
         child_results=[],
+        subquery_results={},
         reranked_child_results=[],
         parent_ids=[],
         parent_chunks=[],
@@ -547,6 +561,15 @@ class RetrievalGraphNodes:
         updated = dict(state)
         updated["warnings"] = list(updated.get("warnings", []))
         updated["child_results"] = list(updated.get("child_results", []))
+        raw_subquery_results = updated.get("subquery_results", {})
+        if isinstance(raw_subquery_results, Mapping):
+            normalized_subquery_results: dict[str, SubqueryRetrievalResult] = {}
+            for key, value in raw_subquery_results.items():
+                if isinstance(value, SubqueryRetrievalResult):
+                    normalized_subquery_results[str(key)] = value
+            updated["subquery_results"] = normalized_subquery_results
+        else:
+            updated["subquery_results"] = {}
         updated["reranked_child_results"] = list(updated.get("reranked_child_results", []))
         updated["parent_ids"] = list(updated.get("parent_ids", []))
         updated["parent_chunks"] = list(updated.get("parent_chunks", []))
@@ -807,6 +830,44 @@ class RetrievalGraphNodes:
         )
         return cast(RetrievalStageState, updated)
 
+    def run_subquery_hybrid_search(self, state: RetrievalStageState) -> RetrievalStageState:
+        """Run hybrid retrieval for each validated decomposition subquery."""
+
+        logger.info("node_enter name=run_subquery_hybrid_search")
+        updated = dict(state)
+        plan = updated.get("decomposition_plan")
+        if plan is None or not plan.subqueries:
+            updated["subquery_results"] = {}
+            logger.info("node_exit name=run_subquery_hybrid_search skipped=true")
+            return cast(RetrievalStageState, updated)
+
+        filters = updated.get("filters")
+        subquery_results: dict[str, SubqueryRetrievalResult] = {}
+        for subquery in plan.subqueries:
+            try:
+                hits = self.dependencies.hybrid_search(
+                    subquery.question,
+                    filters=filters,
+                    top_k=self.config.hybrid_top_k,
+                )
+                normalized_hits = list(hits)
+                if not normalized_hits:
+                    updated["warnings"] = [*updated["warnings"], f"no_subquery_child_results:{subquery.id}"]
+            except Exception as exc:  # pragma: no cover
+                normalized_hits = []
+                updated["warnings"] = [*updated["warnings"], f"subquery_hybrid_search_failed:{subquery.id}:{type(exc).__name__}"]
+
+            subquery_results[subquery.id] = SubqueryRetrievalResult(
+                subquery_id=subquery.id,
+                subquery_question=subquery.question,
+                hits=normalized_hits,
+            )
+
+        updated["subquery_results"] = subquery_results
+        logger.info("node_exit name=run_subquery_hybrid_search subquery_count=%s", len(subquery_results))
+        return cast(RetrievalStageState, updated)
+
+
     def run_hybrid_search(self, state: RetrievalStageState) -> RetrievalStageState:
         logger.info("node_enter name=run_hybrid_search")
         updated = dict(state)
@@ -975,6 +1036,7 @@ class _FallbackCompiledGraph:
             current["decomposition_validation_errors"] = []
         current = self._nodes.rewrite_query_if_needed(current)
         current = self._nodes.extract_entities_if_needed(current)
+        current = self._nodes.run_subquery_hybrid_search(current)
         current = self._nodes.run_hybrid_search(current)
         current = self._nodes.rerank_results(current)
         current = self._nodes.collect_parent_ids(current)
@@ -1009,6 +1071,7 @@ def build_retrieval_graph(
     graph.add_node("validate_decomposition_plan", nodes.validate_decomposition_plan)
     graph.add_node("rewrite_query_if_needed", nodes.rewrite_query_if_needed)
     graph.add_node("extract_entities_if_needed", nodes.extract_entities_if_needed)
+    graph.add_node("run_subquery_hybrid_search", nodes.run_subquery_hybrid_search)
     graph.add_node("run_hybrid_search", nodes.run_hybrid_search)
     graph.add_node("rerank_results", nodes.rerank_results)
     graph.add_node("collect_parent_ids", nodes.collect_parent_ids)
@@ -1032,7 +1095,8 @@ def build_retrieval_graph(
     graph.add_edge("maybe_build_decomposition_plan", "validate_decomposition_plan")
     graph.add_edge("validate_decomposition_plan", "rewrite_query_if_needed")
     graph.add_edge("rewrite_query_if_needed", "extract_entities_if_needed")
-    graph.add_edge("extract_entities_if_needed", "run_hybrid_search")
+    graph.add_edge("extract_entities_if_needed", "run_subquery_hybrid_search")
+    graph.add_edge("run_subquery_hybrid_search", "run_hybrid_search")
     graph.add_edge("run_hybrid_search", "rerank_results")
     graph.add_edge("rerank_results", "collect_parent_ids")
     graph.add_edge("collect_parent_ids", "fetch_parent_chunks")
