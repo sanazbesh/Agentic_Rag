@@ -606,3 +606,97 @@ def test_regression_definition_title_only_does_not_generate_clause_answer() -> N
     result = run_legal_rag_turn(query="what is employment agreement?", dependencies=services.as_dependencies())
     assert len(services.answer_calls) == 0
     assert "Termination Without Cause" not in result.answer_text
+
+
+def test_warning_aggregation_dedupes_identical_definition_not_supported_warnings() -> None:
+    services = FakeServices(
+        classifier=understand_query("what is employment agreement?"),
+        hybrid_results=[_hybrid("c1", "p1")],
+        reranked_results=[_reranked("c1", "p1")],
+        parent_results=[_parent("p1", text="Employment Agreement\nTermination Without Cause...")],
+    )
+    result = run_legal_rag_turn(query="what is employment agreement?", dependencies=services.as_dependencies())
+    assert len(result.warnings) == len(set(result.warnings))
+
+
+def test_definition_required_insufficient_response_is_more_specific_for_title_only_or_generic_label_case() -> None:
+    title_only_parent = ParentChunkResult(
+        parent_chunk_id="p1",
+        document_id="doc-1",
+        text="Employment Agreement",
+        source="test",
+        source_name="Employment Agreement",
+        heading_text="Employment Agreement",
+    )
+    services = FakeServices(
+        classifier=understand_query("what is employment agreement?"),
+        hybrid_results=[_hybrid("c1", "p1")],
+        reranked_results=[_reranked("c1", "p1")],
+        parent_results=[title_only_parent],
+    )
+    result = run_legal_rag_turn(query="what is employment agreement?", dependencies=services.as_dependencies())
+    assert "does not define the term itself" not in result.answer_text
+    assert (
+        result.answer_text
+        == "Direct answer: I do not see a definition of 'employment agreement' in the retrieved context. "
+        "It appears as a document title or label, not as a defined term or clause."
+    )
+    assert result.grounded is False
+    assert result.sufficient_context is False
+    assert result.citations == []
+
+
+def test_existing_valid_clause_lookup_response_remains_unchanged() -> None:
+    sufficient_assessment = AnswerabilityAssessment(
+        original_query="what is confidentiality?",
+        question_type="document_content_query",
+        answerability_expectation="clause_lookup",
+        has_relevant_context=True,
+        sufficient_context=True,
+        partially_supported=False,
+        should_answer=True,
+        support_level="sufficient",
+        insufficiency_reason=None,
+        matched_parent_chunk_ids=["p1"],
+        matched_headings=["Confidentiality"],
+        evidence_notes=["operative_clause_language_detected"],
+        warnings=[],
+    )
+    services = FakeServices(
+        classifier=_decision(),
+        hybrid_results=[_hybrid("c1", "p1")],
+        reranked_results=[_reranked("c1", "p1")],
+        parent_results=[_parent("p1")],
+        answerability_result=sufficient_assessment,
+    )
+    result = run_legal_rag_turn(query="what is confidentiality?", dependencies=services.as_dependencies())
+    assert result.sufficient_context is True
+    assert result.grounded is True
+    assert result.answer_text == "Grounded answer"
+
+
+def test_existing_unsupported_definition_routing_remains_unchanged_except_wording_and_warning_dedupe() -> None:
+    title_only_parent = ParentChunkResult(
+        parent_chunk_id="p1",
+        document_id="doc-1",
+        text="Employment Agreement",
+        source="test",
+        source_name="Employment Agreement",
+        heading_text="Employment Agreement",
+    )
+    services = FakeServices(
+        classifier=understand_query("what is employment agreement?"),
+        hybrid_results=[_hybrid("c1", "p1")],
+        reranked_results=[_reranked("c1", "p1")],
+        parent_results=[title_only_parent],
+    )
+    result, state = run_legal_rag_turn_with_state(
+        query="what is employment agreement?",
+        dependencies=services.as_dependencies(),
+    )
+    assessment = state["answerability_result"]
+    assert assessment.should_answer is False
+    assert assessment.sufficient_context is False
+    assert assessment.insufficiency_reason == "only_title_or_heading_match"
+    assert state["response_route"] == "build_insufficient_response"
+    assert len(result.warnings) == len(set(result.warnings))
