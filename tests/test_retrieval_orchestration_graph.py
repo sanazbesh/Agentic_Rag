@@ -41,6 +41,7 @@ class FakeServices:
     extract_calls: list[str] = field(default_factory=list)
     hybrid_calls: list[dict[str, Any]] = field(default_factory=list)
     rerank_calls: list[dict[str, Any]] = field(default_factory=list)
+    parent_fetch_calls: list[list[str]] = field(default_factory=list)
 
     def as_dependencies(self) -> RetrievalDependencies:
         return RetrievalDependencies(
@@ -129,6 +130,7 @@ class FakeServices:
         return self.reranked_results
 
     def retrieve_parent_chunks(self, parent_ids: list[str]) -> list[ParentChunkResult]:
+        self.parent_fetch_calls.append(list(parent_ids))
         return self.parent_results
 
     def compress_context(self, _: list[ParentChunkResult]) -> CompressContextResult:
@@ -838,6 +840,69 @@ def test_decomposed_mode_applies_one_global_rerank_over_merged_pool_with_root_an
     assert sq1_payload["retrieval_scores"]["hybrid_score"] == 0.81
 
 
+def test_decomposed_parent_id_collection_uses_global_reranked_merged_pool() -> None:
+    query = "Compare governing law versus dispute resolution."
+    services = FakeServices(
+        classifier=_decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False),
+        hybrid_results=[_hybrid("root-c1", "root-p1")],
+        hybrid_results_by_query={
+            "Locate clauses about governing law within the same agreement scope as the root question.": [_hybrid("sq-c1", "sq-p1")],
+            "Locate clauses about dispute resolution within the same agreement scope as the root question.": [_hybrid("sq-c2", "sq-p2")],
+        },
+        reranked_results=[_reranked("sq-c2", "sq-p2"), _reranked("sq-c1", "sq-p1"), _reranked("root-c1", "root-p1")],
+        parent_results=[_parent("sq-p2"), _parent("sq-p1"), _parent("root-p1")],
+    )
+
+    state = run_retrieval_stage(query=query, dependencies=services.as_dependencies())
+
+    assert [item.child_chunk_id for item in state["reranked_child_results"]] == ["sq-c2", "sq-c1", "root-c1"]
+    assert [item.child_chunk_id for item in state["parent_expansion_child_results"]] == ["sq-c2", "sq-c1", "root-c1"]
+    assert state["parent_ids"] == ["sq-p2", "sq-p1", "root-p1"]
+    assert services.parent_fetch_calls == [["sq-p2", "sq-p1", "root-p1"]]
+
+
+def test_decomposed_parent_fetch_uses_parent_ids_derived_from_global_reranked_pool() -> None:
+    query = "Compare governing law versus dispute resolution."
+    services = FakeServices(
+        classifier=_decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False),
+        hybrid_results=[_hybrid("root-c1", "root-p1")],
+        hybrid_results_by_query={
+            "Locate clauses about governing law within the same agreement scope as the root question.": [_hybrid("sq-c1", "sq-p1")],
+            "Locate clauses about dispute resolution within the same agreement scope as the root question.": [_hybrid("sq-c2", "sq-p2")],
+        },
+        reranked_results=[
+            _reranked("sq-c2", "sq-p2"),
+            _reranked("sq-c2-dup", "sq-p2"),
+            _reranked("root-c1", "root-p1"),
+        ],
+        parent_results=[_parent("sq-p2"), _parent("root-p1")],
+    )
+
+    state = run_retrieval_stage(query=query, dependencies=services.as_dependencies())
+
+    assert state["parent_ids"] == ["sq-p2", "root-p1"]
+    assert services.parent_fetch_calls == [["sq-p2", "root-p1"]]
+    assert [item.parent_chunk_id for item in state["parent_chunks"]] == ["sq-p2", "root-p1"]
+
+
+def test_non_decomposition_parent_collection_behavior_remains_unchanged() -> None:
+    services = FakeServices(
+        classifier=_decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False),
+        hybrid_results=[_hybrid("c1", "p1"), _hybrid("c2", "p2")],
+        reranked_results=[_reranked("c2", "p2"), _reranked("c1", "p1")],
+        parent_results=[_parent("p2"), _parent("p1")],
+    )
+
+    state = run_retrieval_stage(query="termination clause", dependencies=services.as_dependencies())
+
+    assert state["decomposition_plan"] is None
+    assert state["parent_expansion_child_results"] == []
+    assert state["parent_ids"] == ["p2", "p1"]
+    assert services.parent_fetch_calls == [["p2", "p1"]]
+
+
+
+
 def test_non_decomposition_rerank_behavior_unchanged_uses_effective_query_and_root_children() -> None:
     services = FakeServices(
         classifier=_decision(followup=False, ambiguous=True, use_context=False, rewrite=True, extract=False),
@@ -880,7 +945,9 @@ def test_fallback_executor_matches_global_rerank_behavior_for_decomposed_mode(mo
     assert len(services.rerank_calls) == 1
     assert services.rerank_calls[0]["query"] == state["original_query"]
     assert [item.child_chunk_id for item in services.rerank_calls[0]["chunks"]] == ["root-c1", "sq-c1", "sq-c2"]
+    assert [item.child_chunk_id for item in state["parent_expansion_child_results"]] == ["root-c1", "sq-c1", "sq-c2"]
     assert state["parent_ids"] == ["root-p1", "sq-p1", "sq-p2"]
+    assert services.parent_fetch_calls == [["root-p1", "sq-p1", "sq-p2"]]
 
 
 def test_merged_candidate_representation_does_not_change_active_retrieval_path() -> None:

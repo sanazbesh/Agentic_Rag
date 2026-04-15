@@ -646,6 +646,82 @@ def test_definition_required_insufficient_response_is_more_specific_for_title_on
     assert result.citations == []
 
 
+
+
+def test_non_definition_heading_only_insufficient_response_does_not_use_definition_wording() -> None:
+    non_definition_heading_only = AnswerabilityAssessment(
+        original_query="what are notice requirements?",
+        question_type="document_content_query",
+        answerability_expectation="clause_lookup",
+        has_relevant_context=True,
+        sufficient_context=False,
+        partially_supported=False,
+        should_answer=False,
+        support_level="insufficient",
+        insufficiency_reason="only_title_or_heading_match",
+        matched_parent_chunk_ids=["p1"],
+        matched_headings=["Notice"],
+        evidence_notes=["weakness_signal:title_only_signal_without_body"],
+        warnings=["heading_only_context"],
+    )
+    title_only_parent = ParentChunkResult(
+        parent_chunk_id="p1",
+        document_id="doc-1",
+        text="Notice",
+        source="test",
+        source_name="test",
+        heading_text="Notice",
+    )
+    services = FakeServices(
+        classifier=understand_query("what are notice requirements?"),
+        hybrid_results=[_hybrid("c1", "p1")],
+        reranked_results=[_reranked("c1", "p1")],
+        parent_results=[title_only_parent],
+        answerability_result=non_definition_heading_only,
+    )
+
+    result = run_legal_rag_turn(query="what are notice requirements?", dependencies=services.as_dependencies())
+
+    assert "does not define the term itself" not in result.answer_text
+    assert "I do not see a definition" not in result.answer_text
+
+
+def test_definition_intent_heading_only_insufficient_response_still_uses_improved_definition_wording() -> None:
+    title_only_parent = ParentChunkResult(
+        parent_chunk_id="p1",
+        document_id="doc-1",
+        text="Employment Agreement",
+        source="test",
+        source_name="Employment Agreement",
+        heading_text="Employment Agreement",
+    )
+    services = FakeServices(
+        classifier=understand_query("what is employment agreement?"),
+        hybrid_results=[_hybrid("c1", "p1")],
+        reranked_results=[_reranked("c1", "p1")],
+        parent_results=[title_only_parent],
+    )
+
+    result = run_legal_rag_turn(query="what is employment agreement?", dependencies=services.as_dependencies())
+
+    assert result.answer_text == (
+        "Direct answer: I do not see a definition of 'employment agreement' in the retrieved context. "
+        "It appears as a document title or label, not as a defined term or clause."
+    )
+
+
+def test_warning_dedupe_still_holds_after_followup_fix() -> None:
+    services = FakeServices(
+        classifier=understand_query("what is employment agreement?"),
+        hybrid_results=[_hybrid("c1", "p1")],
+        reranked_results=[_reranked("c1", "p1")],
+        parent_results=[_parent("p1", text="Employment Agreement\nTermination Without Cause...")],
+    )
+
+    result = run_legal_rag_turn(query="what is employment agreement?", dependencies=services.as_dependencies())
+
+    assert len(result.warnings) == len(set(result.warnings))
+
 def test_existing_valid_clause_lookup_response_remains_unchanged() -> None:
     sufficient_assessment = AnswerabilityAssessment(
         original_query="what is confidentiality?",

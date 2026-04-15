@@ -152,6 +152,7 @@ class RetrievalStageState(TypedDict):
     subquery_merged_candidates: dict[str, list[MergedRetrievalCandidate]]
     merged_candidates: list[MergedRetrievalCandidate]
     reranked_child_results: list[RerankedChunkResult]
+    parent_expansion_child_results: list[RerankedChunkResult]
     parent_ids: list[str]
     parent_chunks: list[ParentChunkResult]
     compressed_context: list[CompressedParentChunk]
@@ -241,6 +242,7 @@ def default_retrieval_state(
         subquery_merged_candidates={},
         merged_candidates=[],
         reranked_child_results=[],
+        parent_expansion_child_results=[],
         parent_ids=[],
         parent_chunks=[],
         compressed_context=[],
@@ -740,6 +742,7 @@ class RetrievalGraphNodes:
         else:
             updated["subquery_merged_candidates"] = {}
         updated["reranked_child_results"] = list(updated.get("reranked_child_results", []))
+        updated["parent_expansion_child_results"] = list(updated.get("parent_expansion_child_results", []))
         updated["parent_ids"] = list(updated.get("parent_ids", []))
         updated["parent_chunks"] = list(updated.get("parent_chunks", []))
         updated["compressed_context"] = list(updated.get("compressed_context", []))
@@ -1104,6 +1107,7 @@ class RetrievalGraphNodes:
 
         if not rerank_input:
             updated["reranked_child_results"] = []
+            updated["parent_expansion_child_results"] = []
             logger.info("node_exit name=rerank_results skipped=true")
             return cast(RetrievalStageState, updated)
         try:
@@ -1139,22 +1143,41 @@ class RetrievalGraphNodes:
                 )
                 for item in rerank_input
             ]
-        logger.info("node_exit name=rerank_results reranked_count=%s", len(updated["reranked_child_results"]))
+        if use_global_merged_pool:
+            updated["parent_expansion_child_results"] = list(updated["reranked_child_results"])
+        else:
+            updated["parent_expansion_child_results"] = []
+        logger.info(
+            "node_exit name=rerank_results reranked_count=%s parent_expansion_source=%s",
+            len(updated["reranked_child_results"]),
+            "global_merged_rerank" if use_global_merged_pool else "reranked_child_results",
+        )
         return cast(RetrievalStageState, updated)
 
     def collect_parent_ids(self, state: RetrievalStageState) -> RetrievalStageState:
         logger.info("node_enter name=collect_parent_ids")
         updated = dict(state)
+        has_valid_decomposition = updated.get("decomposition_plan") is not None
+        has_merged_candidates = bool(updated.get("merged_candidates"))
+        has_global_reranked_pool = bool(updated.get("parent_expansion_child_results"))
+
+        if has_valid_decomposition and has_merged_candidates and has_global_reranked_pool:
+            parent_source = list(updated["parent_expansion_child_results"])
+            source_name = "global_merged_rerank"
+        else:
+            parent_source = list(updated["reranked_child_results"])
+            source_name = "reranked_child_results"
+
         seen: set[str] = set()
         parent_ids: list[str] = []
-        for item in updated["reranked_child_results"]:
+        for item in parent_source:
             parent_id = item.parent_chunk_id
             if not parent_id or parent_id in seen:
                 continue
             seen.add(parent_id)
             parent_ids.append(parent_id)
         updated["parent_ids"] = parent_ids
-        logger.info("node_exit name=collect_parent_ids parent_count=%s", len(parent_ids))
+        logger.info("node_exit name=collect_parent_ids source=%s parent_count=%s", source_name, len(parent_ids))
         return cast(RetrievalStageState, updated)
 
     def fetch_parent_chunks(self, state: RetrievalStageState) -> RetrievalStageState:
