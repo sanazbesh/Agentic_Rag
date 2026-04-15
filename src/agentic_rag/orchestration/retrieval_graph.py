@@ -120,6 +120,7 @@ class MergedRetrievalCandidate(BaseModel):
 
     hit: HybridSearchResult
     provenance: RetrievalCandidateProvenance
+    contributing_hits: list[HybridSearchResult] = Field(default_factory=list)
 
 
 class RetrievalStageState(TypedDict):
@@ -149,6 +150,7 @@ class RetrievalStageState(TypedDict):
     subquery_results: dict[str, SubqueryRetrievalResult]
     root_merged_candidates: list[MergedRetrievalCandidate]
     subquery_merged_candidates: dict[str, list[MergedRetrievalCandidate]]
+    merged_candidates: list[MergedRetrievalCandidate]
     reranked_child_results: list[RerankedChunkResult]
     parent_ids: list[str]
     parent_chunks: list[ParentChunkResult]
@@ -237,6 +239,7 @@ def default_retrieval_state(
         subquery_results={},
         root_merged_candidates=[],
         subquery_merged_candidates={},
+        merged_candidates=[],
         reranked_child_results=[],
         parent_ids=[],
         parent_chunks=[],
@@ -286,7 +289,77 @@ def _build_merged_candidate(
             from_root_query=from_root_query,
             subquery_ids=ordered_subquery_ids,
         ),
+        contributing_hits=[hit],
     )
+
+
+def _merge_two_candidates(
+    *,
+    existing: MergedRetrievalCandidate,
+    incoming: MergedRetrievalCandidate,
+) -> MergedRetrievalCandidate:
+    merged_metadata = dict(existing.hit.metadata)
+    for key, value in incoming.hit.metadata.items():
+        if key not in merged_metadata:
+            merged_metadata[key] = value
+
+    merged_hit = HybridSearchResult(
+        child_chunk_id=existing.hit.child_chunk_id,
+        parent_chunk_id=existing.hit.parent_chunk_id or incoming.hit.parent_chunk_id,
+        document_id=existing.hit.document_id or incoming.hit.document_id,
+        text=existing.hit.text or incoming.hit.text,
+        hybrid_score=existing.hit.hybrid_score,
+        metadata=merged_metadata,
+        dense_score=existing.hit.dense_score if existing.hit.dense_score is not None else incoming.hit.dense_score,
+        sparse_score=existing.hit.sparse_score if existing.hit.sparse_score is not None else incoming.hit.sparse_score,
+        dense_rank=existing.hit.dense_rank if existing.hit.dense_rank is not None else incoming.hit.dense_rank,
+        sparse_rank=existing.hit.sparse_rank if existing.hit.sparse_rank is not None else incoming.hit.sparse_rank,
+        matched_in_dense=existing.hit.matched_in_dense or incoming.hit.matched_in_dense,
+        matched_in_sparse=existing.hit.matched_in_sparse or incoming.hit.matched_in_sparse,
+    )
+
+    merged_subquery_ids = list(existing.provenance.subquery_ids)
+    for subquery_id in incoming.provenance.subquery_ids:
+        if subquery_id and subquery_id not in merged_subquery_ids:
+            merged_subquery_ids.append(subquery_id)
+
+    return MergedRetrievalCandidate(
+        hit=merged_hit,
+        provenance=RetrievalCandidateProvenance(
+            from_root_query=existing.provenance.from_root_query or incoming.provenance.from_root_query,
+            subquery_ids=merged_subquery_ids,
+        ),
+        contributing_hits=[*existing.contributing_hits, *incoming.contributing_hits],
+    )
+
+
+def _merge_root_and_subquery_candidates(
+    *,
+    root_candidates: Sequence[MergedRetrievalCandidate],
+    subquery_candidates: Mapping[str, Sequence[MergedRetrievalCandidate]],
+) -> list[MergedRetrievalCandidate]:
+    by_child_chunk_id: dict[str, MergedRetrievalCandidate] = {}
+
+    for candidate in root_candidates:
+        child_chunk_id = candidate.hit.child_chunk_id
+        if child_chunk_id not in by_child_chunk_id:
+            by_child_chunk_id[child_chunk_id] = candidate
+        else:
+            by_child_chunk_id[child_chunk_id] = _merge_two_candidates(
+                existing=by_child_chunk_id[child_chunk_id],
+                incoming=candidate,
+            )
+
+    for subquery_id in sorted(subquery_candidates):
+        for candidate in subquery_candidates[subquery_id]:
+            child_chunk_id = candidate.hit.child_chunk_id
+            existing = by_child_chunk_id.get(child_chunk_id)
+            if existing is None:
+                by_child_chunk_id[child_chunk_id] = candidate
+            else:
+                by_child_chunk_id[child_chunk_id] = _merge_two_candidates(existing=existing, incoming=candidate)
+
+    return list(by_child_chunk_id.values())
 
 
 def _derive_filters(extraction: LegalEntityExtractionResult) -> dict[str, Any] | None:
@@ -609,6 +682,7 @@ class RetrievalGraphNodes:
         else:
             updated["subquery_results"] = {}
         updated["root_merged_candidates"] = list(updated.get("root_merged_candidates", []))
+        updated["merged_candidates"] = list(updated.get("merged_candidates", []))
         raw_subquery_candidates = updated.get("subquery_merged_candidates", {})
         if isinstance(raw_subquery_candidates, Mapping):
             normalized_subquery_candidates: dict[str, list[MergedRetrievalCandidate]] = {}
@@ -947,6 +1021,26 @@ class RetrievalGraphNodes:
         logger.info("node_exit name=run_hybrid_search child_count=%s", len(updated["child_results"]))
         return cast(RetrievalStageState, updated)
 
+    def merge_retrieval_candidates(self, state: RetrievalStageState) -> RetrievalStageState:
+        """Merge root/subquery retrieval candidates into one deduped deterministic pool."""
+
+        logger.info("node_enter name=merge_retrieval_candidates")
+        updated = dict(state)
+        if updated.get("decomposition_plan") is None:
+            updated["merged_candidates"] = []
+            logger.info("node_exit name=merge_retrieval_candidates skipped=true")
+            return cast(RetrievalStageState, updated)
+
+        updated["merged_candidates"] = _merge_root_and_subquery_candidates(
+            root_candidates=list(updated.get("root_merged_candidates", [])),
+            subquery_candidates=dict(updated.get("subquery_merged_candidates", {})),
+        )
+        logger.info(
+            "node_exit name=merge_retrieval_candidates merged_count=%s",
+            len(updated["merged_candidates"]),
+        )
+        return cast(RetrievalStageState, updated)
+
     def rerank_results(self, state: RetrievalStageState) -> RetrievalStageState:
         logger.info("node_enter name=rerank_results child_count=%s", len(state["child_results"]))
         updated = dict(state)
@@ -1099,6 +1193,7 @@ class _FallbackCompiledGraph:
         current = self._nodes.extract_entities_if_needed(current)
         current = self._nodes.run_subquery_hybrid_search(current)
         current = self._nodes.run_hybrid_search(current)
+        current = self._nodes.merge_retrieval_candidates(current)
         current = self._nodes.rerank_results(current)
         current = self._nodes.collect_parent_ids(current)
         current = self._nodes.fetch_parent_chunks(current)
@@ -1134,6 +1229,7 @@ def build_retrieval_graph(
     graph.add_node("extract_entities_if_needed", nodes.extract_entities_if_needed)
     graph.add_node("run_subquery_hybrid_search", nodes.run_subquery_hybrid_search)
     graph.add_node("run_hybrid_search", nodes.run_hybrid_search)
+    graph.add_node("merge_retrieval_candidates", nodes.merge_retrieval_candidates)
     graph.add_node("rerank_results", nodes.rerank_results)
     graph.add_node("collect_parent_ids", nodes.collect_parent_ids)
     graph.add_node("fetch_parent_chunks", nodes.fetch_parent_chunks)
@@ -1158,7 +1254,8 @@ def build_retrieval_graph(
     graph.add_edge("rewrite_query_if_needed", "extract_entities_if_needed")
     graph.add_edge("extract_entities_if_needed", "run_subquery_hybrid_search")
     graph.add_edge("run_subquery_hybrid_search", "run_hybrid_search")
-    graph.add_edge("run_hybrid_search", "rerank_results")
+    graph.add_edge("run_hybrid_search", "merge_retrieval_candidates")
+    graph.add_edge("merge_retrieval_candidates", "rerank_results")
     graph.add_edge("rerank_results", "collect_parent_ids")
     graph.add_edge("collect_parent_ids", "fetch_parent_chunks")
     graph.add_edge("fetch_parent_chunks", "maybe_compress_context")
