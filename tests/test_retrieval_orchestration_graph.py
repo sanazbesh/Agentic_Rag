@@ -885,6 +885,55 @@ def test_decomposed_parent_fetch_uses_parent_ids_derived_from_global_reranked_po
     assert [item.parent_chunk_id for item in state["parent_chunks"]] == ["sq-p2", "root-p1"]
 
 
+def test_decomposed_parent_expansion_preserves_child_parent_traceability() -> None:
+    query = "Compare governing law versus dispute resolution."
+    services = FakeServices(
+        classifier=_decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False),
+        hybrid_results=[_hybrid("root-c1", "root-p1")],
+        hybrid_results_by_query={
+            "Locate clauses about governing law within the same agreement scope as the root question.": [_hybrid("sq-c1", "sq-p1")],
+            "Locate clauses about dispute resolution within the same agreement scope as the root question.": [_hybrid("sq-c2", "sq-p2")],
+        },
+        reranked_results=[
+            RerankedChunkResult(
+                child_chunk_id="sq-c2",
+                parent_chunk_id="sq-p2",
+                document_id="doc-1",
+                text="dispute resolution text",
+                rerank_score=0.93,
+                original_score=0.79,
+                payload={
+                    "retrieval_provenance": {"from_root_query": False, "subquery_ids": ["sq-2"]},
+                    "retrieval_scores": {"hybrid_score": 0.79},
+                },
+            ),
+            RerankedChunkResult(
+                child_chunk_id="root-c1",
+                parent_chunk_id="root-p1",
+                document_id="doc-1",
+                text="root text",
+                rerank_score=0.91,
+                original_score=0.91,
+                payload={"retrieval_provenance": {"from_root_query": True, "subquery_ids": []}},
+            ),
+        ],
+        parent_results=[_parent("sq-p2"), _parent("root-p1")],
+    )
+
+    state = run_retrieval_stage(query=query, dependencies=services.as_dependencies())
+
+    assert [(item.child_chunk_id, item.parent_chunk_id) for item in state["parent_expansion_child_results"]] == [
+        ("sq-c2", "sq-p2"),
+        ("root-c1", "root-p1"),
+    ]
+    assert state["parent_expansion_child_results"][0].payload["retrieval_provenance"] == {
+        "from_root_query": False,
+        "subquery_ids": ["sq-2"],
+    }
+    assert state["parent_ids"] == ["sq-p2", "root-p1"]
+    assert services.parent_fetch_calls == [["sq-p2", "root-p1"]]
+
+
 def test_non_decomposition_parent_collection_behavior_remains_unchanged() -> None:
     services = FakeServices(
         classifier=_decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False),
@@ -948,6 +997,37 @@ def test_fallback_executor_matches_global_rerank_behavior_for_decomposed_mode(mo
     assert [item.child_chunk_id for item in state["parent_expansion_child_results"]] == ["root-c1", "sq-c1", "sq-c2"]
     assert state["parent_ids"] == ["root-p1", "sq-p1", "sq-p2"]
     assert services.parent_fetch_calls == [["root-p1", "sq-p1", "sq-p2"]]
+
+
+def test_fallback_executor_parent_fetch_uses_deduped_ordered_parent_ids_from_global_pool(monkeypatch) -> None:
+    import agentic_rag.orchestration.retrieval_graph as retrieval_graph_module
+
+    monkeypatch.setattr(retrieval_graph_module, "StateGraph", None)
+    services = FakeServices(
+        classifier=_decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False),
+        hybrid_results=[_hybrid("root-c1", "root-p1")],
+        hybrid_results_by_query={
+            "Locate clauses about governing law within the same agreement scope as the root question.": [
+                _hybrid("sq-c1", "sq-p1")
+            ],
+            "Locate clauses about dispute resolution within the same agreement scope as the root question.": [
+                _hybrid("sq-c2", "sq-p2")
+            ],
+        },
+        reranked_results=[
+            _reranked("sq-c2", "sq-p2"),
+            _reranked("sq-c2-dup", "sq-p2"),
+            _reranked("root-c1", "root-p1"),
+        ],
+        parent_results=[_parent("sq-p2"), _parent("root-p1")],
+    )
+
+    app = build_retrieval_graph(dependencies=services.as_dependencies())
+    state = app.invoke(default_retrieval_state(query="Compare governing law versus dispute resolution."))
+
+    assert [item.child_chunk_id for item in state["parent_expansion_child_results"]] == ["sq-c2", "sq-c2-dup", "root-c1"]
+    assert state["parent_ids"] == ["sq-p2", "root-p1"]
+    assert services.parent_fetch_calls == [["sq-p2", "root-p1"]]
 
 
 def test_merged_candidate_representation_does_not_change_active_retrieval_path() -> None:
