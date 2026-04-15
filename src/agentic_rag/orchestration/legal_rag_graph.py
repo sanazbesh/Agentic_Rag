@@ -7,6 +7,7 @@ production behavior stays deterministic, debuggable, and non-agentic.
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, cast
@@ -155,6 +156,28 @@ def _copy_update(model: FinalAnswerModel, **updates: Any) -> FinalAnswerModel:
     payload = model.model_dump()
     payload.update(updates)
     return FinalAnswerModel(**payload)
+
+
+def _dedupe_preserve_order(values: Sequence[str]) -> list[str]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        deduped.append(value)
+    return deduped
+
+
+def _extract_definition_subject(query: str) -> str | None:
+    normalized = " ".join(str(query or "").split()).strip()
+    if not normalized:
+        return None
+    match = re.match(r"^what\s+is(?:\s+the)?\s+(.+?)(?:\?)?$", normalized, flags=re.IGNORECASE)
+    if not match:
+        return None
+    subject = match.group(1).strip(" \"'`")
+    return subject or None
 
 
 def _coerce_citation(item: object) -> AnswerCitation:
@@ -420,10 +443,24 @@ class AnswerStageNodes:
             "Direct answer: The retrieved context does not contain enough information to answer the question fully."
         )
         if isinstance(assessment, AnswerabilityAssessment):
-            if assessment.insufficiency_reason == "definition_not_supported":
-                insufficiency_message = (
-                    "Direct answer: The retrieved context includes related material, but it does not define the term itself."
+            if assessment.insufficiency_reason in {"definition_not_supported", "only_title_or_heading_match"}:
+                asked_term = _extract_definition_subject(assessment.original_query)
+                title_or_label_only = assessment.insufficiency_reason == "only_title_or_heading_match" or any(
+                    note == "weakness_signal:title_only_signal_without_body" for note in assessment.evidence_notes
                 )
+                if asked_term and title_or_label_only:
+                    insufficiency_message = (
+                        f"Direct answer: I do not see a definition of '{asked_term}' in the retrieved context. "
+                        "It appears as a document title or label, not as a defined term or clause."
+                    )
+                elif asked_term:
+                    insufficiency_message = (
+                        f"Direct answer: I do not see a definition of '{asked_term}' in the retrieved context."
+                    )
+                else:
+                    insufficiency_message = (
+                        "Direct answer: The retrieved context includes related material, but it does not define the term itself."
+                    )
             elif assessment.insufficiency_reason == "fact_not_found":
                 insufficiency_message = (
                     "Direct answer: The retrieved context does not contain enough information to identify the requested fact."
@@ -469,7 +506,7 @@ class AnswerStageNodes:
                 updated["response_route"] = "fallback_finalizer:missing_final_answer"
             else:
                 final = _validate_answer_payload(raw_final)
-                merged_warnings = [*warnings, *final.warnings]
+                merged_warnings = _dedupe_preserve_order([*warnings, *final.warnings])
                 final = _copy_update(final, warnings=merged_warnings)
         except (ValueError, TypeError) as exc:
             final = _safe_fallback(
