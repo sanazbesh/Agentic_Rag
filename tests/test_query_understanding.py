@@ -26,6 +26,35 @@ def test_what_is_clause_lookup_only_when_document_grounded() -> None:
     assert result.is_document_scoped is True
 
 
+def test_what_is_title_only_match_does_not_trigger_clause_lookup_override() -> None:
+    result = understand_query(
+        "what is employment agreement?",
+        active_documents=[{"id": "doc-employment", "title": "Employment Agreement"}],
+    )
+    assert result.question_type == "definition_query"
+    assert result.answerability_expectation == "definition_required"
+    assert "what_is_override_blocked_by_non_independent_hint_evidence" in result.routing_notes
+
+
+def test_what_is_filename_like_label_does_not_trigger_clause_lookup_override() -> None:
+    result = understand_query(
+        "what is employment agreement?",
+        active_documents=[{"id": "doc-employment", "name": "employment_agreement_019.md"}],
+    )
+    assert result.question_type == "definition_query"
+    assert result.answerability_expectation == "definition_required"
+    assert "what_is_override_blocked_by_non_independent_hint_evidence" in result.routing_notes
+
+
+def test_what_is_generic_agreement_label_does_not_trigger_clause_lookup_override() -> None:
+    result = understand_query(
+        "what is agreement?",
+        active_documents=[{"id": "doc-employment", "name": "Employment Agreement"}],
+    )
+    assert result.question_type == "definition_query"
+    assert result.answerability_expectation == "definition_required"
+
+
 def test_what_is_remains_definition_without_active_document_context() -> None:
     result = understand_query("what is confidentiality?")
     assert result.question_type == "definition_query"
@@ -49,6 +78,16 @@ def test_what_is_multiword_clause_subject_preserved_for_hint_matching() -> None:
     )
     assert "termination without cause" in result.resolved_clause_hints
     assert result.question_type == "document_content_query"
+    assert "debug:clause_hint_match=true" in result.routing_notes
+
+
+def test_what_is_governing_law_clause_lookup_still_triggers_with_independent_topic_evidence() -> None:
+    result = understand_query(
+        "what is governing law?",
+        active_documents=[{"id": "doc-nda", "name": "Mutual NDA"}],
+    )
+    assert result.question_type == "document_content_query"
+    assert result.answerability_expectation == "clause_lookup"
     assert "debug:clause_hint_match=true" in result.routing_notes
 
 
@@ -92,6 +131,13 @@ def test_ambiguous_pronoun_with_multiple_documents() -> None:
 def test_comparison_query() -> None:
     result = understand_query("compare that with Ontario law")
     assert result.question_type == "comparison_query"
+    assert result.may_need_decomposition is True
+
+
+def test_non_canonical_query_understanding_behavior_remains_unchanged() -> None:
+    result = understand_query("compare that with Ontario law")
+    assert result.question_type == "comparison_query"
+    assert result.answerability_expectation == "comparison"
     assert result.may_need_decomposition is True
 
 

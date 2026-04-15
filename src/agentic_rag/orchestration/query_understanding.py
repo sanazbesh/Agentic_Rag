@@ -120,6 +120,34 @@ def _extract_what_is_subject(normalized_query: str) -> str | None:
     return subject or None
 
 
+def _is_generic_document_label_phrase(value: str) -> bool:
+    canonical = _canonicalize_phrase(value)
+    if not canonical:
+        return False
+    tokens = canonical.split()
+    if not tokens:
+        return False
+    generic_heads = {"agreement", "contract", "document", "nda", "lease", "msa"}
+    if tokens[-1] in generic_heads:
+        return True
+    return canonical in generic_heads
+
+
+def _is_document_label_like_hint(hint: str, known_documents: Sequence[str]) -> bool:
+    canonical_hint = _canonicalize_phrase(hint)
+    if not canonical_hint:
+        return False
+    for document_label in known_documents:
+        canonical_label = _canonicalize_phrase(document_label)
+        if not canonical_label:
+            continue
+        if canonical_hint == canonical_label:
+            return True
+        if canonical_hint in canonical_label or canonical_label in canonical_hint:
+            return True
+    return False
+
+
 def _hint_match_confidence(subject: str, hints: Sequence[str]) -> float:
     if not subject:
         return 0.0
@@ -250,13 +278,51 @@ def understand_query(
     if is_canonical_what_is:
         available_documents = bool(active_documents or selected_documents)
         combined_hints = [*resolved_topic_hints, *resolved_clause_hints]
-        best_hint_confidence = _hint_match_confidence(what_is_subject or "", combined_hints)
+        canonical_subject = _canonicalize_phrase(what_is_subject or "")
+        independent_clause_hints: list[str] = []
+        for hint in resolved_topic_hints:
+            canonical_hint = _canonicalize_phrase(hint)
+            if not canonical_hint:
+                continue
+            if _is_document_label_like_hint(canonical_hint, known_documents):
+                continue
+            if _is_generic_document_label_phrase(canonical_hint):
+                continue
+            if canonical_hint not in independent_clause_hints:
+                independent_clause_hints.append(canonical_hint)
+        for hint in resolved_clause_hints:
+            canonical_hint = _canonicalize_phrase(hint)
+            if not canonical_hint:
+                continue
+            if canonical_hint == canonical_subject:
+                # Canonical "what is X" subject hints are synthetic for override
+                # gating and must not self-qualify clause lookup.
+                continue
+            if _is_document_label_like_hint(canonical_hint, known_documents):
+                continue
+            if _is_generic_document_label_phrase(canonical_hint):
+                continue
+            if canonical_hint not in independent_clause_hints:
+                independent_clause_hints.append(canonical_hint)
+
+        best_hint_confidence = _hint_match_confidence(what_is_subject or "", independent_clause_hints)
         threshold = 0.8
-        is_document_grounded = bool(available_documents and combined_hints and best_hint_confidence >= threshold)
-        has_hint_signal = bool(available_documents and combined_hints)
-        clause_hint_match = bool(best_hint_confidence >= threshold and combined_hints)
+        subject_token_count = len((what_is_subject or "").split())
+        has_topic_marker_support = bool(
+            set(independent_clause_hints) & {_canonicalize_phrase(topic) for topic in resolved_topic_hints}
+        )
+        topic_support_threshold = 0.3
+        has_high_confidence_match = best_hint_confidence >= threshold
+        has_topic_supported_match = (
+            subject_token_count >= 2 and has_topic_marker_support and best_hint_confidence >= topic_support_threshold
+        )
+        is_document_grounded = bool(available_documents and independent_clause_hints and (has_high_confidence_match or has_topic_supported_match))
+        has_hint_signal = bool(available_documents and independent_clause_hints)
+        clause_hint_match = bool((has_high_confidence_match or has_topic_supported_match) and independent_clause_hints)
         routing_notes.append("debug:canonical_what_is=true")
         routing_notes.append(f"debug:clause_hint_match={'true' if clause_hint_match else 'false'}")
+        if combined_hints and not independent_clause_hints:
+            routing_notes.append("what_is_override_blocked_by_non_independent_hint_evidence")
 
         if is_document_grounded:
             question_type = "document_content_query"
