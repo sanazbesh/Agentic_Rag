@@ -945,12 +945,45 @@ class AnswerabilityAssessor:
             return False
         if candidate in canonical_text:
             return True
-        candidate_tokens = [token for token in candidate.split() if len(token) >= 4]
+        candidate_tokens = [token for token in candidate.split() if len(token) >= 3]
         if len(candidate_tokens) < 2:
             return False
-        text_tokens = set(canonical_text.split())
-        overlap = [token for token in candidate_tokens if token in text_tokens]
-        return len(overlap) >= 2
+        text_tokens = canonical_text.split()
+        if len(text_tokens) < 2:
+            return False
+
+        def normalize(token: str) -> str:
+            if len(token) > 4 and token.endswith("es"):
+                return token[:-2]
+            if len(token) > 3 and token.endswith("s"):
+                return token[:-1]
+            return token
+
+        def token_matches(candidate_token: str, text_token: str) -> bool:
+            lhs = normalize(candidate_token)
+            rhs = normalize(text_token)
+            if lhs == rhs:
+                return True
+            if len(lhs) >= 6 and len(rhs) >= 6:
+                return lhs[:6] == rhs[:6]
+            return False
+
+        match_positions: list[int] = []
+        search_start = 0
+        for candidate_token in candidate_tokens:
+            found_index: int | None = None
+            for index in range(search_start, len(text_tokens)):
+                if token_matches(candidate_token, text_tokens[index]):
+                    found_index = index
+                    break
+            if found_index is None:
+                return False
+            match_positions.append(found_index)
+            search_start = found_index + 1
+
+        span = match_positions[-1] - match_positions[0]
+        max_span = max(6, len(candidate_tokens) + 3)
+        return span <= max_span
 
     def _field(self, item: object, key: str) -> Any:
         if isinstance(item, Mapping):
