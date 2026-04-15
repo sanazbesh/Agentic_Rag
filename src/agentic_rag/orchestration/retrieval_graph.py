@@ -104,6 +104,24 @@ class SubqueryRetrievalResult(BaseModel):
     hits: list[HybridSearchResult] = Field(default_factory=list)
 
 
+class RetrievalCandidateProvenance(BaseModel):
+    """Query-path provenance for future merged retrieval candidates."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    from_root_query: bool = False
+    subquery_ids: list[str] = Field(default_factory=list)
+
+
+class MergedRetrievalCandidate(BaseModel):
+    """Stable candidate contract for future root+subquery merge phases."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    hit: HybridSearchResult
+    provenance: RetrievalCandidateProvenance
+
+
 class RetrievalStageState(TypedDict):
     """Strict retrieval-stage state shared by all graph nodes."""
 
@@ -129,6 +147,8 @@ class RetrievalStageState(TypedDict):
 
     child_results: list[HybridSearchResult]
     subquery_results: dict[str, SubqueryRetrievalResult]
+    root_merged_candidates: list[MergedRetrievalCandidate]
+    subquery_merged_candidates: dict[str, list[MergedRetrievalCandidate]]
     reranked_child_results: list[RerankedChunkResult]
     parent_ids: list[str]
     parent_chunks: list[ParentChunkResult]
@@ -215,6 +235,8 @@ def default_retrieval_state(
         filters=None,
         child_results=[],
         subquery_results={},
+        root_merged_candidates=[],
+        subquery_merged_candidates={},
         reranked_child_results=[],
         parent_ids=[],
         parent_chunks=[],
@@ -248,6 +270,22 @@ def heuristic_query_classifier(
         recent_messages=recent_messages,
         active_documents=active_documents,
         selected_documents=selected_documents,
+    )
+
+
+def _build_merged_candidate(
+    *,
+    hit: HybridSearchResult,
+    from_root_query: bool,
+    subquery_ids: Sequence[str] | None = None,
+) -> MergedRetrievalCandidate:
+    ordered_subquery_ids = [subquery_id for subquery_id in (subquery_ids or []) if subquery_id]
+    return MergedRetrievalCandidate(
+        hit=hit,
+        provenance=RetrievalCandidateProvenance(
+            from_root_query=from_root_query,
+            subquery_ids=ordered_subquery_ids,
+        ),
     )
 
 
@@ -570,6 +608,18 @@ class RetrievalGraphNodes:
             updated["subquery_results"] = normalized_subquery_results
         else:
             updated["subquery_results"] = {}
+        updated["root_merged_candidates"] = list(updated.get("root_merged_candidates", []))
+        raw_subquery_candidates = updated.get("subquery_merged_candidates", {})
+        if isinstance(raw_subquery_candidates, Mapping):
+            normalized_subquery_candidates: dict[str, list[MergedRetrievalCandidate]] = {}
+            for key, value in raw_subquery_candidates.items():
+                if isinstance(value, list):
+                    normalized_subquery_candidates[str(key)] = [
+                        item for item in value if isinstance(item, MergedRetrievalCandidate)
+                    ]
+            updated["subquery_merged_candidates"] = normalized_subquery_candidates
+        else:
+            updated["subquery_merged_candidates"] = {}
         updated["reranked_child_results"] = list(updated.get("reranked_child_results", []))
         updated["parent_ids"] = list(updated.get("parent_ids", []))
         updated["parent_chunks"] = list(updated.get("parent_chunks", []))
@@ -838,11 +888,13 @@ class RetrievalGraphNodes:
         plan = updated.get("decomposition_plan")
         if plan is None or not plan.subqueries:
             updated["subquery_results"] = {}
+            updated["subquery_merged_candidates"] = {}
             logger.info("node_exit name=run_subquery_hybrid_search skipped=true")
             return cast(RetrievalStageState, updated)
 
         filters = updated.get("filters")
         subquery_results: dict[str, SubqueryRetrievalResult] = {}
+        subquery_merged_candidates: dict[str, list[MergedRetrievalCandidate]] = {}
         for subquery in plan.subqueries:
             try:
                 hits = self.dependencies.hybrid_search(
@@ -862,8 +914,13 @@ class RetrievalGraphNodes:
                 subquery_question=subquery.question,
                 hits=normalized_hits,
             )
+            subquery_merged_candidates[subquery.id] = [
+                _build_merged_candidate(hit=hit, from_root_query=False, subquery_ids=[subquery.id])
+                for hit in normalized_hits
+            ]
 
         updated["subquery_results"] = subquery_results
+        updated["subquery_merged_candidates"] = subquery_merged_candidates
         logger.info("node_exit name=run_subquery_hybrid_search subquery_count=%s", len(subquery_results))
         return cast(RetrievalStageState, updated)
 
@@ -878,11 +935,15 @@ class RetrievalGraphNodes:
                 top_k=self.config.hybrid_top_k,
             )
             updated["child_results"] = list(results)
+            updated["root_merged_candidates"] = [
+                _build_merged_candidate(hit=item, from_root_query=True) for item in updated["child_results"]
+            ]
             if not results:
                 updated["warnings"] = [*updated["warnings"], "no_child_results"]
         except Exception as exc:  # pragma: no cover
             updated["warnings"] = [*updated["warnings"], f"hybrid_search_failed:{type(exc).__name__}"]
             updated["child_results"] = []
+            updated["root_merged_candidates"] = []
         logger.info("node_exit name=run_hybrid_search child_count=%s", len(updated["child_results"]))
         return cast(RetrievalStageState, updated)
 
