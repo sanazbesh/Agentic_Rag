@@ -296,6 +296,31 @@ def _is_matter_metadata_query(normalized_query: str) -> bool:
     return has_marker and has_question_frame
 
 
+def _is_employment_contract_lifecycle_query(normalized_query: str) -> bool:
+    lowered = _canonicalize_phrase(normalized_query)
+    if not lowered:
+        return False
+
+    patterns = (
+        r"\bwhen\s+did\s+(?:employment|the employment relationship)\s+(?:begin|start|commence)\b",
+        r"\b(?:employment\s+)?start\s+date\b",
+        r"\bcommencement\s+date\b",
+        r"\boffer\s+and\s+acceptance\b",
+        r"\bwhen\s+was\s+the\s+offer\s+accepted\b",
+        r"\bprobation(?:ary)?\b",
+        r"\bwhen\s+did\s+probation\s+end\b",
+        r"\bcompensation\s+terms\b",
+        r"\bsalary\b",
+        r"\bbenefits\b",
+        r"\btermination\s+effective\s+date\b",
+        r"\bwhen\s+did\s+termination\s+take\s+effect\b",
+        r"\bseverance\b",
+        r"\brecord\s+of\s+employment\b",
+        r"\broe\b",
+    )
+    return any(re.search(pattern, lowered) for pattern in patterns)
+
+
 def understand_query(
     query: str,
     conversation_summary: str | None = None,
@@ -317,6 +342,7 @@ def understand_query(
     is_party_role_entity_query = _is_party_role_entity_query(normalized)
     is_chronology_date_event_query = _is_chronology_date_event_query(normalized)
     is_matter_metadata_query = _is_matter_metadata_query(normalized)
+    is_employment_contract_lifecycle_query = _is_employment_contract_lifecycle_query(normalized)
 
     meta_markers = ("how many documents", "what files are loaded", "what documents are uploaded", "what docs are loaded")
     comparison_markers = ("compare", "differ", "difference", "vs ", "versus")
@@ -335,6 +361,14 @@ def understand_query(
         "arbitration",
         "liability",
         "assignment",
+        "probation",
+        "compensation",
+        "benefits",
+        "severance",
+        "roe",
+        "record of employment",
+        "commencement",
+        "effective date",
     )
 
     padded = f" {lowered} "
@@ -357,7 +391,13 @@ def understand_query(
         for topic in topic_markers:
             if topic in resolved_topic_hints:
                 continue
-            if subject_tokens & set(topic.split()):
+            topic_tokens = set(topic.split())
+            overlap = subject_tokens & topic_tokens
+            if (
+                (len(topic_tokens) == 1 and overlap)
+                or (len(topic_tokens) > 1 and len(overlap) >= 2)
+                or (len(subject_tokens) == 1 and len(overlap) == 1)
+            ):
                 resolved_topic_hints.append(topic)
     resolved_clause_hints = list(resolved_topic_hints)
     if is_canonical_what_is and what_is_subject:
@@ -389,6 +429,7 @@ def understand_query(
         is_party_role_entity_query
         or is_chronology_date_event_query
         or is_matter_metadata_query
+        or is_employment_contract_lifecycle_query
         or any(marker in lowered for marker in extractive_markers)
     ):
         question_type = "extractive_fact_query"
@@ -522,6 +563,7 @@ def understand_query(
         or (is_context_dependent and not explicit_document_scope)
         or is_party_role_entity_query
         or is_matter_metadata_query
+        or is_employment_contract_lifecycle_query
     )
     should_extract_entities = is_party_role_entity_query or is_matter_metadata_query or any(
         marker in lowered
@@ -545,6 +587,8 @@ def understand_query(
         routing_notes.append("legal_question_family:chronology_date_event")
     if is_matter_metadata_query:
         routing_notes.append("legal_question_family:matter_document_metadata")
+    if is_employment_contract_lifecycle_query:
+        routing_notes.append("legal_question_family:employment_contract_lifecycle")
 
     if question_type == "other_query" and refers_to_prior_document_scope and not context_available:
         ambiguity_notes.append("pronoun_reference_without_resolvable_scope")
