@@ -103,6 +103,9 @@ class LegalAnswerSynthesizer:
             party_role_response = self._generate_party_role_answer(normalized_context, normalized_query)
             if party_role_response is not None:
                 return party_role_response
+            lifecycle_response = self._generate_employment_lifecycle_answer(normalized_context, normalized_query)
+            if lifecycle_response is not None:
+                return lifecycle_response
             chronology_response = self._generate_chronology_answer(normalized_context, normalized_query)
             if chronology_response is not None:
                 return chronology_response
@@ -562,6 +565,160 @@ class LegalAnswerSynthesizer:
             sufficient_context=True,
             citations=citations,
             warnings=[],
+        )
+
+    def _generate_employment_lifecycle_answer(
+        self,
+        context: Sequence[dict[str, Any]],
+        query: str,
+    ) -> GenerateAnswerResult | None:
+        lowered_query = query.lower()
+        target = self._employment_lifecycle_target(lowered_query)
+        if target is None:
+            return None
+
+        match = self._resolve_employment_lifecycle_value(context, target)
+        if match is None:
+            return self._insufficient_response("insufficient_context: employment lifecycle-responsive evidence not found")
+        if self._is_lifecycle_when_date_required_query(lowered_query, target) and not self._contains_concrete_date(str(match["value"])):
+            return self._insufficient_response("insufficient_context: lifecycle date value not found")
+
+        citation = AnswerCitation(
+            parent_chunk_id=match["parent_chunk_id"],
+            document_id=match.get("document_id"),
+            source_name=match.get("source_name"),
+            heading=match.get("heading"),
+            supporting_excerpt=match["excerpt"],
+        )
+        source_line = f"- {match.get('heading') or '(no heading)'}: {match['excerpt']}"
+        direct = self._employment_lifecycle_direct_answer(target, match["value"])
+
+        return GenerateAnswerResult(
+            answer_text=(
+                f"Direct answer: {direct}\n\n"
+                "Supporting points:\n"
+                f"{source_line}\n\n"
+                "Caveats / limitations:\n"
+                "- Response is limited to employment lifecycle-responsive agreement language in the retrieved context."
+            ),
+            grounded=True,
+            sufficient_context=True,
+            citations=[citation],
+            warnings=[],
+        )
+
+    def _employment_lifecycle_target(self, lowered_query: str) -> str | None:
+        if "offer" in lowered_query and "accept" in lowered_query:
+            return "offer_acceptance"
+        if any(token in lowered_query for token in ("start date", "commencement", "employment begin", "employment start", "employment relationship begin")):
+            return "employment_start"
+        if "probation" in lowered_query:
+            return "probation"
+        if any(token in lowered_query for token in ("compensation", "salary", "wage", "remuneration")):
+            return "compensation"
+        if "benefit" in lowered_query:
+            return "benefits"
+        if "termination" in lowered_query and any(token in lowered_query for token in ("effective", "take effect", "date", "terminated")):
+            return "termination_effective"
+        if "severance" in lowered_query:
+            return "severance"
+        if "roe" in lowered_query or "record of employment" in lowered_query:
+            return "roe"
+        return None
+
+    def _resolve_employment_lifecycle_value(
+        self,
+        context: Sequence[dict[str, Any]],
+        target: str,
+    ) -> dict[str, Any] | None:
+        for item in context:
+            text = str(item.get("text") or "")
+            heading = str(item.get("heading") or "")
+            haystack = f"{heading}\n{text}"
+            value = self._extract_employment_lifecycle_value(text, target)
+            if not value:
+                value = self._extract_employment_lifecycle_value(haystack, target)
+            if not value:
+                continue
+            excerpt = self._best_excerpt(text or haystack, value)
+            return {
+                "value": value,
+                "excerpt": excerpt or value,
+                "parent_chunk_id": item.get("parent_chunk_id", ""),
+                "document_id": item.get("document_id"),
+                "source_name": item.get("source_name"),
+                "heading": item.get("heading"),
+            }
+        return None
+
+    def _extract_employment_lifecycle_value(self, haystack: str, target: str) -> str | None:
+        lowered = haystack.lower()
+        date_pattern = r"(?:\d{4}-\d{2}-\d{2}|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+\d{1,2},\s*\d{4})"
+        if target == "offer_acceptance":
+            if "offer" in lowered and any(token in lowered for token in ("accept", "accepted", "acceptance")):
+                match = re.search(rf"\boffer.{0,80}(?:accepted|acceptance).{{0,40}}(?:on\s+({date_pattern}))?", haystack, flags=re.IGNORECASE)
+                return match.group(0).strip() if match else "Offer acceptance terms are present."
+            return None
+        if target == "employment_start":
+            match = re.search(rf"\b(?:effective date|commence(?:ment|d)?|start date|employment (?:began|begins|commenced|commences|start(?:ed|s)?)).{{0,40}}({date_pattern})", haystack, flags=re.IGNORECASE)
+            if match:
+                return match.group(1).strip()
+            if "effective date" in lowered or "commence" in lowered or "start date" in lowered:
+                return "Employment start/commencement language is present."
+            return None
+        if target == "probation":
+            match = re.search(r"\bprobation(?:ary)?[^.\n;]*", haystack, flags=re.IGNORECASE)
+            return match.group(0).strip() if match else None
+        if target == "compensation":
+            match = re.search(r"\b(?:compensation|salary|base salary|wage)[^.\n;]*", haystack, flags=re.IGNORECASE)
+            return match.group(0).strip() if match else None
+        if target == "benefits":
+            match = re.search(r"\bbenefits?[^.\n;]*", haystack, flags=re.IGNORECASE)
+            return match.group(0).strip() if match else None
+        if target == "termination_effective":
+            match = re.search(rf"\b(?:termination|terminated)[^.\n;]{{0,60}}(?:effective|on)\s+({date_pattern})", haystack, flags=re.IGNORECASE)
+            if match:
+                return match.group(1).strip()
+            if "termination" in lowered and "effective" in lowered:
+                return "Termination effective language is present."
+            return None
+        if target == "severance":
+            match = re.search(r"\bseverance[^.\n;]*", haystack, flags=re.IGNORECASE)
+            return match.group(0).strip() if match else None
+        if target == "roe":
+            match = re.search(r"\b(?:record of employment|roe)[^.\n;]*", haystack, flags=re.IGNORECASE)
+            return match.group(0).strip() if match else None
+        return None
+
+    def _employment_lifecycle_direct_answer(self, target: str, value: str) -> str:
+        if target == "offer_acceptance":
+            return f"The offer/acceptance evidence states: {value}"
+        if target == "employment_start":
+            return f"The employment start/commencement evidence is: {value}."
+        if target == "probation":
+            return f"The probation evidence states: {value}."
+        if target == "compensation":
+            return f"The compensation evidence states: {value}."
+        if target == "benefits":
+            return f"The benefits evidence states: {value}."
+        if target == "termination_effective":
+            return f"The termination effective-date evidence is: {value}."
+        if target == "severance":
+            return f"The severance evidence states: {value}."
+        return f"The ROE evidence states: {value}."
+
+    def _is_lifecycle_when_date_required_query(self, lowered_query: str, target: str) -> bool:
+        if "when" not in lowered_query:
+            return False
+        return target in {"offer_acceptance", "employment_start", "probation", "termination_effective", "roe"}
+
+    def _contains_concrete_date(self, value: str) -> bool:
+        return bool(
+            re.search(
+                r"\b(?:\d{4}-\d{2}-\d{2}|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+\d{1,2},\s*\d{4})\b",
+                value or "",
+                flags=re.IGNORECASE,
+            )
         )
 
     def _is_chronology_question(self, lowered_query: str) -> bool:

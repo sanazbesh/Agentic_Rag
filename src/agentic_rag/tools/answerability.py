@@ -438,6 +438,31 @@ class AnswerabilityAssessor:
             )
 
         if expectation == "fact_extraction":
+            is_lifecycle_query = self._is_employment_contract_lifecycle_query(original_query, query_understanding)
+            if is_lifecycle_query:
+                lifecycle_support = self._evaluate_employment_lifecycle_support(
+                    query=original_query,
+                    substantive=matched,
+                )
+                if lifecycle_support["supported"]:
+                    return build(
+                        status="sufficient",
+                        has_any_coverage=True,
+                        sufficient_coverage=True,
+                        partial_coverage=False,
+                        reason="fact_supported",
+                        supporting_signals=list(lifecycle_support["signals"]),
+                    )
+                return build(
+                    status="weak",
+                    has_any_coverage=bool(matched),
+                    sufficient_coverage=False,
+                    partial_coverage=False,
+                    reason="fact_not_found",
+                    missing_requirements=list(lifecycle_support["missing"]),
+                    warnings=["heading_only_context"] if heading_only else [],
+                )
+
             is_matter_metadata_query = self._is_matter_metadata_query(original_query, query_understanding)
             if is_matter_metadata_query:
                 found = self._has_matter_metadata_evidence(substantive, original_query)
@@ -873,6 +898,158 @@ class AnswerabilityAssessor:
             r"\ball dated events\b",
         )
         return any(re.search(pattern, lowered) for pattern in chronology_patterns)
+
+    def _is_employment_contract_lifecycle_query(
+        self,
+        query: str,
+        query_understanding: QueryUnderstandingResult,
+    ) -> bool:
+        if any(
+            note == "legal_question_family:employment_contract_lifecycle"
+            for note in (query_understanding.routing_notes or [])
+        ):
+            return True
+        lowered = self._canonical_phrase(query)
+        patterns = (
+            r"\bwhen\s+did\s+(?:employment|the employment relationship)\s+(?:begin|start|commence)\b",
+            r"\b(?:employment\s+)?start\s+date\b",
+            r"\bcommencement\s+date\b",
+            r"\boffer\s+and\s+acceptance\b",
+            r"\bwhen\s+was\s+the\s+offer\s+accepted\b",
+            r"\bprobation(?:ary)?\b",
+            r"\bcompensation\s+terms\b",
+            r"\bsalary\b",
+            r"\bbenefits\b",
+            r"\btermination\s+effective\s+date\b",
+            r"\bwhen\s+did\s+termination\s+take\s+effect\b",
+            r"\bseverance\b",
+            r"\broe\b",
+            r"\brecord\s+of\s+employment\b",
+        )
+        return any(re.search(pattern, lowered) for pattern in patterns)
+
+    def _evaluate_employment_lifecycle_support(
+        self,
+        *,
+        query: str,
+        substantive: Sequence[Mapping[str, str]],
+    ) -> dict[str, object]:
+        lowered_query = self._canonical_phrase(query)
+        requires_date = self._is_lifecycle_when_date_required_query(lowered_query)
+        if not substantive:
+            return {"supported": False, "signals": [], "missing": ["employment_lifecycle_responsive_evidence"]}
+
+        def has_responsive_evidence(required: Sequence[str], any_of: Sequence[str] = ()) -> bool:
+            for item in substantive:
+                text = self._canonical_phrase(f"{item.get('heading', '')} {item.get('text', '')}")
+                if not text:
+                    continue
+                if not all(token in text for token in required):
+                    continue
+                if any_of and not any(token in text for token in any_of):
+                    continue
+                return True
+            return False
+
+        def has_responsive_dated_evidence(required: Sequence[str], any_of: Sequence[str] = ()) -> bool:
+            for item in substantive:
+                text = self._canonical_phrase(f"{item.get('heading', '')} {item.get('text', '')}")
+                if not text:
+                    continue
+                if not all(token in text for token in required):
+                    continue
+                if any_of and not any(token in text for token in any_of):
+                    continue
+                raw_text = f"{item.get('heading', '')} {item.get('text', '')}"
+                if self._extract_datetimes(raw_text):
+                    return True
+            return False
+
+        if "offer" in lowered_query and "accept" in lowered_query:
+            if has_responsive_dated_evidence(("offer",), ("accept", "accepted", "acceptance")) if requires_date else has_responsive_evidence(("offer",), ("accept", "accepted", "acceptance")):
+                return {"supported": True, "signals": ["employment_lifecycle_offer_acceptance_evidence_detected"], "missing": []}
+            missing = "offer_and_acceptance_dated_evidence" if requires_date else "offer_and_acceptance_evidence"
+            return {"supported": False, "signals": [], "missing": [missing]}
+
+        if any(token in lowered_query for token in ("start date", "commencement", "employment begin", "employment start", "employment relationship begin")):
+            has_support = (
+                has_responsive_evidence(("employment",), ("effective date", "commence", "start", "began", "begin"))
+                or has_responsive_evidence(("commencement",), ("date",))
+                or has_responsive_evidence(
+                    ("effective date",),
+                    ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec", "20", "19"),
+                )
+                or has_responsive_evidence(("start date",))
+            )
+            has_dated_support = (
+                has_responsive_dated_evidence(("employment",), ("effective date", "commence", "start", "began", "begin"))
+                or has_responsive_dated_evidence(("commencement",), ("date",))
+                or has_responsive_dated_evidence(("effective date",))
+                or has_responsive_dated_evidence(("start date",))
+            )
+            if (has_dated_support if requires_date else has_support):
+                return {
+                    "supported": True,
+                    "signals": [
+                        "employment_lifecycle_start_or_commencement_evidence_detected",
+                        "employment_start_date_supported",
+                    ],
+                    "missing": [],
+                }
+            missing = "employment_start_or_commencement_dated_evidence" if requires_date else "employment_start_or_commencement_evidence"
+            return {"supported": False, "signals": [], "missing": [missing]}
+
+        if "probation" in lowered_query:
+            if has_responsive_dated_evidence(("probation",), ("month", "day", "end", "period", "complete")) if requires_date else has_responsive_evidence(("probation",), ("month", "day", "end", "period", "complete")):
+                return {"supported": True, "signals": ["employment_lifecycle_probation_evidence_detected"], "missing": []}
+            missing = "probation_term_or_end_dated_evidence" if requires_date else "probation_term_or_end_evidence"
+            return {"supported": False, "signals": [], "missing": [missing]}
+
+        if any(token in lowered_query for token in ("compensation", "salary", "wage", "remuneration")):
+            if has_responsive_evidence(("compensation",), ("salary", "base", "$", "annual", "bonus")) or has_responsive_evidence(("salary",)):
+                return {"supported": True, "signals": ["employment_lifecycle_compensation_evidence_detected"], "missing": []}
+            return {"supported": False, "signals": [], "missing": ["compensation_or_salary_evidence"]}
+
+        if "benefit" in lowered_query:
+            if has_responsive_evidence(("benefit",), ("eligible", "coverage", "plan", "insurance", "vacation", "rrsp", "health")):
+                return {"supported": True, "signals": ["employment_lifecycle_benefits_evidence_detected"], "missing": []}
+            return {"supported": False, "signals": [], "missing": ["benefits_terms_or_eligibility_evidence"]}
+
+        if "termination" in lowered_query and any(token in lowered_query for token in ("effective", "take effect", "date", "terminated")):
+            if has_responsive_dated_evidence(("termination",), ("effective", "terminated on", "date", "cease")) if requires_date else has_responsive_evidence(("termination",), ("effective", "terminated on", "date", "cease")):
+                return {"supported": True, "signals": ["employment_lifecycle_termination_effective_evidence_detected"], "missing": []}
+            missing = "termination_effective_dated_evidence" if requires_date else "termination_effective_date_evidence"
+            return {"supported": False, "signals": [], "missing": [missing]}
+
+        if "severance" in lowered_query:
+            if has_responsive_evidence(("severance",), ("pay", "payable", "weeks", "salary", "offered")):
+                return {"supported": True, "signals": ["employment_lifecycle_severance_evidence_detected"], "missing": []}
+            return {"supported": False, "signals": [], "missing": ["severance_terms_evidence"]}
+
+        if "roe" in lowered_query or "record of employment" in lowered_query:
+            has_support = has_responsive_evidence(("record of employment",), ("roe", "issued", "issue", "provide", "days")) or has_responsive_evidence(("roe",), ("issued", "issue", "provide", "days"))
+            has_dated_support = has_responsive_dated_evidence(("record of employment",), ("roe", "issued", "issue", "provide", "days")) or has_responsive_dated_evidence(("roe",), ("issued", "issue", "provide", "days"))
+            if (has_dated_support if requires_date else has_support):
+                return {"supported": True, "signals": ["employment_lifecycle_roe_evidence_detected"], "missing": []}
+            missing = "roe_issuance_dated_evidence" if requires_date else "roe_issuance_timing_or_reference_evidence"
+            return {"supported": False, "signals": [], "missing": [missing]}
+
+        return {"supported": False, "signals": [], "missing": ["employment_lifecycle_responsive_evidence"]}
+
+    def _is_lifecycle_when_date_required_query(self, lowered_query: str) -> bool:
+        return "when" in lowered_query and any(
+            token in lowered_query
+            for token in (
+                "start",
+                "commencement",
+                "probation",
+                "termination",
+                "roe",
+                "record of employment",
+                "offer",
+                "accept",
+            )
+        )
 
     def _evaluate_chronology_support(
         self,
@@ -1489,6 +1666,12 @@ def _combine_coverage_and_strength(
         if ALLOW_MODERATE_STRENGTH_WHEN_COVERAGE_SUFFICIENT:
             return "sufficient", True, not expectation_blocks_answer, False, None
         return "moderate", False, False, False, "partial_evidence_only"
+
+    if any(
+        note == "legal_question_family:employment_contract_lifecycle"
+        for note in (query_understanding.routing_notes or [])
+    ):
+        return "sufficient", True, not expectation_blocks_answer, False, None
 
     # Explicitly conservative for weak/none structural strength.
     return "weak", False, False, False, "partial_evidence_only"
