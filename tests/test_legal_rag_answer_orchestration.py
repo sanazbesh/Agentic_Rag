@@ -6,13 +6,22 @@ from typing import Any
 from agentic_rag.orchestration.legal_rag_graph import (
     FinalAnswerModel,
     LegalRagDependencies,
+    build_answer_graph,
     build_full_legal_rag_graph,
     default_legal_rag_state,
     run_legal_rag_turn,
     run_legal_rag_turn_with_state,
 )
 from agentic_rag.orchestration.query_understanding import understand_query
-from agentic_rag.orchestration.retrieval_graph import QueryRoutingDecision, RetrievalDependencies, RetrievalGraphConfig
+from agentic_rag.orchestration.retrieval_graph import (
+    DecompositionPlan,
+    QueryRoutingDecision,
+    RetrievalDependencies,
+    RetrievalGraphConfig,
+    SubQueryPlan,
+    SubqueryCoverageRecord,
+    SubquerySupportClassification,
+)
 from agentic_rag.retrieval.parent_child import HybridSearchResult, ParentChunkResult, RerankedChunkResult
 from agentic_rag.tools.answerability import AnswerabilityAssessment, assess_answerability
 from agentic_rag.tools.answer_generation import AnswerCitation, GenerateAnswerResult
@@ -776,3 +785,227 @@ def test_existing_unsupported_definition_routing_remains_unchanged_except_wordin
     assert assessment.insufficiency_reason == "only_title_or_heading_match"
     assert state["response_route"] == "build_insufficient_response"
     assert len(result.warnings) == len(set(result.warnings))
+
+
+def _sufficient_assessment(query: str = "compare clauses") -> AnswerabilityAssessment:
+    return AnswerabilityAssessment(
+        original_query=query,
+        question_type="comparison_query",
+        answerability_expectation="comparison",
+        has_relevant_context=True,
+        sufficient_context=True,
+        partially_supported=False,
+        should_answer=True,
+        support_level="sufficient",
+        insufficiency_reason=None,
+        matched_parent_chunk_ids=["p1"],
+        matched_headings=["Comparison"],
+        evidence_notes=["baseline_sufficient_answerability"],
+        warnings=[],
+    )
+
+
+def _plan() -> DecompositionPlan:
+    return DecompositionPlan(
+        should_decompose=True,
+        root_question="Compare governing law and dispute resolution.",
+        strategy="comparison",
+        subqueries=[
+            SubQueryPlan(
+                id="sq-1",
+                question="Find governing law text.",
+                purpose="required",
+                required=True,
+                expected_answer_type="cross_reference",
+            ),
+            SubQueryPlan(
+                id="sq-2",
+                question="Find dispute resolution text.",
+                purpose="required",
+                required=True,
+                expected_answer_type="cross_reference",
+            ),
+            SubQueryPlan(
+                id="sq-3",
+                question="Find optional venue text.",
+                purpose="optional",
+                required=False,
+                expected_answer_type="cross_reference",
+            ),
+        ],
+    )
+
+
+def _coverage(
+    sq1: SubquerySupportClassification,
+    sq2: SubquerySupportClassification,
+    sq3: SubquerySupportClassification = "supported",
+) -> list[SubqueryCoverageRecord]:
+    return [
+        SubqueryCoverageRecord(
+            subquery_id="sq-1",
+            required=True,
+            support_classification=sq1,
+            evidence_child_chunk_ids=["c1"] if sq1 == "supported" else [],
+            evidence_parent_chunk_ids=["p1"] if sq1 == "supported" else [],
+            insufficiency_reason=None if sq1 == "supported" else "no_retrieval_evidence",
+        ),
+        SubqueryCoverageRecord(
+            subquery_id="sq-2",
+            required=True,
+            support_classification=sq2,
+            evidence_child_chunk_ids=["c2"] if sq2 == "supported" else [],
+            evidence_parent_chunk_ids=["p2"] if sq2 == "supported" else [],
+            insufficiency_reason=None if sq2 == "supported" else "no_retrieval_evidence",
+        ),
+        SubqueryCoverageRecord(
+            subquery_id="sq-3",
+            required=False,
+            support_classification=sq3,
+            evidence_child_chunk_ids=["c3"] if sq3 == "supported" else [],
+            evidence_parent_chunk_ids=["p3"] if sq3 == "supported" else [],
+            insufficiency_reason=None if sq3 == "supported" else "no_retrieval_evidence",
+        ),
+    ]
+
+
+def _invoke_answer_graph(
+    *,
+    assessment: AnswerabilityAssessment,
+    decomposition_plan: DecompositionPlan | None,
+    subquery_coverage: list[SubqueryCoverageRecord],
+) -> dict[str, Any]:
+    app = build_answer_graph(
+        answer_generator=lambda *_args, **_kwargs: GenerateAnswerResult(
+            answer_text="Grounded answer",
+            grounded=True,
+            sufficient_context=True,
+            citations=[AnswerCitation(parent_chunk_id="p1", document_id=None, source_name=None, heading=None, supporting_excerpt="x")],
+            warnings=[],
+        ),
+        answerability_evaluator=lambda *_args, **_kwargs: assessment,
+    )
+    state = default_legal_rag_state(query="compare clauses")
+    state["query_classification"] = _decision()
+    state["parent_chunks"] = [_parent("p1")]
+    state["decomposition_plan"] = decomposition_plan
+    state["subquery_coverage"] = subquery_coverage
+    return app.invoke(state)
+
+
+def test_decomposed_query_with_all_required_subqueries_supported_can_be_sufficient() -> None:
+    state = _invoke_answer_graph(
+        assessment=_sufficient_assessment(),
+        decomposition_plan=_plan(),
+        subquery_coverage=_coverage("supported", "supported", "supported"),
+    )
+    assert state["final_answer"].sufficient_context is True
+    assert state["response_route"] == "generate_answer"
+
+
+def test_decomposed_query_with_missing_required_subquery_is_not_fully_sufficient() -> None:
+    state = _invoke_answer_graph(
+        assessment=_sufficient_assessment(),
+        decomposition_plan=_plan(),
+        subquery_coverage=[
+            _coverage("supported", "supported")[0],
+        ],
+    )
+    assessment = state["answerability_result"]
+    assert assessment.sufficient_context is False
+    assert assessment.should_answer is False
+    assert assessment.support_level == "partial"
+    assert state["response_route"] == "build_insufficient_response"
+
+
+def test_decomposed_query_with_optional_subquery_missing_can_still_be_sufficient() -> None:
+    state = _invoke_answer_graph(
+        assessment=_sufficient_assessment(),
+        decomposition_plan=_plan(),
+        subquery_coverage=_coverage("supported", "supported", "unsupported"),
+    )
+    assert state["answerability_result"].sufficient_context is True
+    assert state["response_route"] == "generate_answer"
+
+
+def test_decomposed_query_with_weak_required_support_routes_to_partial_or_insufficient_in_repo_consistent_way() -> None:
+    state = _invoke_answer_graph(
+        assessment=_sufficient_assessment(),
+        decomposition_plan=_plan(),
+        subquery_coverage=_coverage("supported", "weak", "supported"),
+    )
+    assessment = state["answerability_result"]
+    assert assessment.sufficient_context is False
+    assert assessment.should_answer is False
+    assert assessment.partially_supported is True
+    assert assessment.support_level == "partial"
+    assert assessment.insufficiency_reason == "partial_evidence_only"
+    assert state["response_route"] == "build_insufficient_response"
+
+
+def test_no_coverage_or_no_valid_decomposition_plan_falls_back_to_existing_answerability_behavior() -> None:
+    no_coverage_state = _invoke_answer_graph(
+        assessment=_sufficient_assessment(),
+        decomposition_plan=_plan(),
+        subquery_coverage=[],
+    )
+    no_plan_state = _invoke_answer_graph(
+        assessment=_sufficient_assessment(),
+        decomposition_plan=None,
+        subquery_coverage=_coverage("unsupported", "unsupported"),
+    )
+    assert no_coverage_state["answerability_result"].sufficient_context is True
+    assert no_coverage_state["response_route"] == "generate_answer"
+    assert no_plan_state["answerability_result"].sufficient_context is True
+    assert no_plan_state["response_route"] == "generate_answer"
+
+
+def test_non_decomposition_answerability_behavior_remains_unchanged() -> None:
+    baseline = _invoke_answer_graph(
+        assessment=_sufficient_assessment(),
+        decomposition_plan=None,
+        subquery_coverage=[],
+    )
+    assert baseline["answerability_result"] == _sufficient_assessment()
+    assert baseline["response_route"] == "generate_answer"
+
+
+def test_fallback_path_matches_main_answerability_behavior_if_applicable(monkeypatch: Any) -> None:
+    import agentic_rag.orchestration.legal_rag_graph as legal_graph_module
+
+    assessment = _sufficient_assessment()
+    decomposition_plan = _plan()
+    subquery_coverage = _coverage("supported", "weak", "supported")
+    state = default_legal_rag_state(query="compare clauses")
+    state["query_classification"] = _decision()
+    state["parent_chunks"] = [_parent("p1")]
+    state["decomposition_plan"] = decomposition_plan
+    state["subquery_coverage"] = subquery_coverage
+
+    main_app = build_answer_graph(
+        answer_generator=lambda *_args, **_kwargs: GenerateAnswerResult(
+            answer_text="Grounded answer",
+            grounded=True,
+            sufficient_context=True,
+            citations=[AnswerCitation(parent_chunk_id="p1", document_id=None, source_name=None, heading=None, supporting_excerpt="x")],
+            warnings=[],
+        ),
+        answerability_evaluator=lambda *_args, **_kwargs: assessment,
+    )
+    main_state = main_app.invoke(state)
+
+    monkeypatch.setattr(legal_graph_module, "StateGraph", None)
+    fallback_app = legal_graph_module.build_answer_graph(
+        answer_generator=lambda *_args, **_kwargs: GenerateAnswerResult(
+            answer_text="Grounded answer",
+            grounded=True,
+            sufficient_context=True,
+            citations=[AnswerCitation(parent_chunk_id="p1", document_id=None, source_name=None, heading=None, supporting_excerpt="x")],
+            warnings=[],
+        ),
+        answerability_evaluator=lambda *_args, **_kwargs: assessment,
+    )
+    fallback_state = fallback_app.invoke(state)
+
+    assert main_state["answerability_result"] == fallback_state["answerability_result"]
+    assert main_state["response_route"] == fallback_state["response_route"]

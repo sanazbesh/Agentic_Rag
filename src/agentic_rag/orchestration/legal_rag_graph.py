@@ -18,9 +18,11 @@ except Exception:  # pragma: no cover - fallback for constrained envs
     from agentic_rag._compat_pydantic import BaseModel, ConfigDict, Field
 
 from agentic_rag.orchestration.retrieval_graph import (
+    DecompositionPlan,
     RetrievalDependencies,
     RetrievalGraphConfig,
     RetrievalStageState,
+    SubqueryCoverageRecord,
     build_retrieval_graph,
     default_retrieval_state,
 )
@@ -158,6 +160,12 @@ def _copy_update(model: FinalAnswerModel, **updates: Any) -> FinalAnswerModel:
     return FinalAnswerModel(**payload)
 
 
+def _copy_update_answerability(model: AnswerabilityAssessment, **updates: Any) -> AnswerabilityAssessment:
+    payload = model.model_dump()
+    payload.update(updates)
+    return AnswerabilityAssessment(**payload)
+
+
 def _dedupe_preserve_order(values: Sequence[str]) -> list[str]:
     seen: set[str] = set()
     deduped: list[str] = []
@@ -167,6 +175,93 @@ def _dedupe_preserve_order(values: Sequence[str]) -> list[str]:
         seen.add(value)
         deduped.append(value)
     return deduped
+
+
+def _decomposition_coverage_gate_assessment(
+    *,
+    assessment: AnswerabilityAssessment,
+    decomposition_plan: DecompositionPlan | None,
+    subquery_coverage: Sequence[SubqueryCoverageRecord],
+) -> AnswerabilityAssessment:
+    """Apply required-subquery support gate before full sufficiency for decomposed queries."""
+
+    if decomposition_plan is None or not decomposition_plan.subqueries:
+        return assessment
+    if not subquery_coverage:
+        return assessment
+
+    required_subquery_ids = [subquery.id for subquery in decomposition_plan.subqueries if subquery.required and subquery.id]
+    if not required_subquery_ids:
+        return assessment
+
+    coverage_by_id = {item.subquery_id: item for item in subquery_coverage if item.subquery_id}
+    below_threshold_required: list[str] = []
+    weak_required: list[str] = []
+    unsupported_required: list[str] = []
+    supported_required_count = 0
+    for required_subquery_id in required_subquery_ids:
+        record = coverage_by_id.get(required_subquery_id)
+        if record is None:
+            below_threshold_required.append(required_subquery_id)
+            unsupported_required.append(required_subquery_id)
+            continue
+        if record.support_classification == "supported":
+            supported_required_count += 1
+            continue
+        below_threshold_required.append(required_subquery_id)
+        if record.support_classification == "weak":
+            weak_required.append(required_subquery_id)
+        else:
+            unsupported_required.append(required_subquery_id)
+
+    if not below_threshold_required:
+        return assessment
+
+    if not assessment.sufficient_context:
+        return _copy_update_answerability(
+            assessment,
+            evidence_notes=_dedupe_preserve_order(
+                [
+                    *list(assessment.evidence_notes),
+                    f"decomposition_required_subqueries_supported:{supported_required_count}/{len(required_subquery_ids)}",
+                ]
+            ),
+            warnings=_dedupe_preserve_order(
+                [
+                    *list(assessment.warnings),
+                    f"decomposition_required_subquery_coverage_below_threshold:{','.join(below_threshold_required)}",
+                ]
+            ),
+        )
+
+    support_level: Literal["weak", "partial"] = "partial" if supported_required_count > 0 else "weak"
+    partially_supported = support_level == "partial"
+    insufficiency_reason = "partial_evidence_only" if partially_supported else "topic_match_but_not_answer"
+    warning_suffix = ",".join(below_threshold_required)
+    evidence_notes = [
+        *list(assessment.evidence_notes),
+        f"decomposition_required_subqueries_supported:{supported_required_count}/{len(required_subquery_ids)}",
+    ]
+    if weak_required:
+        evidence_notes.append(f"decomposition_required_subqueries_weak:{','.join(weak_required)}")
+    if unsupported_required:
+        evidence_notes.append(f"decomposition_required_subqueries_unsupported:{','.join(unsupported_required)}")
+
+    return _copy_update_answerability(
+        assessment,
+        sufficient_context=False,
+        should_answer=False,
+        partially_supported=partially_supported,
+        support_level=support_level,
+        insufficiency_reason=insufficiency_reason,
+        evidence_notes=_dedupe_preserve_order(evidence_notes),
+        warnings=_dedupe_preserve_order(
+            [
+                *list(assessment.warnings),
+                f"decomposition_required_subquery_coverage_below_threshold:{warning_suffix}",
+            ]
+        ),
+    )
 
 
 def _extract_definition_subject(query: str) -> str | None:
@@ -323,6 +418,15 @@ class AnswerStageNodes:
 
         try:
             assessment = self.answerability_evaluator(query, query_understanding, context)
+            decomposition_plan = updated.get("decomposition_plan")
+            subquery_coverage = list(updated.get("subquery_coverage", []))
+            assessment = _decomposition_coverage_gate_assessment(
+                assessment=assessment,
+                decomposition_plan=decomposition_plan if isinstance(decomposition_plan, DecompositionPlan) else None,
+                subquery_coverage=[
+                    item for item in subquery_coverage if isinstance(item, SubqueryCoverageRecord)
+                ],
+            )
             updated["answerability_assessment"] = assessment
             updated["answerability_result"] = assessment
             should_generate_answer = bool(assessment.sufficient_context and assessment.should_answer)
