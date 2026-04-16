@@ -108,6 +108,49 @@ def test_start_date_question_accepts_commencement_date_evidence_without_literal_
     assert "employment_lifecycle_start_or_commencement_evidence_detected" in result.evidence_notes
 
 
+def test_lifecycle_when_question_without_extracted_date_is_not_sufficient() -> None:
+    query = "When did employment start?"
+    understanding = understand_query(query)
+    context = [
+        _parent(
+            "p-no-date",
+            "Term",
+            "Employment start/commencement language is present and duties begin after onboarding.",
+        )
+    ]
+
+    result = assess_answerability(query, understanding, context)
+
+    assert result.sufficient_context is False
+    assert result.insufficiency_reason == "fact_not_found"
+
+
+def test_lifecycle_when_question_without_extracted_date_does_not_emit_placeholder_as_successful_answer() -> None:
+    query = "When did employment start?"
+    context = [
+        _parent(
+            "p-no-date",
+            "Term",
+            "Employment start/commencement language is present and duties begin after onboarding.",
+        )
+    ]
+
+    answer = generate_answer(context, query)
+
+    assert answer.sufficient_context is False
+    assert answer.grounded is False
+    assert "Employment start/commencement language is present." not in answer.answer_text
+
+
+def test_lifecycle_when_question_with_valid_extracted_date_still_returns_sufficient_answer() -> None:
+    query = "When did employment start?"
+    answer = generate_answer(_lifecycle_context(), query)
+
+    assert answer.sufficient_context is True
+    assert answer.grounded is True
+    assert "January 9, 2023" in answer.answer_text
+
+
 def test_compensation_question_uses_compensation_section_when_present() -> None:
     query = "What were the compensation terms?"
     understanding = understand_query(query)
@@ -169,9 +212,9 @@ def test_roe_question_uses_roe_reference_when_present() -> None:
     result = assess_answerability(query, understanding, _lifecycle_context())
     answer = generate_answer(_lifecycle_context(), query)
 
-    assert result.sufficient_context is True
-    assert "employment_lifecycle_roe_evidence_detected" in result.evidence_notes
-    assert "record of employment" in answer.answer_text.lower()
+    assert result.sufficient_context is False
+    assert result.insufficiency_reason == "fact_not_found"
+    assert answer.sufficient_context is False
 
 
 def test_missing_or_ambiguous_lifecycle_evidence_fails_safely() -> None:
@@ -187,6 +230,15 @@ def test_missing_or_ambiguous_lifecycle_evidence_fails_safely() -> None:
 
 
 def test_non_lifecycle_clause_lookup_behavior_remains_unchanged() -> None:
+    query = "What does the document say about confidentiality?"
+    understanding = understand_query(query)
+    result = assess_answerability(query, understanding, _lifecycle_context())
+
+    assert understanding.answerability_expectation == "clause_lookup"
+    assert result.sufficient_context is True
+
+
+def test_unrelated_non_lifecycle_behavior_remains_unchanged() -> None:
     query = "What does the document say about confidentiality?"
     understanding = understand_query(query)
     result = assess_answerability(query, understanding, _lifecycle_context())

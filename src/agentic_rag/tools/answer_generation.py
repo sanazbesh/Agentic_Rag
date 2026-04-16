@@ -580,6 +580,8 @@ class LegalAnswerSynthesizer:
         match = self._resolve_employment_lifecycle_value(context, target)
         if match is None:
             return self._insufficient_response("insufficient_context: employment lifecycle-responsive evidence not found")
+        if self._is_lifecycle_when_date_required_query(lowered_query, target) and not self._contains_concrete_date(str(match["value"])):
+            return self._insufficient_response("insufficient_context: lifecycle date value not found")
 
         citation = AnswerCitation(
             parent_chunk_id=match["parent_chunk_id"],
@@ -633,7 +635,9 @@ class LegalAnswerSynthesizer:
             text = str(item.get("text") or "")
             heading = str(item.get("heading") or "")
             haystack = f"{heading}\n{text}"
-            value = self._extract_employment_lifecycle_value(haystack, target)
+            value = self._extract_employment_lifecycle_value(text, target)
+            if not value:
+                value = self._extract_employment_lifecycle_value(haystack, target)
             if not value:
                 continue
             excerpt = self._best_excerpt(text or haystack, value)
@@ -702,6 +706,20 @@ class LegalAnswerSynthesizer:
         if target == "severance":
             return f"The severance evidence states: {value}."
         return f"The ROE evidence states: {value}."
+
+    def _is_lifecycle_when_date_required_query(self, lowered_query: str, target: str) -> bool:
+        if "when" not in lowered_query:
+            return False
+        return target in {"offer_acceptance", "employment_start", "probation", "termination_effective", "roe"}
+
+    def _contains_concrete_date(self, value: str) -> bool:
+        return bool(
+            re.search(
+                r"\b(?:\d{4}-\d{2}-\d{2}|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+\d{1,2},\s*\d{4})\b",
+                value or "",
+                flags=re.IGNORECASE,
+            )
+        )
 
     def _is_chronology_question(self, lowered_query: str) -> bool:
         patterns = (

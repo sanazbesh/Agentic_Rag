@@ -935,6 +935,7 @@ class AnswerabilityAssessor:
         substantive: Sequence[Mapping[str, str]],
     ) -> dict[str, object]:
         lowered_query = self._canonical_phrase(query)
+        requires_date = self._is_lifecycle_when_date_required_query(lowered_query)
         if not substantive:
             return {"supported": False, "signals": [], "missing": ["employment_lifecycle_responsive_evidence"]}
 
@@ -950,13 +951,28 @@ class AnswerabilityAssessor:
                 return True
             return False
 
+        def has_responsive_dated_evidence(required: Sequence[str], any_of: Sequence[str] = ()) -> bool:
+            for item in substantive:
+                text = self._canonical_phrase(f"{item.get('heading', '')} {item.get('text', '')}")
+                if not text:
+                    continue
+                if not all(token in text for token in required):
+                    continue
+                if any_of and not any(token in text for token in any_of):
+                    continue
+                raw_text = f"{item.get('heading', '')} {item.get('text', '')}"
+                if self._extract_datetimes(raw_text):
+                    return True
+            return False
+
         if "offer" in lowered_query and "accept" in lowered_query:
-            if has_responsive_evidence(("offer",), ("accept", "accepted", "acceptance")):
+            if has_responsive_dated_evidence(("offer",), ("accept", "accepted", "acceptance")) if requires_date else has_responsive_evidence(("offer",), ("accept", "accepted", "acceptance")):
                 return {"supported": True, "signals": ["employment_lifecycle_offer_acceptance_evidence_detected"], "missing": []}
-            return {"supported": False, "signals": [], "missing": ["offer_and_acceptance_evidence"]}
+            missing = "offer_and_acceptance_dated_evidence" if requires_date else "offer_and_acceptance_evidence"
+            return {"supported": False, "signals": [], "missing": [missing]}
 
         if any(token in lowered_query for token in ("start date", "commencement", "employment begin", "employment start", "employment relationship begin")):
-            if (
+            has_support = (
                 has_responsive_evidence(("employment",), ("effective date", "commence", "start", "began", "begin"))
                 or has_responsive_evidence(("commencement",), ("date",))
                 or has_responsive_evidence(
@@ -964,7 +980,14 @@ class AnswerabilityAssessor:
                     ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec", "20", "19"),
                 )
                 or has_responsive_evidence(("start date",))
-            ):
+            )
+            has_dated_support = (
+                has_responsive_dated_evidence(("employment",), ("effective date", "commence", "start", "began", "begin"))
+                or has_responsive_dated_evidence(("commencement",), ("date",))
+                or has_responsive_dated_evidence(("effective date",))
+                or has_responsive_dated_evidence(("start date",))
+            )
+            if (has_dated_support if requires_date else has_support):
                 return {
                     "supported": True,
                     "signals": [
@@ -973,12 +996,14 @@ class AnswerabilityAssessor:
                     ],
                     "missing": [],
                 }
-            return {"supported": False, "signals": [], "missing": ["employment_start_or_commencement_evidence"]}
+            missing = "employment_start_or_commencement_dated_evidence" if requires_date else "employment_start_or_commencement_evidence"
+            return {"supported": False, "signals": [], "missing": [missing]}
 
         if "probation" in lowered_query:
-            if has_responsive_evidence(("probation",), ("month", "day", "end", "period", "complete")):
+            if has_responsive_dated_evidence(("probation",), ("month", "day", "end", "period", "complete")) if requires_date else has_responsive_evidence(("probation",), ("month", "day", "end", "period", "complete")):
                 return {"supported": True, "signals": ["employment_lifecycle_probation_evidence_detected"], "missing": []}
-            return {"supported": False, "signals": [], "missing": ["probation_term_or_end_evidence"]}
+            missing = "probation_term_or_end_dated_evidence" if requires_date else "probation_term_or_end_evidence"
+            return {"supported": False, "signals": [], "missing": [missing]}
 
         if any(token in lowered_query for token in ("compensation", "salary", "wage", "remuneration")):
             if has_responsive_evidence(("compensation",), ("salary", "base", "$", "annual", "bonus")) or has_responsive_evidence(("salary",)):
@@ -991,9 +1016,10 @@ class AnswerabilityAssessor:
             return {"supported": False, "signals": [], "missing": ["benefits_terms_or_eligibility_evidence"]}
 
         if "termination" in lowered_query and any(token in lowered_query for token in ("effective", "take effect", "date", "terminated")):
-            if has_responsive_evidence(("termination",), ("effective", "terminated on", "date", "cease")):
+            if has_responsive_dated_evidence(("termination",), ("effective", "terminated on", "date", "cease")) if requires_date else has_responsive_evidence(("termination",), ("effective", "terminated on", "date", "cease")):
                 return {"supported": True, "signals": ["employment_lifecycle_termination_effective_evidence_detected"], "missing": []}
-            return {"supported": False, "signals": [], "missing": ["termination_effective_date_evidence"]}
+            missing = "termination_effective_dated_evidence" if requires_date else "termination_effective_date_evidence"
+            return {"supported": False, "signals": [], "missing": [missing]}
 
         if "severance" in lowered_query:
             if has_responsive_evidence(("severance",), ("pay", "payable", "weeks", "salary", "offered")):
@@ -1001,11 +1027,29 @@ class AnswerabilityAssessor:
             return {"supported": False, "signals": [], "missing": ["severance_terms_evidence"]}
 
         if "roe" in lowered_query or "record of employment" in lowered_query:
-            if has_responsive_evidence(("record of employment",), ("roe", "issued", "issue", "provide", "days")) or has_responsive_evidence(("roe",), ("issued", "issue", "provide", "days")):
+            has_support = has_responsive_evidence(("record of employment",), ("roe", "issued", "issue", "provide", "days")) or has_responsive_evidence(("roe",), ("issued", "issue", "provide", "days"))
+            has_dated_support = has_responsive_dated_evidence(("record of employment",), ("roe", "issued", "issue", "provide", "days")) or has_responsive_dated_evidence(("roe",), ("issued", "issue", "provide", "days"))
+            if (has_dated_support if requires_date else has_support):
                 return {"supported": True, "signals": ["employment_lifecycle_roe_evidence_detected"], "missing": []}
-            return {"supported": False, "signals": [], "missing": ["roe_issuance_timing_or_reference_evidence"]}
+            missing = "roe_issuance_dated_evidence" if requires_date else "roe_issuance_timing_or_reference_evidence"
+            return {"supported": False, "signals": [], "missing": [missing]}
 
         return {"supported": False, "signals": [], "missing": ["employment_lifecycle_responsive_evidence"]}
+
+    def _is_lifecycle_when_date_required_query(self, lowered_query: str) -> bool:
+        return "when" in lowered_query and any(
+            token in lowered_query
+            for token in (
+                "start",
+                "commencement",
+                "probation",
+                "termination",
+                "roe",
+                "record of employment",
+                "offer",
+                "accept",
+            )
+        )
 
     def _evaluate_chronology_support(
         self,
