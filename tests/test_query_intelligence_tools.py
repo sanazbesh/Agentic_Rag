@@ -257,3 +257,13 @@ def test_rewrite_query_expands_matter_document_metadata_query_for_caption_header
     assert result.rewrite_notes == "matter_document_metadata_query_expansion"
     assert "caption" in result.rewritten_query.lower()
     assert "matter information" in result.rewritten_query.lower()
+
+
+def test_rewrite_query_expands_employment_lifecycle_query_for_lifecycle_clause_retrieval() -> None:
+    query = "When did employment start?"
+
+    result = rewrite_query(query)
+
+    assert result.rewrite_notes == "employment_contract_lifecycle_query_expansion"
+    assert "commencement" in result.rewritten_query.lower()
+    assert "compensation" in result.rewritten_query.lower()
