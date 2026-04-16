@@ -392,6 +392,37 @@ class QueryTransformationService:
     )
     llm_client: QueryTransformationLLM | None = None
 
+    _PARTY_ROLE_QUERY_PATTERNS: tuple[re.Pattern[str], ...] = (
+        re.compile(r"\bwho\s+is\s+the\s+(employer|employee)\b", flags=re.IGNORECASE),
+        re.compile(r"\bwho\s+are\s+the\s+parties\b", flags=re.IGNORECASE),
+        re.compile(r"\bwhich\s+company\s+is\s+this\s+agreement\s+for\b", flags=re.IGNORECASE),
+        re.compile(r"\bis\s+this\s+agreement\s+between\b", flags=re.IGNORECASE),
+    )
+
+    def _is_party_role_entity_query(self, query: str) -> bool:
+        normalized = (query or "").strip()
+        if not normalized:
+            return False
+        return any(pattern.search(normalized) for pattern in self._PARTY_ROLE_QUERY_PATTERNS)
+
+    def _expand_party_role_query(self, query: str) -> str:
+        normalized = re.sub(r"\s+", " ", (query or "").strip())
+        if not normalized:
+            return ""
+
+        expansion_terms = [
+            "agreement parties",
+            "between",
+            "by and between",
+            "made effective",
+            "employment agreement",
+            "employer",
+            "employee",
+            "company",
+        ]
+        expanded = f"{normalized} {' '.join(expansion_terms)}"
+        return re.sub(r"\s+", " ", expanded).strip()
+
     def rewrite_query(
         self,
         query: str,
@@ -408,6 +439,14 @@ class QueryTransformationService:
                 rewritten_query="",
                 used_conversation_context=False,
                 rewrite_notes="empty_input",
+            )
+
+        if self._is_party_role_entity_query(normalized_query):
+            return QueryRewriteResult(
+                original_query=original_query,
+                rewritten_query=self._expand_party_role_query(normalized_query),
+                used_conversation_context=False,
+                rewrite_notes="party_role_entity_query_expansion",
             )
 
         context_blob = _build_context_blob(conversation_summary, recent_messages)

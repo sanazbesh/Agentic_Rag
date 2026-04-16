@@ -177,3 +177,20 @@ def test_canonical_tricky_followup_example() -> None:
     assert result.is_context_dependent is True
     assert result.use_conversation_context is True
     assert result.resolved_document_hints == ["Mutual NDA"]
+
+
+def test_party_question_recognized_as_legal_party_role_query() -> None:
+    result = understand_query("who is the employer?")
+
+    assert result.question_type == "extractive_fact_query"
+    assert result.answerability_expectation == "fact_extraction"
+    assert "legal_question_family:party_role_entity" in result.routing_notes
+    assert result.should_rewrite is True
+
+
+def test_non_party_clause_lookup_behavior_remains_unchanged() -> None:
+    result = understand_query("what does the document say about confidentiality?")
+
+    assert result.question_type == "document_content_query"
+    assert result.answerability_expectation == "clause_lookup"
+    assert "legal_question_family:party_role_entity" not in result.routing_notes

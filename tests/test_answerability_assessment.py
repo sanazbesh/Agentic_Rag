@@ -882,3 +882,118 @@ def test_assess_answerability_strength_failure_safe_fallback(monkeypatch) -> Non
     assert result.sufficient_context is False
     assert result.should_answer is False
     assert any(w.startswith("strength_evaluation_failed:") for w in result.warnings)
+
+
+def test_agreement_intro_line_can_support_party_question() -> None:
+    query = "who are the parties to this agreement?"
+    understanding = understand_query(query)
+    context = [
+        _parent(
+            "p1",
+            (
+                "This Employment Agreement is made effective as of January 1, 2025, by and between Acme Corp and Jane Smith. "
+                "The opening recital identifies the contracting parties for all obligations in this Agreement."
+            ),
+            heading="Introduction",
+        )
+    ]
+
+    result = assess_answerability(query, understanding, context)
+
+    assert result.sufficient_context is True
+    assert "party_role_responsive_evidence_detected" in result.evidence_notes
+
+
+def test_who_is_the_employer_uses_party_role_evidence_not_unrelated_clause_text() -> None:
+    query = "who is the employer?"
+    understanding = understand_query(query)
+    context = [
+        _parent(
+            "p1",
+            "This Agreement is governed by New York law and includes confidentiality obligations for both parties.",
+            heading="Confidentiality",
+        )
+    ]
+
+    result = assess_answerability(query, understanding, context)
+
+    assert result.sufficient_context is False
+    assert result.insufficiency_reason == "fact_not_found"
+
+
+def test_who_are_the_parties_returns_party_evidence_when_present() -> None:
+    query = "who are the parties?"
+    understanding = understand_query(query)
+    context = [
+        _parent(
+            "p1",
+            (
+                "The parties to this Agreement are Acme Corp (the Employer) and Jane Smith (the Employee). "
+                "These identified parties are the signatories and are bound by the operative provisions below."
+            ),
+            heading="Parties",
+        )
+    ]
+
+    result = assess_answerability(query, understanding, context)
+
+    assert result.sufficient_context is True
+    assert result.should_answer is True
+
+
+def test_which_company_is_this_agreement_for_uses_entity_evidence_when_present() -> None:
+    query = "which company is this agreement for?"
+    understanding = understand_query(query)
+    context = [
+        _parent(
+            "p1",
+            (
+                "This Agreement is made by and between Acme Holdings, Inc. and John Roe. "
+                "The introductory statement names the company entity associated with this agreement."
+            ),
+            heading="Introductory Statement",
+        )
+    ]
+
+    result = assess_answerability(query, understanding, context)
+
+    assert result.sufficient_context is True
+    assert result.should_answer is True
+
+
+def test_missing_party_role_evidence_fails_safely() -> None:
+    query = "who is the employee?"
+    understanding = understand_query(query)
+    context = [
+        _parent(
+            "p1",
+            "Either party may terminate this Agreement with thirty (30) days written notice.",
+            heading="Termination",
+        )
+    ]
+
+    result = assess_answerability(query, understanding, context)
+
+    assert result.sufficient_context is False
+    assert result.should_answer is False
+    assert result.insufficiency_reason == "fact_not_found"
+
+
+def test_non_party_clause_lookup_behavior_remains_unchanged_in_answerability() -> None:
+    query = "what does the document say about confidentiality?"
+    understanding = understand_query(query)
+    context = [
+        _parent(
+            "p1",
+            (
+                "The receiving party shall keep confidential information confidential and may disclose it only when required "
+                "by law, with prior written notice where legally permitted."
+            ),
+            heading="Confidentiality",
+        )
+    ]
+
+    result = assess_answerability(query, understanding, context)
+
+    assert understanding.answerability_expectation == "clause_lookup"
+    assert result.sufficient_context is True

@@ -174,6 +174,25 @@ def _hint_match_confidence(subject: str, hints: Sequence[str]) -> float:
     return best
 
 
+
+
+def _is_party_role_entity_query(normalized_query: str) -> bool:
+    lowered = _canonicalize_phrase(normalized_query)
+    if not lowered:
+        return False
+
+    role_markers = ("employer", "employee", "parties", "party", "company", "entity")
+    if any(marker in lowered for marker in role_markers):
+        role_intents = ("who is", "who are", "which", "what", "is this agreement", "agreement for")
+        if any(intent in lowered for intent in role_intents):
+            return True
+
+    if lowered.startswith("is this agreement between") or lowered.startswith("is the agreement between"):
+        return True
+    if "which company is this agreement for" in lowered:
+        return True
+    return False
+
 def understand_query(
     query: str,
     conversation_summary: str | None = None,
@@ -192,6 +211,7 @@ def understand_query(
     normalized = " ".join(original.split())
     lowered = normalized.lower()
     context_available = bool(_text(conversation_summary) or list(recent_messages or []))
+    is_party_role_entity_query = _is_party_role_entity_query(normalized)
 
     meta_markers = ("how many documents", "what files are loaded", "what documents are uploaded", "what docs are loaded")
     comparison_markers = ("compare", "differ", "difference", "vs ", "versus")
@@ -260,7 +280,7 @@ def understand_query(
         question_type = "document_summary_query"
     elif explicit_document_scope and any(marker in lowered for marker in doc_content_markers):
         question_type = "document_content_query"
-    elif any(marker in lowered for marker in extractive_markers):
+    elif is_party_role_entity_query or any(marker in lowered for marker in extractive_markers):
         question_type = "extractive_fact_query"
     elif lowered.startswith(definition_starters):
         question_type = "definition_query"
@@ -387,8 +407,12 @@ def understand_query(
         answerability = "general_grounded_response"
         should_retrieve = True
 
-    should_rewrite = question_type in {"ambiguous_query"} or (is_context_dependent and not explicit_document_scope)
-    should_extract_entities = any(
+    should_rewrite = (
+        question_type in {"ambiguous_query"}
+        or (is_context_dependent and not explicit_document_scope)
+        or is_party_role_entity_query
+    )
+    should_extract_entities = is_party_role_entity_query or any(
         marker in lowered
         for marker in ("law", "jurisdiction", "court", "statute", "regulation", "clause", "section", "ontario", "california")
     )
@@ -404,6 +428,8 @@ def understand_query(
         routing_notes.append("rewrite_recommended")
     if should_extract_entities:
         routing_notes.append("entity_extraction_useful")
+    if is_party_role_entity_query:
+        routing_notes.append("legal_question_family:party_role_entity")
 
     if question_type == "other_query" and refers_to_prior_document_scope and not context_available:
         ambiguity_notes.append("pronoun_reference_without_resolvable_scope")
