@@ -82,6 +82,17 @@ def test_regression_definition_query_debug_contains_answerability_result() -> No
     assert payload["answerability_result"]["question_type"] == "definition_query"
 
 
+def test_debug_warning_aggregation_dedupes_identical_definition_not_supported_warnings() -> None:
+    services = _services_with_context(query="what is employment agreement?")
+    _, state = run_legal_rag_turn_with_state(
+        query="what is employment agreement?",
+        dependencies=services.as_dependencies(),
+    )
+    payload = build_real_debug_payload(latest_state=dict(state), selected_documents=[])
+    warnings = payload["warnings"]
+    assert len(warnings) == len(set(warnings))
+
+
 def test_real_debug_payload_explicitly_surfaces_decomposition_gate_from_state() -> None:
     services = _services_with_context(query="Compare governing law and dispute resolution clauses.")
     _, state = run_legal_rag_turn_with_state(

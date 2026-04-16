@@ -7,6 +7,7 @@ production behavior stays deterministic, debuggable, and non-agentic.
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, cast
@@ -17,9 +18,11 @@ except Exception:  # pragma: no cover - fallback for constrained envs
     from agentic_rag._compat_pydantic import BaseModel, ConfigDict, Field
 
 from agentic_rag.orchestration.retrieval_graph import (
+    DecompositionPlan,
     RetrievalDependencies,
     RetrievalGraphConfig,
     RetrievalStageState,
+    SubqueryCoverageRecord,
     build_retrieval_graph,
     default_retrieval_state,
 )
@@ -54,6 +57,21 @@ class FinalAnswerModel(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class SubqueryGroundedSubanswer(BaseModel):
+    """Intermediate per-subquery grounded answer artifact for future synthesis."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    subquery_id: str
+    subquery_question: str
+    answer_text: str
+    grounded: bool
+    support_classification: Literal["supported", "weak", "unsupported"]
+    citations: list[AnswerCitation] = Field(default_factory=list)
+    insufficiency_reason: str | None = None
+    warnings: list[str] = Field(default_factory=list)
+
+
 class LegalRagState(RetrievalStageState, total=False):
     """Retrieval + answer stage state.
 
@@ -74,6 +92,7 @@ class LegalRagState(RetrievalStageState, total=False):
     should_return_partial_response: bool
     should_return_insufficient_response: bool
     response_route: str
+    subquery_subanswers: list[SubqueryGroundedSubanswer]
 
 
 class AnswerGenerator(Protocol):
@@ -136,6 +155,7 @@ def default_legal_rag_state(
             "should_return_partial_response": False,
             "should_return_insufficient_response": True,
             "response_route": "unresolved",
+            "subquery_subanswers": [],
         }
     )
     return cast(LegalRagState, merged)
@@ -155,6 +175,121 @@ def _copy_update(model: FinalAnswerModel, **updates: Any) -> FinalAnswerModel:
     payload = model.model_dump()
     payload.update(updates)
     return FinalAnswerModel(**payload)
+
+
+def _copy_update_answerability(model: AnswerabilityAssessment, **updates: Any) -> AnswerabilityAssessment:
+    payload = model.model_dump()
+    payload.update(updates)
+    return AnswerabilityAssessment(**payload)
+
+
+def _dedupe_preserve_order(values: Sequence[str]) -> list[str]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        deduped.append(value)
+    return deduped
+
+
+def _decomposition_coverage_gate_assessment(
+    *,
+    assessment: AnswerabilityAssessment,
+    decomposition_plan: DecompositionPlan | None,
+    subquery_coverage: Sequence[SubqueryCoverageRecord],
+) -> AnswerabilityAssessment:
+    """Apply required-subquery support gate before full sufficiency for decomposed queries."""
+
+    if decomposition_plan is None or not decomposition_plan.subqueries:
+        return assessment
+    if not subquery_coverage:
+        return assessment
+
+    required_subquery_ids = [subquery.id for subquery in decomposition_plan.subqueries if subquery.required and subquery.id]
+    if not required_subquery_ids:
+        return assessment
+
+    coverage_by_id = {item.subquery_id: item for item in subquery_coverage if item.subquery_id}
+    below_threshold_required: list[str] = []
+    weak_required: list[str] = []
+    unsupported_required: list[str] = []
+    supported_required_count = 0
+    for required_subquery_id in required_subquery_ids:
+        record = coverage_by_id.get(required_subquery_id)
+        if record is None:
+            below_threshold_required.append(required_subquery_id)
+            unsupported_required.append(required_subquery_id)
+            continue
+        if record.support_classification == "supported":
+            supported_required_count += 1
+            continue
+        below_threshold_required.append(required_subquery_id)
+        if record.support_classification == "weak":
+            weak_required.append(required_subquery_id)
+        else:
+            unsupported_required.append(required_subquery_id)
+
+    if not below_threshold_required:
+        return assessment
+
+    if not assessment.sufficient_context:
+        return _copy_update_answerability(
+            assessment,
+            evidence_notes=_dedupe_preserve_order(
+                [
+                    *list(assessment.evidence_notes),
+                    f"decomposition_required_subqueries_supported:{supported_required_count}/{len(required_subquery_ids)}",
+                ]
+            ),
+            warnings=_dedupe_preserve_order(
+                [
+                    *list(assessment.warnings),
+                    f"decomposition_required_subquery_coverage_below_threshold:{','.join(below_threshold_required)}",
+                ]
+            ),
+        )
+
+    support_level: Literal["weak", "partial"] = "partial" if supported_required_count > 0 else "weak"
+    partially_supported = support_level == "partial"
+    insufficiency_reason = "partial_evidence_only" if partially_supported else "topic_match_but_not_answer"
+    warning_suffix = ",".join(below_threshold_required)
+    evidence_notes = [
+        *list(assessment.evidence_notes),
+        f"decomposition_required_subqueries_supported:{supported_required_count}/{len(required_subquery_ids)}",
+    ]
+    if weak_required:
+        evidence_notes.append(f"decomposition_required_subqueries_weak:{','.join(weak_required)}")
+    if unsupported_required:
+        evidence_notes.append(f"decomposition_required_subqueries_unsupported:{','.join(unsupported_required)}")
+
+    return _copy_update_answerability(
+        assessment,
+        sufficient_context=False,
+        should_answer=False,
+        partially_supported=partially_supported,
+        support_level=support_level,
+        insufficiency_reason=insufficiency_reason,
+        evidence_notes=_dedupe_preserve_order(evidence_notes),
+        warnings=_dedupe_preserve_order(
+            [
+                *list(assessment.warnings),
+                f"decomposition_required_subquery_coverage_below_threshold:{warning_suffix}",
+            ]
+        ),
+    )
+
+
+def _extract_definition_subject(query: str) -> str | None:
+    normalized = " ".join(str(query or "").split()).strip()
+    if not normalized:
+        return None
+    match = re.match(r"^what\s+is(?:\s+the)?\s+(.+?)(?:\?)?$", normalized, flags=re.IGNORECASE)
+    if not match:
+        return None
+    subject = match.group(1).strip(" \"'`")
+    return subject or None
 
 
 def _coerce_citation(item: object) -> AnswerCitation:
@@ -223,6 +358,94 @@ def _validate_answer_payload(payload: object) -> FinalAnswerModel:
             warnings=[*answer.warnings, "grounding_adjusted:no_citations"],
         )
     return answer
+
+
+def _dedupe_citations_preserve_order(citations: Sequence[AnswerCitation]) -> list[AnswerCitation]:
+    seen: set[tuple[str, str | None, str | None, str | None, str | None]] = set()
+    deduped: list[AnswerCitation] = []
+    for citation in citations:
+        key = (
+            citation.parent_chunk_id,
+            citation.document_id,
+            citation.source_name,
+            citation.heading,
+            citation.supporting_excerpt,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(citation)
+    return deduped
+
+
+def _synthesize_from_grounded_subanswers(
+    *,
+    decomposition_plan: DecompositionPlan | None,
+    subquery_subanswers: Sequence[SubqueryGroundedSubanswer],
+    baseline_warnings: Sequence[str],
+    sufficient_context: bool,
+) -> FinalAnswerModel | None:
+    """Compose decomposed final answer strictly from grounded subanswers + explicit gaps."""
+
+    if not isinstance(decomposition_plan, DecompositionPlan) or not decomposition_plan.subqueries:
+        return None
+    if not subquery_subanswers:
+        return None
+
+    by_id = {item.subquery_id: item for item in subquery_subanswers if item.subquery_id}
+    supported_sections: list[str] = []
+    aggregated_citations: list[AnswerCitation] = []
+    required_gap_ids: list[str] = []
+    gap_lines: list[str] = []
+    subanswer_warnings: list[str] = []
+
+    for subquery in decomposition_plan.subqueries:
+        artifact = by_id.get(subquery.id)
+        if artifact is None:
+            if subquery.required:
+                required_gap_ids.append(subquery.id)
+                gap_lines.append(f"- Required gap: {subquery.question} (reason: no_subanswer_artifact)")
+            else:
+                gap_lines.append(f"- Optional gap: {subquery.question} (reason: no_subanswer_artifact)")
+            continue
+
+        subanswer_warnings.extend(list(artifact.warnings))
+        is_supported = artifact.support_classification == "supported" and artifact.grounded and bool(artifact.citations)
+        if is_supported:
+            supported_sections.append(f"- {subquery.question}: {artifact.answer_text}")
+            aggregated_citations.extend(list(artifact.citations))
+            continue
+
+        reason = artifact.insufficiency_reason or f"subquery_not_{artifact.support_classification}"
+        if subquery.required:
+            required_gap_ids.append(subquery.id)
+            gap_lines.append(f"- Required gap: {subquery.question} (reason: {reason})")
+        else:
+            gap_lines.append(f"- Optional gap: {subquery.question} (reason: {reason})")
+
+    aggregated_citations = _dedupe_citations_preserve_order(aggregated_citations)
+    if not supported_sections:
+        return None
+
+    sections = ["Direct answer (synthesized from grounded subanswers):", *supported_sections]
+    if gap_lines:
+        sections.extend(["", "Support gaps:", *gap_lines])
+    answer_text = "\n".join(sections)
+
+    merged_warnings = _dedupe_preserve_order(
+        [
+            *list(baseline_warnings),
+            *subanswer_warnings,
+            *([f"decomposition_required_support_gaps:{','.join(required_gap_ids)}"] if required_gap_ids else []),
+        ]
+    )
+    return FinalAnswerModel(
+        answer_text=answer_text,
+        grounded=bool(aggregated_citations),
+        sufficient_context=bool(sufficient_context),
+        citations=aggregated_citations,
+        warnings=merged_warnings,
+    )
 
 
 class AnswerStageNodes:
@@ -300,6 +523,15 @@ class AnswerStageNodes:
 
         try:
             assessment = self.answerability_evaluator(query, query_understanding, context)
+            decomposition_plan = updated.get("decomposition_plan")
+            subquery_coverage = list(updated.get("subquery_coverage", []))
+            assessment = _decomposition_coverage_gate_assessment(
+                assessment=assessment,
+                decomposition_plan=decomposition_plan if isinstance(decomposition_plan, DecompositionPlan) else None,
+                subquery_coverage=[
+                    item for item in subquery_coverage if isinstance(item, SubqueryCoverageRecord)
+                ],
+            )
             updated["answerability_assessment"] = assessment
             updated["answerability_result"] = assessment
             should_generate_answer = bool(assessment.sufficient_context and assessment.should_answer)
@@ -326,6 +558,141 @@ class AnswerStageNodes:
             logger.info("node_exit name=assess_answerability success=false reason=%s", type(exc).__name__)
         return cast(LegalRagState, updated)
 
+    def generate_subquery_subanswers(self, state: LegalRagState) -> LegalRagState:
+        """Generate one intermediate grounded subanswer for each covered subquery."""
+
+        logger.info("node_enter name=generate_subquery_subanswers")
+        updated = dict(state)
+        warnings = list(updated.get("warnings", []))
+        plan = updated.get("decomposition_plan")
+        should_generate_answer = bool(updated.get("should_generate_answer", False))
+        assessment = updated.get("answerability_result")
+        decomposition_gap_override = False
+        if isinstance(assessment, AnswerabilityAssessment):
+            decomposition_gap_override = any(
+                str(warning).startswith("decomposition_required_subquery_coverage_below_threshold:")
+                for warning in assessment.warnings
+            )
+        allow_subanswer_generation = should_generate_answer or decomposition_gap_override
+        coverage_records = [
+            item for item in list(updated.get("subquery_coverage", [])) if isinstance(item, SubqueryCoverageRecord)
+        ]
+        answer_context = list(updated.get("answer_context", []))
+
+        if not isinstance(plan, DecompositionPlan) or not plan.subqueries or not coverage_records:
+            updated["subquery_subanswers"] = []
+            logger.info("node_exit name=generate_subquery_subanswers skipped=true")
+            return cast(LegalRagState, updated)
+
+        subquery_by_id = {subquery.id: subquery for subquery in plan.subqueries if subquery.id}
+        subanswers: list[SubqueryGroundedSubanswer] = []
+        for record in coverage_records:
+            subquery = subquery_by_id.get(record.subquery_id)
+            subquery_question = subquery.question if subquery is not None else ""
+
+            if record.support_classification != "supported":
+                subanswers.append(
+                    SubqueryGroundedSubanswer(
+                        subquery_id=record.subquery_id,
+                        subquery_question=subquery_question,
+                        answer_text="No grounded subanswer generated due to insufficient subquery support.",
+                        citations=[],
+                        grounded=False,
+                        support_classification=record.support_classification,
+                        insufficiency_reason=record.insufficiency_reason,
+                        warnings=[
+                            f"subquery_not_answerable:{record.support_classification}",
+                            *(
+                                [f"subquery_insufficiency_reason:{record.insufficiency_reason}"]
+                                if record.insufficiency_reason
+                                else []
+                            ),
+                        ],
+                    )
+                )
+                continue
+
+            if not allow_subanswer_generation:
+                subanswers.append(
+                    SubqueryGroundedSubanswer(
+                        subquery_id=record.subquery_id,
+                        subquery_question=subquery_question,
+                        answer_text="No grounded subanswer generated because answerability did not approve subquery synthesis.",
+                        citations=[],
+                        grounded=False,
+                        support_classification="weak",
+                        insufficiency_reason="answerability_gate_blocked_subquery_synthesis",
+                        warnings=["subquery_generation_blocked_by_answerability_gate"],
+                    )
+                )
+                continue
+
+            allowed_parent_ids = {
+                parent_chunk_id
+                for parent_chunk_id in record.evidence_parent_chunk_ids
+                if isinstance(parent_chunk_id, str) and parent_chunk_id
+            }
+            scoped_context = [
+                item
+                for item in answer_context
+                if str(getattr(item, "parent_chunk_id", "") or (item.get("parent_chunk_id") if isinstance(item, Mapping) else ""))
+                in allowed_parent_ids
+            ]
+            if not scoped_context:
+                subanswers.append(
+                    SubqueryGroundedSubanswer(
+                        subquery_id=record.subquery_id,
+                        subquery_question=subquery_question,
+                        answer_text="No grounded subanswer generated because no subquery-linked evidence was available.",
+                        citations=[],
+                        grounded=False,
+                        support_classification="unsupported",
+                        insufficiency_reason="no_subquery_scoped_context",
+                        warnings=["subquery_scoped_context_empty"],
+                    )
+                )
+                continue
+
+            try:
+                raw = self.answer_generator(scoped_context, subquery_question)
+                validated = _validate_answer_payload(raw)
+                filtered_citations = [
+                    citation for citation in validated.citations if citation.parent_chunk_id in allowed_parent_ids
+                ]
+                citation_scope_warnings = []
+                if len(filtered_citations) != len(validated.citations):
+                    citation_scope_warnings.append("subquery_citation_scope_adjusted")
+                subanswers.append(
+                    SubqueryGroundedSubanswer(
+                        subquery_id=record.subquery_id,
+                        subquery_question=subquery_question,
+                        answer_text=validated.answer_text,
+                        citations=filtered_citations,
+                        grounded=bool(validated.grounded and filtered_citations),
+                        support_classification="supported",
+                        insufficiency_reason=None,
+                        warnings=[*validated.warnings, *citation_scope_warnings],
+                    )
+                )
+            except Exception as exc:
+                subanswers.append(
+                    SubqueryGroundedSubanswer(
+                        subquery_id=record.subquery_id,
+                        subquery_question=subquery_question,
+                        answer_text="No grounded subanswer generated because generation failed safely.",
+                        citations=[],
+                        grounded=False,
+                        support_classification="unsupported",
+                        insufficiency_reason=f"generation_failed:{type(exc).__name__}",
+                        warnings=[f"subquery_answer_generation_failed:{record.subquery_id}:{type(exc).__name__}"],
+                    )
+                )
+
+        updated["subquery_subanswers"] = subanswers
+        updated["warnings"] = warnings
+        logger.info("node_exit name=generate_subquery_subanswers subanswer_count=%s", len(subanswers))
+        return cast(LegalRagState, updated)
+
     def generate_grounded_answer(self, state: LegalRagState) -> LegalRagState:
         """Call `generate_answer(context, effective_query)` and persist structured output."""
 
@@ -334,6 +701,30 @@ class AnswerStageNodes:
         warnings = list(updated.get("warnings", []))
         answer_context = list(updated.get("answer_context", []))
         should_generate_answer = bool(updated.get("should_generate_answer", False))
+        synthesized = _synthesize_from_grounded_subanswers(
+            decomposition_plan=updated.get("decomposition_plan")
+            if isinstance(updated.get("decomposition_plan"), DecompositionPlan)
+            else None,
+            subquery_subanswers=[
+                item
+                for item in list(updated.get("subquery_subanswers", []))
+                if isinstance(item, SubqueryGroundedSubanswer)
+            ],
+            baseline_warnings=warnings,
+            sufficient_context=True,
+        )
+        if synthesized is not None:
+            updated["final_answer"] = synthesized
+            updated["citations"] = list(synthesized.citations)
+            updated["grounded"] = synthesized.grounded
+            updated["sufficient_context"] = synthesized.sufficient_context
+            updated["warnings"] = list(synthesized.warnings)
+            updated["response_route"] = "generate_answer"
+            logger.info(
+                "node_exit name=generate_grounded_answer success=true synthesized_from_subanswers=true citations=%s",
+                len(synthesized.citations),
+            )
+            return cast(LegalRagState, updated)
 
         if not answer_context:
             fallback = FinalAnswerModel(
@@ -415,15 +806,57 @@ class AnswerStageNodes:
         updated = dict(state)
         warnings = list(updated.get("warnings", []))
         assessment = updated.get("answerability_result")
+        synthesized = _synthesize_from_grounded_subanswers(
+            decomposition_plan=updated.get("decomposition_plan")
+            if isinstance(updated.get("decomposition_plan"), DecompositionPlan)
+            else None,
+            subquery_subanswers=[
+                item
+                for item in list(updated.get("subquery_subanswers", []))
+                if isinstance(item, SubqueryGroundedSubanswer)
+            ],
+            baseline_warnings=warnings,
+            sufficient_context=False,
+        )
+        if synthesized is not None:
+            updated["final_answer"] = synthesized
+            updated["citations"] = list(synthesized.citations)
+            updated["grounded"] = synthesized.grounded
+            updated["sufficient_context"] = synthesized.sufficient_context
+            updated["warnings"] = list(synthesized.warnings)
+            updated["response_route"] = "build_insufficient_response"
+            logger.info(
+                "node_exit name=build_insufficient_response route=synthesized_partial_or_insufficient citations=%s",
+                len(synthesized.citations),
+            )
+            return cast(LegalRagState, updated)
 
         insufficiency_message = (
             "Direct answer: The retrieved context does not contain enough information to answer the question fully."
         )
         if isinstance(assessment, AnswerabilityAssessment):
-            if assessment.insufficiency_reason == "definition_not_supported":
-                insufficiency_message = (
-                    "Direct answer: The retrieved context includes related material, but it does not define the term itself."
+            is_definition_intent = str(assessment.answerability_expectation) == "definition_required"
+            if is_definition_intent and assessment.insufficiency_reason in {
+                "definition_not_supported",
+                "only_title_or_heading_match",
+            }:
+                asked_term = _extract_definition_subject(assessment.original_query)
+                title_or_label_only = assessment.insufficiency_reason == "only_title_or_heading_match" or any(
+                    note == "weakness_signal:title_only_signal_without_body" for note in assessment.evidence_notes
                 )
+                if asked_term and title_or_label_only:
+                    insufficiency_message = (
+                        f"Direct answer: I do not see a definition of '{asked_term}' in the retrieved context. "
+                        "It appears as a document title or label, not as a defined term or clause."
+                    )
+                elif asked_term:
+                    insufficiency_message = (
+                        f"Direct answer: I do not see a definition of '{asked_term}' in the retrieved context."
+                    )
+                else:
+                    insufficiency_message = (
+                        "Direct answer: The retrieved context includes related material, but it does not define the term itself."
+                    )
             elif assessment.insufficiency_reason == "fact_not_found":
                 insufficiency_message = (
                     "Direct answer: The retrieved context does not contain enough information to identify the requested fact."
@@ -469,7 +902,7 @@ class AnswerStageNodes:
                 updated["response_route"] = "fallback_finalizer:missing_final_answer"
             else:
                 final = _validate_answer_payload(raw_final)
-                merged_warnings = [*warnings, *final.warnings]
+                merged_warnings = _dedupe_preserve_order([*warnings, *final.warnings])
                 final = _copy_update(final, warnings=merged_warnings)
         except (ValueError, TypeError) as exc:
             final = _safe_fallback(
@@ -510,6 +943,7 @@ class _FallbackAnswerGraph:
         current = state
         current = self._nodes.prepare_answer_context(current)
         current = self._nodes.assess_answerability(current)
+        current = self._nodes.generate_subquery_subanswers(current)
         route = self._nodes.route_after_answerability(current)
         if route == "generate_grounded_answer":
             current = self._nodes.generate_grounded_answer(current)
@@ -534,14 +968,16 @@ def build_answer_graph(
     graph = StateGraph(LegalRagState)
     graph.add_node("prepare_answer_context", nodes.prepare_answer_context)
     graph.add_node("assess_answerability", nodes.assess_answerability)
+    graph.add_node("generate_subquery_subanswers", nodes.generate_subquery_subanswers)
     graph.add_node("generate_grounded_answer", nodes.generate_grounded_answer)
     graph.add_node("build_insufficient_response", nodes.build_insufficient_response)
     graph.add_node("finalize_response", nodes.finalize_response)
 
     graph.add_edge(START, "prepare_answer_context")
     graph.add_edge("prepare_answer_context", "assess_answerability")
+    graph.add_edge("assess_answerability", "generate_subquery_subanswers")
     graph.add_conditional_edges(
-        "assess_answerability",
+        "generate_subquery_subanswers",
         nodes.route_after_answerability,
         {
             "generate_grounded_answer": "generate_grounded_answer",

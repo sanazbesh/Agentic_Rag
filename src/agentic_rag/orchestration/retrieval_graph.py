@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Mapping, Sequence
+import re
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, TypedDict, cast
 
@@ -57,6 +58,7 @@ class SubQueryPlan(BaseModel):
     id: str
     question: str
     purpose: str
+    required: bool
     expected_answer_type: Literal[
         "definition",
         "entity",
@@ -90,6 +92,54 @@ class DecompositionPlan(BaseModel):
     planner_notes: list[str] = Field(default_factory=list)
 
 
+
+
+class SubqueryRetrievalResult(BaseModel):
+    """Stored retrieval output for a validated decomposition subquery."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    subquery_id: str
+    subquery_question: str
+    hits: list[HybridSearchResult] = Field(default_factory=list)
+
+
+SubquerySupportClassification = Literal["supported", "weak", "unsupported"]
+SubqueryInsufficiencyReason = Literal["no_retrieval_evidence", "missing_evidence_references"]
+
+
+class SubqueryCoverageRecord(BaseModel):
+    """Per-subquery evidence coverage artifact for decomposed retrieval flows."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    subquery_id: str
+    required: bool
+    support_classification: SubquerySupportClassification
+    evidence_child_chunk_ids: list[str] = Field(default_factory=list)
+    evidence_parent_chunk_ids: list[str] = Field(default_factory=list)
+    insufficiency_reason: SubqueryInsufficiencyReason | None = None
+
+
+class RetrievalCandidateProvenance(BaseModel):
+    """Query-path provenance for future merged retrieval candidates."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    from_root_query: bool = False
+    subquery_ids: list[str] = Field(default_factory=list)
+
+
+class MergedRetrievalCandidate(BaseModel):
+    """Stable candidate contract for future root+subquery merge phases."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    hit: HybridSearchResult
+    provenance: RetrievalCandidateProvenance
+    contributing_hits: list[HybridSearchResult] = Field(default_factory=list)
+
+
 class RetrievalStageState(TypedDict):
     """Strict retrieval-stage state shared by all graph nodes."""
 
@@ -107,13 +157,20 @@ class RetrievalStageState(TypedDict):
     context_resolution: QueryContextResolution | None
     needs_decomposition: bool
     decomposition_plan: DecompositionPlan | None
+    decomposition_validation_errors: list[str]
     decomposition_gate_reasons: list[str]
 
     extracted_entities: LegalEntityExtractionResult | None
     filters: dict[str, Any] | None
 
     child_results: list[HybridSearchResult]
+    subquery_results: dict[str, SubqueryRetrievalResult]
+    subquery_coverage: list[SubqueryCoverageRecord]
+    root_merged_candidates: list[MergedRetrievalCandidate]
+    subquery_merged_candidates: dict[str, list[MergedRetrievalCandidate]]
+    merged_candidates: list[MergedRetrievalCandidate]
     reranked_child_results: list[RerankedChunkResult]
+    parent_expansion_child_results: list[RerankedChunkResult]
     parent_ids: list[str]
     parent_chunks: list[ParentChunkResult]
     compressed_context: list[CompressedParentChunk]
@@ -193,11 +250,18 @@ def default_retrieval_state(
         context_resolution=None,
         needs_decomposition=False,
         decomposition_plan=None,
+        decomposition_validation_errors=[],
         decomposition_gate_reasons=[],
         extracted_entities=None,
         filters=None,
         child_results=[],
+        subquery_results={},
+        subquery_coverage=[],
+        root_merged_candidates=[],
+        subquery_merged_candidates={},
+        merged_candidates=[],
         reranked_child_results=[],
+        parent_expansion_child_results=[],
         parent_ids=[],
         parent_chunks=[],
         compressed_context=[],
@@ -230,6 +294,137 @@ def heuristic_query_classifier(
         recent_messages=recent_messages,
         active_documents=active_documents,
         selected_documents=selected_documents,
+    )
+
+
+def _build_merged_candidate(
+    *,
+    hit: HybridSearchResult,
+    from_root_query: bool,
+    subquery_ids: Sequence[str] | None = None,
+) -> MergedRetrievalCandidate:
+    ordered_subquery_ids = [subquery_id for subquery_id in (subquery_ids or []) if subquery_id]
+    return MergedRetrievalCandidate(
+        hit=hit,
+        provenance=RetrievalCandidateProvenance(
+            from_root_query=from_root_query,
+            subquery_ids=ordered_subquery_ids,
+        ),
+        contributing_hits=[hit],
+    )
+
+
+def _merge_two_candidates(
+    *,
+    existing: MergedRetrievalCandidate,
+    incoming: MergedRetrievalCandidate,
+) -> MergedRetrievalCandidate:
+    merged_metadata = dict(existing.hit.metadata)
+    for key, value in incoming.hit.metadata.items():
+        if key not in merged_metadata:
+            merged_metadata[key] = value
+
+    merged_hit = HybridSearchResult(
+        child_chunk_id=existing.hit.child_chunk_id,
+        parent_chunk_id=existing.hit.parent_chunk_id or incoming.hit.parent_chunk_id,
+        document_id=existing.hit.document_id or incoming.hit.document_id,
+        text=existing.hit.text or incoming.hit.text,
+        hybrid_score=existing.hit.hybrid_score,
+        metadata=merged_metadata,
+        dense_score=existing.hit.dense_score if existing.hit.dense_score is not None else incoming.hit.dense_score,
+        sparse_score=existing.hit.sparse_score if existing.hit.sparse_score is not None else incoming.hit.sparse_score,
+        dense_rank=existing.hit.dense_rank if existing.hit.dense_rank is not None else incoming.hit.dense_rank,
+        sparse_rank=existing.hit.sparse_rank if existing.hit.sparse_rank is not None else incoming.hit.sparse_rank,
+        matched_in_dense=existing.hit.matched_in_dense or incoming.hit.matched_in_dense,
+        matched_in_sparse=existing.hit.matched_in_sparse or incoming.hit.matched_in_sparse,
+    )
+
+    merged_subquery_ids = list(existing.provenance.subquery_ids)
+    for subquery_id in incoming.provenance.subquery_ids:
+        if subquery_id and subquery_id not in merged_subquery_ids:
+            merged_subquery_ids.append(subquery_id)
+
+    return MergedRetrievalCandidate(
+        hit=merged_hit,
+        provenance=RetrievalCandidateProvenance(
+            from_root_query=existing.provenance.from_root_query or incoming.provenance.from_root_query,
+            subquery_ids=merged_subquery_ids,
+        ),
+        contributing_hits=[*existing.contributing_hits, *incoming.contributing_hits],
+    )
+
+
+def _merge_root_and_subquery_candidates(
+    *,
+    root_candidates: Sequence[MergedRetrievalCandidate],
+    subquery_candidates: Mapping[str, Sequence[MergedRetrievalCandidate]],
+) -> list[MergedRetrievalCandidate]:
+    by_child_chunk_id: dict[str, MergedRetrievalCandidate] = {}
+
+    for candidate in root_candidates:
+        child_chunk_id = candidate.hit.child_chunk_id
+        if child_chunk_id not in by_child_chunk_id:
+            by_child_chunk_id[child_chunk_id] = candidate
+        else:
+            by_child_chunk_id[child_chunk_id] = _merge_two_candidates(
+                existing=by_child_chunk_id[child_chunk_id],
+                incoming=candidate,
+            )
+
+    for subquery_id in sorted(subquery_candidates):
+        for candidate in subquery_candidates[subquery_id]:
+            child_chunk_id = candidate.hit.child_chunk_id
+            existing = by_child_chunk_id.get(child_chunk_id)
+            if existing is None:
+                by_child_chunk_id[child_chunk_id] = candidate
+            else:
+                by_child_chunk_id[child_chunk_id] = _merge_two_candidates(existing=existing, incoming=candidate)
+
+    return list(by_child_chunk_id.values())
+
+
+def _to_global_rerank_hit(candidate: MergedRetrievalCandidate) -> HybridSearchResult:
+    """Convert a merged candidate to a rerank input hit while preserving provenance."""
+
+    metadata = dict(candidate.hit.metadata)
+    metadata["retrieval_provenance"] = candidate.provenance.model_dump()
+    metadata["retrieval_scores"] = {
+        "hybrid_score": candidate.hit.hybrid_score,
+        "dense_score": candidate.hit.dense_score,
+        "sparse_score": candidate.hit.sparse_score,
+        "dense_rank": candidate.hit.dense_rank,
+        "sparse_rank": candidate.hit.sparse_rank,
+        "matched_in_dense": candidate.hit.matched_in_dense,
+        "matched_in_sparse": candidate.hit.matched_in_sparse,
+    }
+    metadata["contributing_retrieval_scores"] = [
+        {
+            "child_chunk_id": hit.child_chunk_id,
+            "parent_chunk_id": hit.parent_chunk_id,
+            "document_id": hit.document_id,
+            "hybrid_score": hit.hybrid_score,
+            "dense_score": hit.dense_score,
+            "sparse_score": hit.sparse_score,
+            "dense_rank": hit.dense_rank,
+            "sparse_rank": hit.sparse_rank,
+            "matched_in_dense": hit.matched_in_dense,
+            "matched_in_sparse": hit.matched_in_sparse,
+        }
+        for hit in candidate.contributing_hits
+    ]
+    return HybridSearchResult(
+        child_chunk_id=candidate.hit.child_chunk_id,
+        parent_chunk_id=candidate.hit.parent_chunk_id,
+        document_id=candidate.hit.document_id,
+        text=candidate.hit.text,
+        hybrid_score=candidate.hit.hybrid_score,
+        metadata=metadata,
+        dense_score=candidate.hit.dense_score,
+        sparse_score=candidate.hit.sparse_score,
+        dense_rank=candidate.hit.dense_rank,
+        sparse_rank=candidate.hit.sparse_rank,
+        matched_in_dense=candidate.hit.matched_in_dense,
+        matched_in_sparse=candidate.hit.matched_in_sparse,
     )
 
 
@@ -274,6 +469,263 @@ def classify_decomposition_need(
     return needs_decomposition, list(reasons)
 
 
+def _pick_strategy(reasons: Sequence[str]) -> Literal[
+    "conjunctive",
+    "comparison",
+    "temporal",
+    "exception_chain",
+    "cross_clause",
+    "definition_plus_application",
+    "amendment_vs_base",
+] | None:
+    ordered = list(reasons)
+    if "amendment_vs_base" in ordered:
+        return "amendment_vs_base"
+    if "comparison_query" in ordered:
+        return "comparison"
+    if "exception_chain" in ordered:
+        return "exception_chain"
+    if "temporal_relationship" in ordered:
+        return "temporal"
+    if "cross_clause_obligation_condition" in ordered:
+        return "cross_clause"
+    if "multi_intent_conjunction" in ordered:
+        return "conjunctive"
+    if "context_dependent_followup" in ordered:
+        return "definition_plus_application"
+    return None
+
+
+def _extract_comparison_terms(query: str) -> tuple[str | None, str | None]:
+    cleaned = " ".join((query or "").split())
+    patterns = (
+        re.compile(r"(?:compare|difference(?:s)?\s+between)\s+(.+?)\s+(?:and|versus|vs\.?|compared\s+to)\s+(.+?)(?:[?.]|$)", re.IGNORECASE),
+        re.compile(r"(.+?)\s+(?:versus|vs\.?|compared\s+to)\s+(.+?)(?:[?.]|$)", re.IGNORECASE),
+    )
+    for pattern in patterns:
+        match = pattern.search(cleaned)
+        if not match:
+            continue
+        left = match.group(1).strip(" ,")
+        right = match.group(2).strip(" ,")
+        if left and right:
+            return left, right
+    return None, None
+
+
+def build_decomposition_plan(
+    *,
+    query: str,
+    needs_decomposition: bool,
+    reasons: Sequence[str],
+    query_classification: QueryRoutingDecision | None,
+    context_resolution: QueryContextResolution | None,
+) -> DecompositionPlan | None:
+    """Build a bounded typed decomposition plan only when the gate requires it."""
+
+    if not needs_decomposition:
+        return None
+
+    root_question = " ".join((query or "").split())
+    strategy = _pick_strategy(reasons)
+    plan_notes = [f"gate_reason:{reason}" for reason in reasons]
+
+    if context_resolution is not None:
+        if context_resolution.resolved_document_ids:
+            plan_notes.append("preserve_document_scope")
+        if context_resolution.resolved_topic_hints:
+            plan_notes.append("preserve_topic_scope")
+
+    if query_classification is not None and query_classification.is_context_dependent:
+        plan_notes.append("context_dependent_query")
+
+    if any(token in root_question.lower() for token in (" not ", " except", " unless", " notwithstanding")):
+        plan_notes.append("preserve_negation_and_exceptions")
+
+    subqueries: list[SubQueryPlan]
+    if strategy == "comparison":
+        left, right = _extract_comparison_terms(root_question)
+        if left and right:
+            subqueries = [
+                SubQueryPlan(
+                    id="sq-1",
+                    question=f"Locate clauses about {left} within the same agreement scope as the root question.",
+                    purpose="Retrieve the first side of the comparison without synthesis.",
+                    required=True,
+                    expected_answer_type="cross_reference",
+                ),
+                SubQueryPlan(
+                    id="sq-2",
+                    question=f"Locate clauses about {right} within the same agreement scope as the root question.",
+                    purpose="Retrieve the second side of the comparison without synthesis.",
+                    required=True,
+                    expected_answer_type="cross_reference",
+                ),
+            ]
+        else:
+            subqueries = [
+                SubQueryPlan(
+                    id="sq-1",
+                    question=f"Locate the clause segments needed to compare the requested items in: {root_question}",
+                    purpose="Collect comparison evidence only.",
+                    required=True,
+                    expected_answer_type="comparison",
+                )
+            ]
+    elif strategy == "amendment_vs_base":
+        subqueries = [
+            SubQueryPlan(
+                id="sq-1",
+                question=f"Locate the base-agreement clause(s) relevant to: {root_question}",
+                purpose="Retrieve baseline clause text before amendment impact analysis.",
+                required=True,
+                expected_answer_type="cross_reference",
+            ),
+            SubQueryPlan(
+                id="sq-2",
+                question=f"Locate the amendment clause(s) relevant to: {root_question}",
+                purpose="Retrieve amendment text scoped to the same issue.",
+                required=True,
+                expected_answer_type="cross_reference",
+            ),
+        ]
+    elif strategy == "exception_chain":
+        subqueries = [
+            SubQueryPlan(
+                id="sq-1",
+                question=f"Locate the primary rule clause implicated by: {root_question}",
+                purpose="Find base obligation/condition text for exception tracing.",
+                required=True,
+                expected_answer_type="obligation",
+            ),
+            SubQueryPlan(
+                id="sq-2",
+                question=f"Locate exception or carve-out language (for example 'unless', 'except', 'notwithstanding') tied to: {root_question}",
+                purpose="Find exception chain text without concluding outcomes.",
+                required=True,
+                expected_answer_type="exception",
+                dependency_ids=["sq-1"],
+            ),
+        ]
+    else:
+        subqueries = [
+            SubQueryPlan(
+                id="sq-1",
+                question=f"Locate clause text needed to resolve: {root_question}",
+                purpose="Collect retrieval evidence only; no answer generation.",
+                required=True,
+                expected_answer_type="cross_reference",
+            )
+        ]
+
+    return DecompositionPlan(
+        should_decompose=True,
+        root_question=root_question,
+        strategy=strategy,
+        subqueries=subqueries,
+        planner_notes=plan_notes,
+    )
+
+
+_DECOMPOSITION_MAX_SUBQUERIES = 4
+_VAGUE_SUBQUERY_PATTERNS = (
+    "anything relevant",
+    "everything about",
+    "general overview",
+    "overall summary",
+    "all clauses",
+    "what does it say",
+    "tell me more",
+)
+_ROOT_SCOPE_MARKERS = (
+    "agreement",
+    "contract",
+    "msa",
+    "nda",
+    "lease",
+    "amendment",
+    "clause",
+    "section",
+    "article",
+    "governing law",
+    "jurisdiction",
+)
+_NEGATION_MARKERS = (
+    " not ",
+    " except",
+    " unless",
+    " notwithstanding",
+    " other than",
+)
+
+
+def _normalize_text(value: str) -> str:
+    return " ".join((value or "").strip().split())
+
+
+def _canonical_text(value: str) -> str:
+    normalized = _normalize_text(value).lower()
+    normalized = re.sub(r"[^a-z0-9\s]+", " ", normalized)
+    return " ".join(normalized.split())
+
+
+def _extract_root_entities(root_question: str) -> list[str]:
+    # Capture simple title-cased entity phrases (for example: "Acme Corp").
+    matches = re.findall(r"\b([A-Z][a-z0-9]+(?:\s+[A-Z][a-z0-9]+)+)\b", root_question)
+    entities = sorted({_canonical_text(match) for match in matches if match.strip()})
+    return [entity for entity in entities if entity]
+
+
+def validate_decomposition_plan(plan: DecompositionPlan) -> list[str]:
+    """Deterministic conservative checks to keep broken plans out of retrieval."""
+
+    errors: list[str] = []
+    subqueries = list(plan.subqueries)
+    canonical_subqueries = [_canonical_text(subquery.question) for subquery in subqueries]
+
+    if len(subqueries) > _DECOMPOSITION_MAX_SUBQUERIES:
+        errors.append(f"too_many_subqueries:max_{_DECOMPOSITION_MAX_SUBQUERIES}")
+
+    non_empty_questions = [question for question in canonical_subqueries if question]
+    if len(non_empty_questions) != len(set(non_empty_questions)):
+        errors.append("duplicate_subqueries")
+
+    root_question = _normalize_text(plan.root_question)
+    root_canonical = f" {_canonical_text(root_question)} "
+    joined_subqueries = " ".join(canonical_subqueries)
+    joined_subqueries_padded = f" {joined_subqueries} "
+
+    dropped_entities: list[str] = []
+    for entity in _extract_root_entities(root_question):
+        if entity not in joined_subqueries:
+            dropped_entities.append(entity)
+
+    dropped_scopes: list[str] = []
+    for marker in _ROOT_SCOPE_MARKERS:
+        marker_canonical = _canonical_text(marker)
+        if marker_canonical and marker_canonical in root_canonical and marker_canonical not in joined_subqueries_padded:
+            dropped_scopes.append(marker_canonical)
+
+    if dropped_entities or dropped_scopes:
+        scope_parts = [f"entity={value}" for value in dropped_entities] + [f"scope={value}" for value in dropped_scopes]
+        errors.append("dropped_key_entity_or_scope:" + ",".join(scope_parts))
+
+    root_has_negation = any(marker in root_canonical for marker in _NEGATION_MARKERS)
+    subqueries_preserve_negation = any(marker in joined_subqueries_padded for marker in _NEGATION_MARKERS) or any(
+        token in joined_subqueries for token in ("exception", "carve out", "carveout", "negation", "unless", "except")
+    )
+    if root_has_negation and not subqueries_preserve_negation:
+        errors.append("lost_negation_or_exception_logic")
+
+    for subquery in subqueries:
+        question = _canonical_text(subquery.question)
+        word_count = len(question.split())
+        if word_count < 5 or any(pattern in question for pattern in _VAGUE_SUBQUERY_PATTERNS):
+            errors.append(f"vague_or_overly_broad_subquery:{subquery.id}")
+
+    return errors
+
+
 class RetrievalGraphNodes:
     """Explicit node implementations for a deterministic retrieval workflow graph."""
 
@@ -286,10 +738,38 @@ class RetrievalGraphNodes:
         updated = dict(state)
         updated["warnings"] = list(updated.get("warnings", []))
         updated["child_results"] = list(updated.get("child_results", []))
+        raw_subquery_results = updated.get("subquery_results", {})
+        if isinstance(raw_subquery_results, Mapping):
+            normalized_subquery_results: dict[str, SubqueryRetrievalResult] = {}
+            for key, value in raw_subquery_results.items():
+                if isinstance(value, SubqueryRetrievalResult):
+                    normalized_subquery_results[str(key)] = value
+            updated["subquery_results"] = normalized_subquery_results
+        else:
+            updated["subquery_results"] = {}
+        updated["subquery_coverage"] = [
+            item for item in list(updated.get("subquery_coverage", [])) if isinstance(item, SubqueryCoverageRecord)
+        ]
+        updated["root_merged_candidates"] = list(updated.get("root_merged_candidates", []))
+        updated["merged_candidates"] = list(updated.get("merged_candidates", []))
+        raw_subquery_candidates = updated.get("subquery_merged_candidates", {})
+        if isinstance(raw_subquery_candidates, Mapping):
+            normalized_subquery_candidates: dict[str, list[MergedRetrievalCandidate]] = {}
+            for key, value in raw_subquery_candidates.items():
+                if isinstance(value, list):
+                    normalized_subquery_candidates[str(key)] = [
+                        item for item in value if isinstance(item, MergedRetrievalCandidate)
+                    ]
+            updated["subquery_merged_candidates"] = normalized_subquery_candidates
+        else:
+            updated["subquery_merged_candidates"] = {}
         updated["reranked_child_results"] = list(updated.get("reranked_child_results", []))
+        updated["parent_expansion_child_results"] = list(updated.get("parent_expansion_child_results", []))
         updated["parent_ids"] = list(updated.get("parent_ids", []))
         updated["parent_chunks"] = list(updated.get("parent_chunks", []))
         updated["compressed_context"] = list(updated.get("compressed_context", []))
+        updated["decomposition_validation_errors"] = list(updated.get("decomposition_validation_errors", []) or [])
+        updated["decomposition_plan"] = updated.get("decomposition_plan")
         self._hydrate_prior_turn_memory(updated)
         logger.info("node_exit name=ingest_turn query_length=%s", len(updated["original_query"]))
         return cast(RetrievalStageState, updated)
@@ -453,6 +933,48 @@ class RetrievalGraphNodes:
         )
         return cast(RetrievalStageState, updated)
 
+    def maybe_build_decomposition_plan(self, state: RetrievalStageState) -> RetrievalStageState:
+        logger.info("node_enter name=maybe_build_decomposition_plan")
+        updated = dict(state)
+        plan = build_decomposition_plan(
+            query=str(updated.get("resolved_query") or updated.get("original_query") or ""),
+            needs_decomposition=bool(updated.get("needs_decomposition")),
+            reasons=list(updated.get("decomposition_gate_reasons") or []),
+            query_classification=updated.get("query_classification"),
+            context_resolution=updated.get("context_resolution"),
+        )
+        updated["decomposition_plan"] = plan
+        logger.info(
+            "node_exit name=maybe_build_decomposition_plan plan_created=%s subquery_count=%s",
+            plan is not None,
+            len(plan.subqueries) if plan is not None else 0,
+        )
+        return cast(RetrievalStageState, updated)
+
+    def validate_decomposition_plan(self, state: RetrievalStageState) -> RetrievalStageState:
+        """Validate typed decomposition plans and clear invalid plans conservatively."""
+
+        logger.info("node_enter name=validate_decomposition_plan")
+        updated = dict(state)
+        plan = updated.get("decomposition_plan")
+        if plan is None:
+            updated["decomposition_validation_errors"] = []
+            logger.info("node_exit name=validate_decomposition_plan skipped=true")
+            return cast(RetrievalStageState, updated)
+
+        errors = validate_decomposition_plan(plan)
+        updated["decomposition_validation_errors"] = list(errors)
+        if errors:
+            updated["decomposition_plan"] = None
+            logger.info(
+                "node_exit name=validate_decomposition_plan valid=false error_count=%s",
+                len(errors),
+            )
+            return cast(RetrievalStageState, updated)
+
+        logger.info("node_exit name=validate_decomposition_plan valid=true")
+        return cast(RetrievalStageState, updated)
+
     def rewrite_query_if_needed(self, state: RetrievalStageState) -> RetrievalStageState:
         logger.info("node_enter name=rewrite_query_if_needed should_rewrite=%s", state["should_rewrite"])
         updated = dict(state)
@@ -502,6 +1024,51 @@ class RetrievalGraphNodes:
         )
         return cast(RetrievalStageState, updated)
 
+    def run_subquery_hybrid_search(self, state: RetrievalStageState) -> RetrievalStageState:
+        """Run hybrid retrieval for each validated decomposition subquery."""
+
+        logger.info("node_enter name=run_subquery_hybrid_search")
+        updated = dict(state)
+        plan = updated.get("decomposition_plan")
+        if plan is None or not plan.subqueries:
+            updated["subquery_results"] = {}
+            updated["subquery_merged_candidates"] = {}
+            logger.info("node_exit name=run_subquery_hybrid_search skipped=true")
+            return cast(RetrievalStageState, updated)
+
+        filters = updated.get("filters")
+        subquery_results: dict[str, SubqueryRetrievalResult] = {}
+        subquery_merged_candidates: dict[str, list[MergedRetrievalCandidate]] = {}
+        for subquery in plan.subqueries:
+            try:
+                hits = self.dependencies.hybrid_search(
+                    subquery.question,
+                    filters=filters,
+                    top_k=self.config.hybrid_top_k,
+                )
+                normalized_hits = list(hits)
+                if not normalized_hits:
+                    updated["warnings"] = [*updated["warnings"], f"no_subquery_child_results:{subquery.id}"]
+            except Exception as exc:  # pragma: no cover
+                normalized_hits = []
+                updated["warnings"] = [*updated["warnings"], f"subquery_hybrid_search_failed:{subquery.id}:{type(exc).__name__}"]
+
+            subquery_results[subquery.id] = SubqueryRetrievalResult(
+                subquery_id=subquery.id,
+                subquery_question=subquery.question,
+                hits=normalized_hits,
+            )
+            subquery_merged_candidates[subquery.id] = [
+                _build_merged_candidate(hit=hit, from_root_query=False, subquery_ids=[subquery.id])
+                for hit in normalized_hits
+            ]
+
+        updated["subquery_results"] = subquery_results
+        updated["subquery_merged_candidates"] = subquery_merged_candidates
+        logger.info("node_exit name=run_subquery_hybrid_search subquery_count=%s", len(subquery_results))
+        return cast(RetrievalStageState, updated)
+
+
     def run_hybrid_search(self, state: RetrievalStageState) -> RetrievalStageState:
         logger.info("node_enter name=run_hybrid_search")
         updated = dict(state)
@@ -512,23 +1079,110 @@ class RetrievalGraphNodes:
                 top_k=self.config.hybrid_top_k,
             )
             updated["child_results"] = list(results)
+            updated["root_merged_candidates"] = [
+                _build_merged_candidate(hit=item, from_root_query=True) for item in updated["child_results"]
+            ]
             if not results:
                 updated["warnings"] = [*updated["warnings"], "no_child_results"]
         except Exception as exc:  # pragma: no cover
             updated["warnings"] = [*updated["warnings"], f"hybrid_search_failed:{type(exc).__name__}"]
             updated["child_results"] = []
+            updated["root_merged_candidates"] = []
         logger.info("node_exit name=run_hybrid_search child_count=%s", len(updated["child_results"]))
+        return cast(RetrievalStageState, updated)
+
+    def score_subquery_coverage(self, state: RetrievalStageState) -> RetrievalStageState:
+        """Score typed per-subquery retrieval coverage for valid decomposition plans."""
+
+        logger.info("node_enter name=score_subquery_coverage")
+        updated = dict(state)
+        plan = updated.get("decomposition_plan")
+        if plan is None or not plan.subqueries:
+            updated["subquery_coverage"] = []
+            logger.info("node_exit name=score_subquery_coverage skipped=true")
+            return cast(RetrievalStageState, updated)
+
+        subquery_results = dict(updated.get("subquery_results") or {})
+        coverage_records: list[SubqueryCoverageRecord] = []
+        for subquery in plan.subqueries:
+            retrieval_result = subquery_results.get(subquery.id)
+            hits = list(retrieval_result.hits) if isinstance(retrieval_result, SubqueryRetrievalResult) else []
+            evidence_child_chunk_ids: list[str] = []
+            evidence_parent_chunk_ids: list[str] = []
+            for hit in hits:
+                if hit.child_chunk_id and hit.child_chunk_id not in evidence_child_chunk_ids:
+                    evidence_child_chunk_ids.append(hit.child_chunk_id)
+                if hit.parent_chunk_id and hit.parent_chunk_id not in evidence_parent_chunk_ids:
+                    evidence_parent_chunk_ids.append(hit.parent_chunk_id)
+
+            if not hits:
+                support_classification: SubquerySupportClassification = "unsupported"
+                insufficiency_reason: SubqueryInsufficiencyReason | None = "no_retrieval_evidence"
+            elif not evidence_child_chunk_ids and not evidence_parent_chunk_ids:
+                support_classification = "weak"
+                insufficiency_reason = "missing_evidence_references"
+            else:
+                support_classification = "supported"
+                insufficiency_reason = None
+
+            coverage_records.append(
+                SubqueryCoverageRecord(
+                    subquery_id=subquery.id,
+                    required=subquery.required,
+                    support_classification=support_classification,
+                    evidence_child_chunk_ids=evidence_child_chunk_ids,
+                    evidence_parent_chunk_ids=evidence_parent_chunk_ids,
+                    insufficiency_reason=insufficiency_reason,
+                )
+            )
+
+        updated["subquery_coverage"] = coverage_records
+        logger.info("node_exit name=score_subquery_coverage subquery_count=%s", len(coverage_records))
+        return cast(RetrievalStageState, updated)
+
+    def merge_retrieval_candidates(self, state: RetrievalStageState) -> RetrievalStageState:
+        """Merge root/subquery retrieval candidates into one deduped deterministic pool."""
+
+        logger.info("node_enter name=merge_retrieval_candidates")
+        updated = dict(state)
+        if updated.get("decomposition_plan") is None:
+            updated["merged_candidates"] = []
+            logger.info("node_exit name=merge_retrieval_candidates skipped=true")
+            return cast(RetrievalStageState, updated)
+
+        updated["merged_candidates"] = _merge_root_and_subquery_candidates(
+            root_candidates=list(updated.get("root_merged_candidates", [])),
+            subquery_candidates=dict(updated.get("subquery_merged_candidates", {})),
+        )
+        logger.info(
+            "node_exit name=merge_retrieval_candidates merged_count=%s",
+            len(updated["merged_candidates"]),
+        )
         return cast(RetrievalStageState, updated)
 
     def rerank_results(self, state: RetrievalStageState) -> RetrievalStageState:
         logger.info("node_enter name=rerank_results child_count=%s", len(state["child_results"]))
         updated = dict(state)
-        if not updated["child_results"]:
+        has_valid_decomposition = updated.get("decomposition_plan") is not None
+        has_merged_candidates = bool(updated.get("merged_candidates"))
+        use_global_merged_pool = has_valid_decomposition and has_merged_candidates
+
+        rerank_input: list[HybridSearchResult]
+        rerank_query: str
+        if use_global_merged_pool:
+            rerank_input = [_to_global_rerank_hit(candidate) for candidate in updated["merged_candidates"]]
+            rerank_query = str(updated.get("original_query") or "")
+        else:
+            rerank_input = list(updated["child_results"])
+            rerank_query = str(updated.get("effective_query") or "")
+
+        if not rerank_input:
             updated["reranked_child_results"] = []
+            updated["parent_expansion_child_results"] = []
             logger.info("node_exit name=rerank_results skipped=true")
             return cast(RetrievalStageState, updated)
         try:
-            reranked = self.dependencies.rerank_chunks(updated["child_results"], updated["effective_query"])
+            reranked = self.dependencies.rerank_chunks(rerank_input, rerank_query)
             if not reranked:
                 updated["warnings"] = [*updated["warnings"], "rerank_empty_fallback_to_child_results"]
                 fallback = [
@@ -541,7 +1195,7 @@ class RetrievalGraphNodes:
                         original_score=item.hybrid_score,
                         payload=dict(item.payload),
                     )
-                    for item in updated["child_results"]
+                    for item in rerank_input
                 ]
                 updated["reranked_child_results"] = fallback
             else:
@@ -558,24 +1212,43 @@ class RetrievalGraphNodes:
                     original_score=item.hybrid_score,
                     payload=dict(item.payload),
                 )
-                for item in updated["child_results"]
+                for item in rerank_input
             ]
-        logger.info("node_exit name=rerank_results reranked_count=%s", len(updated["reranked_child_results"]))
+        if use_global_merged_pool:
+            updated["parent_expansion_child_results"] = list(updated["reranked_child_results"])
+        else:
+            updated["parent_expansion_child_results"] = []
+        logger.info(
+            "node_exit name=rerank_results reranked_count=%s parent_expansion_source=%s",
+            len(updated["reranked_child_results"]),
+            "global_merged_rerank" if use_global_merged_pool else "reranked_child_results",
+        )
         return cast(RetrievalStageState, updated)
 
     def collect_parent_ids(self, state: RetrievalStageState) -> RetrievalStageState:
         logger.info("node_enter name=collect_parent_ids")
         updated = dict(state)
+        has_valid_decomposition = updated.get("decomposition_plan") is not None
+        has_merged_candidates = bool(updated.get("merged_candidates"))
+        has_global_reranked_pool = bool(updated.get("parent_expansion_child_results"))
+
+        if has_valid_decomposition and has_merged_candidates and has_global_reranked_pool:
+            parent_source = list(updated["parent_expansion_child_results"])
+            source_name = "global_merged_rerank"
+        else:
+            parent_source = list(updated["reranked_child_results"])
+            source_name = "reranked_child_results"
+
         seen: set[str] = set()
         parent_ids: list[str] = []
-        for item in updated["reranked_child_results"]:
+        for item in parent_source:
             parent_id = item.parent_chunk_id
             if not parent_id or parent_id in seen:
                 continue
             seen.add(parent_id)
             parent_ids.append(parent_id)
         updated["parent_ids"] = parent_ids
-        logger.info("node_exit name=collect_parent_ids parent_count=%s", len(parent_ids))
+        logger.info("node_exit name=collect_parent_ids source=%s parent_count=%s", source_name, len(parent_ids))
         return cast(RetrievalStageState, updated)
 
     def fetch_parent_chunks(self, state: RetrievalStageState) -> RetrievalStageState:
@@ -635,6 +1308,16 @@ DecisionLiteral = Literal[
 ]
 
 
+DecompositionRoutingDecision = Literal[
+    "maybe_build_decomposition_plan",
+    "rewrite_query_if_needed",
+]
+
+
+def _route_after_decomposition_gate(state: RetrievalStageState) -> DecompositionRoutingDecision:
+    return "maybe_build_decomposition_plan" if state["needs_decomposition"] else "rewrite_query_if_needed"
+
+
 def _route_after_compression_check(state: RetrievalStageState) -> DecisionLiteral:
     return "compress_context_node" if state["should_compress"] else "mark_complete_without_compression"
 
@@ -651,12 +1334,22 @@ class _FallbackCompiledGraph:
         current = self._nodes.classify_query_state(current)
         current = self._nodes.resolve_query_context(current)
         current = self._nodes.classify_decomposition_need(current)
+        if _route_after_decomposition_gate(current) == "maybe_build_decomposition_plan":
+            current = self._nodes.maybe_build_decomposition_plan(current)
+            current = self._nodes.validate_decomposition_plan(current)
+        else:
+            current = dict(current)
+            current["decomposition_plan"] = None
+            current["decomposition_validation_errors"] = []
         current = self._nodes.rewrite_query_if_needed(current)
         current = self._nodes.extract_entities_if_needed(current)
+        current = self._nodes.run_subquery_hybrid_search(current)
         current = self._nodes.run_hybrid_search(current)
+        current = self._nodes.merge_retrieval_candidates(current)
         current = self._nodes.rerank_results(current)
         current = self._nodes.collect_parent_ids(current)
         current = self._nodes.fetch_parent_chunks(current)
+        current = self._nodes.score_subquery_coverage(current)
         current = self._nodes.maybe_compress_context(current)
         if _route_after_compression_check(current) == "compress_context_node":
             current = self._nodes.compress_context_node(current)
@@ -683,12 +1376,17 @@ def build_retrieval_graph(
     graph.add_node("classify_query_state", nodes.classify_query_state)
     graph.add_node("resolve_query_context", nodes.resolve_query_context)
     graph.add_node("classify_decomposition_need", nodes.classify_decomposition_need)
+    graph.add_node("maybe_build_decomposition_plan", nodes.maybe_build_decomposition_plan)
+    graph.add_node("validate_decomposition_plan", nodes.validate_decomposition_plan)
     graph.add_node("rewrite_query_if_needed", nodes.rewrite_query_if_needed)
     graph.add_node("extract_entities_if_needed", nodes.extract_entities_if_needed)
+    graph.add_node("run_subquery_hybrid_search", nodes.run_subquery_hybrid_search)
     graph.add_node("run_hybrid_search", nodes.run_hybrid_search)
+    graph.add_node("merge_retrieval_candidates", nodes.merge_retrieval_candidates)
     graph.add_node("rerank_results", nodes.rerank_results)
     graph.add_node("collect_parent_ids", nodes.collect_parent_ids)
     graph.add_node("fetch_parent_chunks", nodes.fetch_parent_chunks)
+    graph.add_node("score_subquery_coverage", nodes.score_subquery_coverage)
     graph.add_node("maybe_compress_context", nodes.maybe_compress_context)
     graph.add_node("compress_context_node", nodes.compress_context_node)
     graph.add_node("mark_complete_without_compression", nodes.mark_complete_without_compression)
@@ -697,13 +1395,25 @@ def build_retrieval_graph(
     graph.add_edge("ingest_turn", "classify_query_state")
     graph.add_edge("classify_query_state", "resolve_query_context")
     graph.add_edge("resolve_query_context", "classify_decomposition_need")
-    graph.add_edge("classify_decomposition_need", "rewrite_query_if_needed")
+    graph.add_conditional_edges(
+        "classify_decomposition_need",
+        _route_after_decomposition_gate,
+        {
+            "maybe_build_decomposition_plan": "maybe_build_decomposition_plan",
+            "rewrite_query_if_needed": "rewrite_query_if_needed",
+        },
+    )
+    graph.add_edge("maybe_build_decomposition_plan", "validate_decomposition_plan")
+    graph.add_edge("validate_decomposition_plan", "rewrite_query_if_needed")
     graph.add_edge("rewrite_query_if_needed", "extract_entities_if_needed")
-    graph.add_edge("extract_entities_if_needed", "run_hybrid_search")
-    graph.add_edge("run_hybrid_search", "rerank_results")
+    graph.add_edge("extract_entities_if_needed", "run_subquery_hybrid_search")
+    graph.add_edge("run_subquery_hybrid_search", "run_hybrid_search")
+    graph.add_edge("run_hybrid_search", "merge_retrieval_candidates")
+    graph.add_edge("merge_retrieval_candidates", "rerank_results")
     graph.add_edge("rerank_results", "collect_parent_ids")
     graph.add_edge("collect_parent_ids", "fetch_parent_chunks")
-    graph.add_edge("fetch_parent_chunks", "maybe_compress_context")
+    graph.add_edge("fetch_parent_chunks", "score_subquery_coverage")
+    graph.add_edge("score_subquery_coverage", "maybe_compress_context")
     graph.add_conditional_edges(
         "maybe_compress_context",
         _route_after_compression_check,

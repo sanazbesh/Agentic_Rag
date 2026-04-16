@@ -13,10 +13,12 @@ from .legal_rag_graph import (
 from .query_understanding import QueryUnderstandingResult, understand_query
 
 from .retrieval_graph import (
+    DecompositionPlan,
     QueryRoutingDecision,
     RetrievalDependencies,
     RetrievalGraphConfig,
     RetrievalStageState,
+    SubQueryPlan,
     build_retrieval_graph,
     default_retrieval_state,
     heuristic_query_classifier,
@@ -27,6 +29,8 @@ __all__ = [
     "Agent",
     "Orchestrator",
     "QueryRoutingDecision",
+    "SubQueryPlan",
+    "DecompositionPlan",
     "RetrievalStageState",
     "RetrievalGraphConfig",
     "RetrievalDependencies",
