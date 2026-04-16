@@ -438,6 +438,31 @@ class AnswerabilityAssessor:
             )
 
         if expectation == "fact_extraction":
+            is_mitigation_query = self._is_employment_mitigation_query(original_query, query_understanding)
+            if is_mitigation_query:
+                mitigation_support = self._evaluate_employment_mitigation_support(
+                    query=original_query,
+                    substantive=matched,
+                )
+                if mitigation_support["supported"]:
+                    return build(
+                        status="sufficient",
+                        has_any_coverage=True,
+                        sufficient_coverage=True,
+                        partial_coverage=False,
+                        reason="fact_supported",
+                        supporting_signals=list(mitigation_support["signals"]),
+                    )
+                return build(
+                    status="weak",
+                    has_any_coverage=bool(matched),
+                    sufficient_coverage=False,
+                    partial_coverage=False,
+                    reason="fact_not_found",
+                    missing_requirements=list(mitigation_support["missing"]),
+                    warnings=["heading_only_context"] if heading_only else [],
+                )
+
             is_lifecycle_query = self._is_employment_contract_lifecycle_query(original_query, query_understanding)
             if is_lifecycle_query:
                 lifecycle_support = self._evaluate_employment_lifecycle_support(
@@ -953,6 +978,28 @@ class AnswerabilityAssessor:
         )
         return any(re.search(pattern, lowered) for pattern in patterns)
 
+    def _is_employment_mitigation_query(
+        self,
+        query: str,
+        query_understanding: QueryUnderstandingResult,
+    ) -> bool:
+        if any(note == "legal_question_family:employment_mitigation" for note in (query_understanding.routing_notes or [])):
+            return True
+        lowered = self._canonical_phrase(query)
+        patterns = (
+            r"\bmitigat(?:e|ion)\b",
+            r"\bmitigation efforts?\b",
+            r"\bjob applications?\b",
+            r"\bhow many job applications?\b",
+            r"\binterviews?\b",
+            r"\boffers?\s+(?:received|rejected)\b",
+            r"\balternative employment\b",
+            r"\bnew employment\b",
+            r"\bmitigation evidence\b",
+            r"\bjob search\b",
+        )
+        return any(re.search(pattern, lowered) for pattern in patterns)
+
     def _is_correspondence_litigation_milestone_query(
         self,
         query: str,
@@ -1189,6 +1236,128 @@ class AnswerabilityAssessor:
             return {"supported": False, "signals": [], "missing": [missing]}
 
         return {"supported": False, "signals": [], "missing": ["procedural_or_correspondence_responsive_evidence"]}
+
+    def _mitigation_target(self, lowered_query: str) -> str:
+        if "how many" in lowered_query and "application" in lowered_query:
+            return "application_count"
+        if ("when" in lowered_query and "interview" in lowered_query) or ("interview date" in lowered_query):
+            return "interview_dates"
+        if "alternative employment" in lowered_query or "new employment" in lowered_query:
+            return "alternative_employment"
+        if re.search(r"\boffers?\b", lowered_query) and any(token in lowered_query for token in ("received", "reject")):
+            return "offers"
+        if "mitigation evidence" in lowered_query or ("what evidence" in lowered_query and "mitigation" in lowered_query):
+            return "mitigation_evidence"
+        if "mitigation" in lowered_query and "effort" in lowered_query:
+            return "mitigation_efforts"
+        if "mitigation" in lowered_query:
+            return "mitigation_general"
+        return "mitigation_general"
+
+    def _evaluate_employment_mitigation_support(
+        self,
+        *,
+        query: str,
+        substantive: Sequence[Mapping[str, str]],
+    ) -> dict[str, object]:
+        lowered_query = self._canonical_phrase(query)
+        target = self._mitigation_target(lowered_query)
+        requires_date = "when" in lowered_query
+        if not substantive:
+            return {"supported": False, "signals": [], "missing": ["employment_mitigation_responsive_evidence"]}
+
+        rows: list[tuple[str, str]] = []
+        for item in substantive:
+            raw_text = f"{item.get('heading', '')} {item.get('text', '')}".strip()
+            canonical = self._canonical_phrase(raw_text)
+            if canonical:
+                rows.append((canonical, raw_text))
+
+        mitigation_doc_markers = (
+            "job search log",
+            "mitigation journal",
+            "application record",
+            "application log",
+            "resume",
+            "interview invitation",
+            "offer letter",
+            "employment update",
+            "email",
+            "correspondence",
+            "notes",
+        )
+
+        def has(required: Sequence[str], any_of: Sequence[str] = ()) -> bool:
+            for canonical, _raw in rows:
+                if not all(token in canonical for token in required):
+                    continue
+                if any_of and not any(token in canonical for token in any_of):
+                    continue
+                return True
+            return False
+
+        def has_dated(required: Sequence[str], any_of: Sequence[str] = ()) -> bool:
+            for canonical, raw in rows:
+                if not all(token in canonical for token in required):
+                    continue
+                if any_of and not any(token in canonical for token in any_of):
+                    continue
+                if self._extract_datetimes(raw):
+                    return True
+            return False
+
+        if target == "application_count":
+            supported = has(("application",), ("submitted", "applied", "resume", "candidate", "position", "job"))
+            if supported:
+                return {"supported": True, "signals": ["employment_mitigation_application_record_evidence_detected"], "missing": []}
+            return {"supported": False, "signals": [], "missing": ["job_application_record_evidence"]}
+
+        if target == "interview_dates":
+            supported = has_dated(("interview",), ("invited", "scheduled", "conducted", "attended")) if requires_date else has(
+                ("interview",),
+                ("invited", "scheduled", "conducted", "attended"),
+            )
+            if supported:
+                return {"supported": True, "signals": ["employment_mitigation_interview_evidence_detected"], "missing": []}
+            missing = "interview_dated_evidence" if requires_date else "interview_record_evidence"
+            return {"supported": False, "signals": [], "missing": [missing]}
+
+        if target == "offers":
+            supported = has(("offer",), ("received", "extended", "rejected", "accepted"))
+            if supported:
+                return {"supported": True, "signals": ["employment_mitigation_offer_evidence_detected"], "missing": []}
+            return {"supported": False, "signals": [], "missing": ["offer_received_or_rejected_evidence"]}
+
+        if target == "alternative_employment":
+            supported = has(("employment",), ("new", "alternative", "accepted", "started", "start date")) or has(
+                ("position",),
+                ("accepted", "new employer", "start date"),
+            )
+            if supported:
+                return {"supported": True, "signals": ["employment_mitigation_alternative_employment_evidence_detected"], "missing": []}
+            return {"supported": False, "signals": [], "missing": ["alternative_or_new_employment_evidence"]}
+
+        if target == "mitigation_evidence":
+            for canonical, _raw in rows:
+                if "mitigation" in canonical and any(marker in canonical for marker in mitigation_doc_markers):
+                    return {"supported": True, "signals": ["employment_mitigation_evidence_source_detected"], "missing": []}
+                if any(marker in canonical for marker in mitigation_doc_markers) and any(
+                    token in canonical for token in ("application", "interview", "offer", "job search", "new employment")
+                ):
+                    return {"supported": True, "signals": ["employment_mitigation_evidence_source_detected"], "missing": []}
+            return {"supported": False, "signals": [], "missing": ["mitigation_responsive_evidence_sources"]}
+
+        if target in {"mitigation_efforts", "mitigation_general"}:
+            supported = (
+                has(("mitigation",), ("effort", "job search", "application", "interview", "offer", "employment"))
+                or has(("job search",), ("application", "interview", "offer"))
+                or has(("application",), ("submitted", "position", "job"))
+            )
+            if supported:
+                return {"supported": True, "signals": ["employment_mitigation_efforts_evidence_detected"], "missing": []}
+            return {"supported": False, "signals": [], "missing": ["mitigation_efforts_or_job_search_evidence"]}
+
+        return {"supported": False, "signals": [], "missing": ["employment_mitigation_responsive_evidence"]}
 
     def _evaluate_chronology_support(
         self,

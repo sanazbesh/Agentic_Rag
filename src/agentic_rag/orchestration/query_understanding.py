@@ -321,6 +321,40 @@ def _is_employment_contract_lifecycle_query(normalized_query: str) -> bool:
     return any(re.search(pattern, lowered) for pattern in patterns)
 
 
+def _is_employment_mitigation_query(normalized_query: str) -> bool:
+    lowered = _canonicalize_phrase(normalized_query)
+    if not lowered:
+        return False
+
+    patterns = (
+        r"\bmitigation\b",
+        r"\bmitigate\b",
+        r"\bmitigation efforts?\b",
+        r"\bjob applications?\b",
+        r"\bhow many job applications?\b",
+        r"\binterviews?\b",
+        r"\boffers?\s+(?:received|rejected)\b",
+        r"\balternative employment\b",
+        r"\bnew employment\b",
+        r"\bjob search\b",
+        r"\bmitigation evidence\b",
+    )
+    if any(re.search(pattern, lowered) for pattern in patterns):
+        return True
+
+    evidence_markers = (
+        "application record",
+        "application log",
+        "job search log",
+        "mitigation journal",
+        "offer letter",
+        "interview invitation",
+        "employment update",
+    )
+    has_employment_frame = any(token in lowered for token in ("employment", "job", "offer", "interview", "application"))
+    return has_employment_frame and any(marker in lowered for marker in evidence_markers)
+
+
 
 
 def _is_correspondence_litigation_milestone_query(normalized_query: str) -> bool:
@@ -381,6 +415,7 @@ def understand_query(
     is_chronology_date_event_query = _is_chronology_date_event_query(normalized)
     is_matter_metadata_query = _is_matter_metadata_query(normalized)
     is_employment_contract_lifecycle_query = _is_employment_contract_lifecycle_query(normalized)
+    is_employment_mitigation_query = _is_employment_mitigation_query(normalized)
     is_correspondence_litigation_milestone_query = _is_correspondence_litigation_milestone_query(normalized)
 
     meta_markers = ("how many documents", "what files are loaded", "what documents are uploaded", "what docs are loaded")
@@ -469,6 +504,7 @@ def understand_query(
         or is_chronology_date_event_query
         or is_matter_metadata_query
         or is_employment_contract_lifecycle_query
+        or is_employment_mitigation_query
         or is_correspondence_litigation_milestone_query
         or any(marker in lowered for marker in extractive_markers)
     ):
@@ -604,6 +640,7 @@ def understand_query(
         or is_party_role_entity_query
         or is_matter_metadata_query
         or is_employment_contract_lifecycle_query
+        or is_employment_mitigation_query
         or is_correspondence_litigation_milestone_query
     )
     should_extract_entities = is_party_role_entity_query or is_matter_metadata_query or any(
@@ -630,6 +667,8 @@ def understand_query(
         routing_notes.append("legal_question_family:matter_document_metadata")
     if is_employment_contract_lifecycle_query:
         routing_notes.append("legal_question_family:employment_contract_lifecycle")
+    if is_employment_mitigation_query:
+        routing_notes.append("legal_question_family:employment_mitigation")
     if is_correspondence_litigation_milestone_query:
         routing_notes.append("legal_question_family:correspondence_litigation_milestone")
 

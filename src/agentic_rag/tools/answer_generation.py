@@ -106,6 +106,9 @@ class LegalAnswerSynthesizer:
             correspondence_response = self._generate_correspondence_litigation_answer(normalized_context, normalized_query)
             if correspondence_response is not None:
                 return correspondence_response
+            mitigation_response = self._generate_employment_mitigation_answer(normalized_context, normalized_query)
+            if mitigation_response is not None:
+                return mitigation_response
             lifecycle_response = self._generate_employment_lifecycle_answer(normalized_context, normalized_query)
             if lifecycle_response is not None:
                 return lifecycle_response
@@ -903,6 +906,145 @@ class LegalAnswerSynthesizer:
         if "when" not in lowered_query:
             return False
         return target in {"offer_acceptance", "employment_start", "probation", "termination_effective"}
+
+    def _generate_employment_mitigation_answer(
+        self,
+        context: Sequence[dict[str, Any]],
+        query: str,
+    ) -> GenerateAnswerResult | None:
+        lowered_query = query.lower()
+        target = self._employment_mitigation_target(lowered_query)
+        if target is None:
+            return None
+
+        match = self._resolve_employment_mitigation_value(context, target)
+        if match is None:
+            return self._insufficient_response("insufficient_context: employment mitigation-responsive evidence not found")
+        if target == "interview_dates" and "when" in lowered_query and not self._contains_concrete_date(str(match["value"])):
+            return self._insufficient_response("insufficient_context: mitigation interview date evidence not found")
+
+        citation = AnswerCitation(
+            parent_chunk_id=match["parent_chunk_id"],
+            document_id=match.get("document_id"),
+            source_name=match.get("source_name"),
+            heading=match.get("heading"),
+            supporting_excerpt=match["excerpt"],
+        )
+        source_line = f"- {match.get('heading') or '(no heading)'}: {match['excerpt']}"
+        direct = self._employment_mitigation_direct_answer(target, str(match["value"]))
+
+        return GenerateAnswerResult(
+            answer_text=(
+                f"Direct answer: {direct}\n\n"
+                "Supporting points:\n"
+                f"{source_line}\n\n"
+                "Caveats / limitations:\n"
+                "- Response is limited to mitigation-responsive employment evidence in the retrieved context."
+            ),
+            grounded=True,
+            sufficient_context=True,
+            citations=[citation],
+            warnings=[],
+        )
+
+    def _employment_mitigation_target(self, lowered_query: str) -> str | None:
+        if "mitigat" not in lowered_query and not any(
+            token in lowered_query for token in ("job application", "interview", "alternative employment", "new employment")
+        ) and not (re.search(r"\boffers?\b", lowered_query) and any(token in lowered_query for token in ("received", "reject"))):
+            return None
+        if "how many" in lowered_query and "application" in lowered_query:
+            return "application_count"
+        if ("when" in lowered_query and "interview" in lowered_query) or "interview date" in lowered_query:
+            return "interview_dates"
+        if "alternative employment" in lowered_query or "new employment" in lowered_query:
+            return "alternative_employment"
+        if re.search(r"\boffers?\b", lowered_query) and any(token in lowered_query for token in ("received", "reject")):
+            return "offers"
+        if "mitigation evidence" in lowered_query or ("what evidence" in lowered_query and "mitigation" in lowered_query):
+            return "mitigation_evidence"
+        if "mitigation" in lowered_query:
+            return "mitigation_efforts"
+        return None
+
+    def _resolve_employment_mitigation_value(
+        self,
+        context: Sequence[dict[str, Any]],
+        target: str,
+    ) -> dict[str, Any] | None:
+        for item in context:
+            text = str(item.get("text") or "")
+            heading = str(item.get("heading") or "")
+            haystack = f"{heading}\n{text}"
+            value = self._extract_employment_mitigation_value(haystack, target)
+            if not value:
+                continue
+            excerpt = self._best_excerpt(text or haystack, value)
+            return {
+                "value": value,
+                "excerpt": excerpt or value,
+                "parent_chunk_id": item.get("parent_chunk_id", ""),
+                "document_id": item.get("document_id"),
+                "source_name": item.get("source_name"),
+                "heading": item.get("heading"),
+            }
+        return None
+
+    def _extract_employment_mitigation_value(self, haystack: str, target: str) -> str | None:
+        lowered = haystack.lower()
+        date_pattern = r"(?:\d{4}-\d{2}-\d{2}|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+\d{1,2},\s*\d{4})"
+        if target == "application_count":
+            count_match = re.search(r"\b(\d+)\s+(?:job\s+)?applications?\s+(?:were\s+)?(?:submitted|made|sent)\b", haystack, flags=re.IGNORECASE)
+            if count_match:
+                return count_match.group(0).strip()
+            match = re.search(
+                r"\b(?:applied|applications?\s+(?:were\s+)?(?:submitted|made|sent)|resume submitted|candidate profile submitted)[^.\n;]{0,120}",
+                haystack,
+                flags=re.IGNORECASE,
+            )
+            return match.group(0).strip() if match else None
+        if target == "interview_dates":
+            dated = re.search(
+                rf"\binterview[^.\n;]{{0,120}}(?:on|scheduled for|conducted on|held on)\s+({date_pattern})",
+                haystack,
+                flags=re.IGNORECASE,
+            )
+            if dated:
+                return dated.group(0).strip()
+            fallback = re.search(r"\binterview[^.\n;]{0,120}", haystack, flags=re.IGNORECASE)
+            return fallback.group(0).strip() if fallback else None
+        if target == "offers":
+            match = re.search(r"\boffer(?: letter)?[^.\n;]{0,140}(?:received|extended|rejected|accepted|declined)[^.\n;]{0,80}", haystack, flags=re.IGNORECASE)
+            return match.group(0).strip() if match else None
+        if target == "alternative_employment":
+            match = re.search(rf"\b(?:new|alternative)\s+employment[^.\n;]{{0,120}}(?:started|accepted|secured|commenced|on)\s*(?:{date_pattern})?", haystack, flags=re.IGNORECASE)
+            if match:
+                return match.group(0).strip()
+            alt = re.search(rf"\baccepted\s+(?:a\s+)?(?:position|role)[^.\n;]{{0,120}}(?:start(?:ing)?\s+on\s+{date_pattern})?", haystack, flags=re.IGNORECASE)
+            return alt.group(0).strip() if alt else None
+        if target == "mitigation_evidence":
+            if "mitigation" in lowered and any(
+                token in lowered for token in ("job search log", "journal", "application", "interview", "offer", "email", "notes", "employment update")
+            ):
+                match = re.search(r"\b(?:mitigation|job search log|mitigation journal|application record|interview invitation|offer letter|employment update)[^.\n;]{0,140}", haystack, flags=re.IGNORECASE)
+                return match.group(0).strip() if match else "Mitigation evidence references are present."
+            return None
+        if target == "mitigation_efforts":
+            match = re.search(r"\b(?:mitigation efforts?|job search efforts?|applications?|interviews?|offers?|alternative employment|new employment)[^.\n;]{0,160}", haystack, flags=re.IGNORECASE)
+            return match.group(0).strip() if match else None
+        return None
+
+    def _employment_mitigation_direct_answer(self, target: str, value: str) -> str:
+        if target == "application_count":
+            return f"The mitigation application evidence states: {value}."
+        if target == "interview_dates":
+            return f"The mitigation interview evidence states: {value}."
+        if target == "offers":
+            return f"The mitigation offer evidence states: {value}."
+        if target == "alternative_employment":
+            return f"The mitigation alternative-employment evidence states: {value}."
+        if target == "mitigation_evidence":
+            return f"The mitigation evidence references include: {value}."
+        return f"The mitigation-efforts evidence states: {value}."
 
     def _contains_concrete_date(self, value: str) -> bool:
         return bool(

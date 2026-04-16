@@ -422,6 +422,18 @@ class QueryTransformationService:
         re.compile(r"\broe\b", flags=re.IGNORECASE),
         re.compile(r"\brecord\s+of\s+employment\b", flags=re.IGNORECASE),
     )
+    _EMPLOYMENT_MITIGATION_QUERY_PATTERNS: tuple[re.Pattern[str], ...] = (
+        re.compile(r"\bmitigat(?:e|ion)\b", flags=re.IGNORECASE),
+        re.compile(r"\bmitigation\s+efforts?\b", flags=re.IGNORECASE),
+        re.compile(r"\bjob\s+applications?\b", flags=re.IGNORECASE),
+        re.compile(r"\bhow\s+many\s+job\s+applications?\b", flags=re.IGNORECASE),
+        re.compile(r"\binterviews?\b", flags=re.IGNORECASE),
+        re.compile(r"\boffers?\s+(?:received|rejected)\b", flags=re.IGNORECASE),
+        re.compile(r"\balternative\s+employment\b", flags=re.IGNORECASE),
+        re.compile(r"\bnew\s+employment\b", flags=re.IGNORECASE),
+        re.compile(r"\bmitigation\s+evidence\b", flags=re.IGNORECASE),
+        re.compile(r"\bjob\s+search\s+log\b", flags=re.IGNORECASE),
+    )
 
     def _is_party_role_entity_query(self, query: str) -> bool:
         normalized = (query or "").strip()
@@ -503,6 +515,33 @@ class QueryTransformationService:
         expanded = f"{normalized} {' '.join(expansion_terms)}"
         return re.sub(r"\s+", " ", expanded).strip()
 
+    def _is_employment_mitigation_query(self, query: str) -> bool:
+        normalized = (query or "").strip()
+        if not normalized:
+            return False
+        return any(pattern.search(normalized) for pattern in self._EMPLOYMENT_MITIGATION_QUERY_PATTERNS)
+
+    def _expand_employment_mitigation_query(self, query: str) -> str:
+        normalized = re.sub(r"\s+", " ", (query or "").strip())
+        if not normalized:
+            return ""
+
+        expansion_terms = [
+            "mitigation efforts",
+            "job search log",
+            "mitigation journal",
+            "application records",
+            "resume submission",
+            "interview invitation",
+            "interview date",
+            "offer letter",
+            "offer received",
+            "new employment start date",
+            "employment update email",
+        ]
+        expanded = f"{normalized} {' '.join(expansion_terms)}"
+        return re.sub(r"\s+", " ", expanded).strip()
+
     def rewrite_query(
         self,
         query: str,
@@ -541,6 +580,13 @@ class QueryTransformationService:
                 rewritten_query=self._expand_employment_lifecycle_query(normalized_query),
                 used_conversation_context=False,
                 rewrite_notes="employment_contract_lifecycle_query_expansion",
+            )
+        if self._is_employment_mitigation_query(normalized_query):
+            return QueryRewriteResult(
+                original_query=original_query,
+                rewritten_query=self._expand_employment_mitigation_query(normalized_query),
+                used_conversation_context=False,
+                rewrite_notes="employment_mitigation_query_expansion",
             )
 
         context_blob = _build_context_blob(conversation_summary, recent_messages)
