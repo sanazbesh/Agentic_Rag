@@ -237,3 +237,13 @@ def test_extract_legal_entities_non_conflation_validation() -> None:
     assert "Delaware" in result.jurisdictions
     assert "Chancery Court" in result.courts
     assert "UCC" not in result.legal_citations
+
+
+def test_rewrite_query_expands_party_role_entity_query_for_intro_line_retrieval() -> None:
+    query = "who is the employer?"
+
+    result = rewrite_query(query)
+
+    assert result.rewrite_notes == "party_role_entity_query_expansion"
+    assert "by and between" in result.rewritten_query.lower()
+    assert "employer" in result.rewritten_query.lower()

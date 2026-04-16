@@ -437,6 +437,28 @@ class AnswerabilityAssessor:
             )
 
         if expectation == "fact_extraction":
+            is_party_role_query = self._is_party_role_entity_query(original_query, query_understanding)
+            if is_party_role_query:
+                found = self._has_party_role_evidence(substantive, original_query)
+                if found:
+                    return build(
+                        status="sufficient",
+                        has_any_coverage=True,
+                        sufficient_coverage=True,
+                        partial_coverage=False,
+                        reason="fact_supported",
+                        supporting_signals=["party_role_responsive_evidence_detected"],
+                    )
+                return build(
+                    status="weak",
+                    has_any_coverage=bool(matched),
+                    sufficient_coverage=False,
+                    partial_coverage=False,
+                    reason="fact_not_found",
+                    missing_requirements=["party_role_or_agreement_entity_evidence_in_context"],
+                    warnings=["heading_only_context"] if heading_only else [],
+                )
+
             fact_markers = self._fact_markers(original_query)
             found = bool(substantive) and any(marker in body_text for marker in fact_markers)
             if found:
@@ -811,10 +833,72 @@ class AnswerabilityAssessor:
         if "which law" in lowered or "govern" in lowered:
             return ("governed by", "laws of", "governing law")
         if "parties" in lowered or "who are the parties" in lowered:
-            return ("between", "party", "parties", "by and between")
+            return ("between", "party", "parties", "by and between", "made effective")
+        if "employer" in lowered:
+            return ("employer", "company", "between", "employment agreement", "by and between", "made effective")
+        if "employee" in lowered:
+            return ("employee", "between", "employment agreement", "by and between", "made effective")
+        if "which company" in lowered and "agreement" in lowered:
+            return ("company", "agreement", "between", "by and between", "made effective")
         if "notice period" in lowered:
             return ("notice period", "days notice", "written notice")
         return tuple(self._query_terms(query))
+
+    def _is_party_role_entity_query(
+        self,
+        query: str,
+        query_understanding: QueryUnderstandingResult,
+    ) -> bool:
+        if any(note == "legal_question_family:party_role_entity" for note in (query_understanding.routing_notes or [])):
+            return True
+
+        lowered = self._canonical_phrase(query)
+        patterns = (
+            r"\bwho\s+is\s+the\s+employer\b",
+            r"\bwho\s+is\s+the\s+employee\b",
+            r"\bwho\s+are\s+the\s+parties\b",
+            r"\bwhich\s+company\s+is\s+this\s+agreement\s+for\b",
+            r"\bis\s+this\s+agreement\s+between\b",
+        )
+        return any(re.search(pattern, lowered) for pattern in patterns)
+
+    def _has_party_role_evidence(self, substantive: Sequence[Mapping[str, str]], query: str) -> bool:
+        fact_markers = self._fact_markers(query)
+        if not fact_markers:
+            return False
+
+        lowered_query = query.lower()
+        for item in substantive:
+            text = (item.get("text") or "").lower()
+            heading = (item.get("heading") or "").lower()
+            haystack = f"{heading}\n{text}".strip()
+            if not haystack:
+                continue
+
+            has_intro_party_line = bool(
+                re.search(r"\b(?:this\s+.+?\s+agreement\s+is\s+made(?:\s+effective)?|by\s+and\s+between)\b", haystack)
+                and "between" in haystack
+            )
+            has_role_labels = bool(re.search(r"\b(employer|employee|company|party|parties)\b", haystack))
+            has_between_entities = bool(re.search(r"\bbetween\b.+\band\b", haystack))
+
+            if "employer" in lowered_query and not ("employer" in haystack or (has_intro_party_line and has_between_entities)):
+                continue
+            if "employee" in lowered_query and not ("employee" in haystack or (has_intro_party_line and has_between_entities)):
+                continue
+            if "which company" in lowered_query and "agreement" in lowered_query and not (
+                "company" in haystack or has_intro_party_line or has_between_entities
+            ):
+                continue
+            if "parties" in lowered_query and not ("parties" in haystack or "party" in haystack or has_between_entities):
+                continue
+
+            if any(marker in haystack for marker in fact_markers):
+                return True
+            if has_intro_party_line and (has_role_labels or has_between_entities):
+                return True
+
+        return False
 
     def _comparison_side_hits(self, query: str, context_text: str) -> int:
         normalized_query = query.lower()

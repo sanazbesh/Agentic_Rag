@@ -84,6 +84,10 @@ class LegalAnswerSynthesizer:
                     warnings=["insufficient_context: no retrieved parent chunks"],
                 )
 
+            party_role_response = self._generate_party_role_answer(normalized_context, normalized_query)
+            if party_role_response is not None:
+                return party_role_response
+
             ranked = self._rank_relevant_chunks(normalized_context, normalized_query)
             if not ranked:
                 return self._insufficient_response(
@@ -149,6 +153,276 @@ class LegalAnswerSynthesizer:
             )
         except Exception as exc:  # pragma: no cover - exercised in explicit fallback test
             return self._failure_response(str(exc))
+
+    def _generate_party_role_answer(
+        self,
+        context: Sequence[dict[str, Any]],
+        query: str,
+    ) -> GenerateAnswerResult | None:
+        lowered_query = query.lower()
+        if not self._is_party_role_question(lowered_query):
+            return None
+
+        role_assignment = self._resolve_party_roles_from_intro(context)
+        if role_assignment is None:
+            return GenerateAnswerResult(
+                answer_text=(
+                    "Direct answer: The retrieved context includes party-related language, but roles cannot be assigned "
+                    "reliably from the available agreement-introduction evidence.\n\n"
+                    "Supporting points:\n"
+                    "- Party-role assignment could not be resolved with sufficient confidence.\n\n"
+                    "Caveats / limitations:\n"
+                    "- A reliable employer/employee/party mapping requires clearer introductory role labels."
+                ),
+                grounded=False,
+                sufficient_context=False,
+                citations=[],
+                warnings=["party_role_assignment_unresolved"],
+            )
+
+        citation = AnswerCitation(
+            parent_chunk_id=role_assignment.source_parent_chunk_id,
+            document_id=role_assignment.document_id,
+            source_name=role_assignment.source_name,
+            heading=role_assignment.heading,
+            supporting_excerpt=role_assignment.supporting_excerpt,
+        )
+        source_line = f"- {role_assignment.heading or '(no heading)'}: {role_assignment.supporting_excerpt}"
+
+        if "who is the employer" in lowered_query:
+            if not role_assignment.employer:
+                return self._insufficient_party_role_with_citation(citation, source_line)
+            return self._party_role_success(
+                direct=f"The employer is {role_assignment.employer}.",
+                citation=citation,
+                source_line=source_line,
+            )
+
+        if "who is the employee" in lowered_query:
+            if not role_assignment.employee:
+                return self._insufficient_party_role_with_citation(citation, source_line)
+            return self._party_role_success(
+                direct=f"The employee is {role_assignment.employee}.",
+                citation=citation,
+                source_line=source_line,
+            )
+
+        if "who are the parties" in lowered_query:
+            if len(role_assignment.parties) < 2:
+                return self._insufficient_party_role_with_citation(citation, source_line)
+            return self._party_role_success(
+                direct=f"The parties are {role_assignment.parties[0]} and {role_assignment.parties[1]}.",
+                citation=citation,
+                source_line=source_line,
+            )
+
+        if "which company is this agreement for" in lowered_query:
+            company = role_assignment.employer or self._pick_company_party(role_assignment.parties)
+            if not company:
+                return self._insufficient_party_role_with_citation(citation, source_line)
+            return self._party_role_success(
+                direct=f"The agreement appears to be for {company}.",
+                citation=citation,
+                source_line=source_line,
+            )
+
+        between_match = re.search(r"\bis\s+this\s+agreement\s+between\s+(.+?)\s+and\s+(.+?)\??$", lowered_query)
+        if between_match:
+            requested_a = self._normalize_party_text(between_match.group(1))
+            requested_b = self._normalize_party_text(between_match.group(2))
+            extracted = {self._normalize_party_text(party) for party in role_assignment.parties}
+            both_match = requested_a in extracted and requested_b in extracted
+            direct = (
+                "Yes, the agreement-introduction evidence identifies those two parties."
+                if both_match
+                else "No, the agreement-introduction evidence does not identify that exact pair of parties."
+            )
+            return self._party_role_success(direct=direct, citation=citation, source_line=source_line)
+
+        return None
+
+    def _party_role_success(
+        self,
+        *,
+        direct: str,
+        citation: AnswerCitation,
+        source_line: str,
+    ) -> GenerateAnswerResult:
+        return GenerateAnswerResult(
+            answer_text=(
+                f"Direct answer: {direct}\n\n"
+                "Supporting points:\n"
+                f"{source_line}\n\n"
+                "Caveats / limitations:\n"
+                "- Role assignment is based on the retrieved agreement-introduction party language."
+            ),
+            grounded=True,
+            sufficient_context=True,
+            citations=[citation],
+            warnings=[],
+        )
+
+    def _insufficient_party_role_with_citation(
+        self,
+        citation: AnswerCitation,
+        source_line: str,
+    ) -> GenerateAnswerResult:
+        return GenerateAnswerResult(
+            answer_text=(
+                "Direct answer: The retrieved party evidence is not sufficient to assign the requested role safely.\n\n"
+                "Supporting points:\n"
+                f"{source_line}\n\n"
+                "Caveats / limitations:\n"
+                "- The text identifies parties but does not reliably label the requested role."
+            ),
+            grounded=False,
+            sufficient_context=False,
+            citations=[citation],
+            warnings=["party_role_assignment_unresolved"],
+        )
+
+    def _is_party_role_question(self, lowered_query: str) -> bool:
+        patterns = (
+            r"\bwho\s+is\s+the\s+employer\b",
+            r"\bwho\s+is\s+the\s+employee\b",
+            r"\bwho\s+are\s+the\s+parties\b",
+            r"\bwhich\s+company\s+is\s+this\s+agreement\s+for\b",
+            r"\bis\s+this\s+agreement\s+between\b",
+        )
+        return any(re.search(pattern, lowered_query) for pattern in patterns)
+
+    def _resolve_party_roles_from_intro(self, context: Sequence[dict[str, Any]]) -> "_PartyRoleAssignment | None":
+        for item in context:
+            text = str(item.get("text") or "").strip()
+            if not text:
+                continue
+            assignment = self._extract_intro_assignment(text)
+            if assignment is None:
+                continue
+            assignment.source_parent_chunk_id = str(item.get("parent_chunk_id") or "")
+            assignment.document_id = item.get("document_id")
+            assignment.source_name = item.get("source_name")
+            assignment.heading = item.get("heading")
+            assignment.supporting_excerpt = self._best_excerpt(text, "parties employer employee agreement")
+            if not assignment.supporting_excerpt:
+                assignment.supporting_excerpt = text
+            return assignment
+        return None
+
+    def _extract_intro_assignment(self, text: str) -> "_PartyRoleAssignment | None":
+        lowered = text.lower()
+        has_intro_anchor = bool(
+            re.search(r"\b(this\s+.+?\s+agreement\s+is\s+made(?:\s+effective)?|by\s+and\s+between|between)\b", lowered)
+        )
+        if not has_intro_anchor:
+            return None
+
+        employer_label = re.search(r"\bemployer\s*[:\-]\s*([^;\n.]+)", text, flags=re.IGNORECASE)
+        employee_label = re.search(r"\bemployee\s*[:\-]\s*([^;\n.]+)", text, flags=re.IGNORECASE)
+        employer = self._clean_party_name(employer_label.group(1)) if employer_label else None
+        employee = self._clean_party_name(employee_label.group(1)) if employee_label else None
+
+        between_match = re.search(r"\bbetween\s+(.+?)\s+and\s+(.+?)(?:[.;\n]|$)", text, flags=re.IGNORECASE)
+        parties: list[str] = []
+        if between_match:
+            first = self._clean_party_name(between_match.group(1))
+            second = self._clean_party_name(between_match.group(2))
+            if first:
+                parties.append(first)
+            if second:
+                parties.append(second)
+
+            first_role = self._detect_inline_role(between_match.group(1))
+            second_role = self._detect_inline_role(between_match.group(2))
+            if first_role == "employer":
+                employer = employer or first
+            elif first_role == "employee":
+                employee = employee or first
+            if second_role == "employer":
+                employer = employer or second
+            elif second_role == "employee":
+                employee = employee or second
+
+        if len(parties) >= 2 and (employer is None or employee is None):
+            inferred_employer, inferred_employee = self._infer_employer_employee(parties[0], parties[1], lowered)
+            employer = employer or inferred_employer
+            employee = employee or inferred_employee
+
+        if employer and self._is_placeholder_party(employer):
+            employer = None
+        if employee and self._is_placeholder_party(employee):
+            employee = None
+        parties = [party for party in parties if not self._is_placeholder_party(party)]
+
+        if not parties and employer and employee:
+            parties = [employer, employee]
+
+        if len(parties) < 2:
+            return None
+
+        return _PartyRoleAssignment(
+            parties=tuple(parties[:2]),
+            employer=employer,
+            employee=employee,
+            source_parent_chunk_id="",
+            document_id=None,
+            source_name=None,
+            heading=None,
+            supporting_excerpt="",
+        )
+
+    def _detect_inline_role(self, value: str) -> str | None:
+        lowered = value.lower()
+        if "employer" in lowered or "company" in lowered:
+            return "employer"
+        if "employee" in lowered:
+            return "employee"
+        return None
+
+    def _infer_employer_employee(self, first: str, second: str, lowered_text: str) -> tuple[str | None, str | None]:
+        if "employment agreement" not in lowered_text:
+            return None, None
+        first_is_org = self._looks_like_organization(first)
+        second_is_org = self._looks_like_organization(second)
+        if first_is_org == second_is_org:
+            return None, None
+        if first_is_org:
+            return first, second
+        return second, first
+
+    def _pick_company_party(self, parties: Sequence[str]) -> str | None:
+        for party in parties:
+            if self._looks_like_organization(party):
+                return party
+        return None
+
+    def _looks_like_organization(self, value: str) -> bool:
+        lowered = value.lower()
+        org_markers = ("inc", "llc", "ltd", "limited", "corp", "corporation", "company", "co.", "plc")
+        return any(marker in lowered for marker in org_markers)
+
+    def _clean_party_name(self, value: str) -> str:
+        cleaned = re.sub(r"\((?:the\s+)?[\"“']?(?:employer|employee|company)[\"”']?\)", "", value, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,;.")
+        return cleaned
+
+    def _is_placeholder_party(self, value: str) -> bool:
+        normalized = self._normalize_party_text(value)
+        placeholders = {
+            "company",
+            "employee",
+            "employer",
+            "party a",
+            "party b",
+            "first party",
+            "second party",
+        }
+        return normalized in placeholders
+
+    def _normalize_party_text(self, value: str) -> str:
+        normalized = re.sub(r"[^a-z0-9\s]", " ", (value or "").lower())
+        normalized = re.sub(r"\b(the|this|that)\b", " ", normalized)
+        return re.sub(r"\s+", " ", normalized).strip()
 
     def _rank_relevant_chunks(self, context: Sequence[dict[str, Any]], query: str) -> list[dict[str, Any]]:
         query_terms = _query_terms(query)
@@ -252,6 +526,18 @@ class LegalAnswerSynthesizer:
 
 
 _DEFAULT_ANSWER_SYNTHESIZER = LegalAnswerSynthesizer()
+
+
+@dataclass(slots=True)
+class _PartyRoleAssignment:
+    parties: tuple[str, str]
+    employer: str | None
+    employee: str | None
+    source_parent_chunk_id: str
+    document_id: str | None
+    source_name: str | None
+    heading: str | None
+    supporting_excerpt: str
 
 
 def generate_answer(context: Sequence[object], query: str) -> GenerateAnswerResult:
