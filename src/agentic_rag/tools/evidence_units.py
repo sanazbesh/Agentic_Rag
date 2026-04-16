@@ -8,7 +8,7 @@ mapping instead of re-deriving headings/text independently.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -24,6 +24,7 @@ class EvidenceUnit:
     heading_path: tuple[str, ...]
     text: str
     evidence_text: str
+    metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
 def build_evidence_units(context: Sequence[object]) -> list[EvidenceUnit]:
@@ -62,6 +63,7 @@ def build_evidence_units(context: Sequence[object]) -> list[EvidenceUnit]:
                 heading_path=heading_path,
                 text=text,
                 evidence_text=text,
+                metadata=_mapping(_field(item, "metadata", {})),
             )
         )
     return units
@@ -96,3 +98,9 @@ def _tuple_str(value: Any) -> tuple[str, ...]:
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
         return tuple(str(part) for part in value)
     return ()
+
+
+def _mapping(value: Any) -> Mapping[str, Any]:
+    if isinstance(value, Mapping):
+        return dict(value)
+    return {}

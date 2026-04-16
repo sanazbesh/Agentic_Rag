@@ -398,6 +398,14 @@ class QueryTransformationService:
         re.compile(r"\bwhich\s+company\s+is\s+this\s+agreement\s+for\b", flags=re.IGNORECASE),
         re.compile(r"\bis\s+this\s+agreement\s+between\b", flags=re.IGNORECASE),
     )
+    _MATTER_METADATA_QUERY_PATTERNS: tuple[re.Pattern[str], ...] = (
+        re.compile(r"\bwhat\s+is\s+the\s+file\s+number\b", flags=re.IGNORECASE),
+        re.compile(r"\b(?:what|which)\s+jurisdiction\s+applies\b", flags=re.IGNORECASE),
+        re.compile(r"\b(?:what|which)\s+court\s+is\s+involved\b", flags=re.IGNORECASE),
+        re.compile(r"\bwho\s+is\s+the\s+client\b", flags=re.IGNORECASE),
+        re.compile(r"\bwhat\s+is\s+the\s+(?:case|matter)\s+name\b", flags=re.IGNORECASE),
+        re.compile(r"\bwhat\s+is\s+this\s+(?:matter|document)\s+about\b", flags=re.IGNORECASE),
+    )
 
     def _is_party_role_entity_query(self, query: str) -> bool:
         normalized = (query or "").strip()
@@ -419,6 +427,34 @@ class QueryTransformationService:
             "employer",
             "employee",
             "company",
+        ]
+        expanded = f"{normalized} {' '.join(expansion_terms)}"
+        return re.sub(r"\s+", " ", expanded).strip()
+
+    def _is_matter_metadata_query(self, query: str) -> bool:
+        normalized = (query or "").strip()
+        if not normalized:
+            return False
+        return any(pattern.search(normalized) for pattern in self._MATTER_METADATA_QUERY_PATTERNS)
+
+    def _expand_matter_metadata_query(self, query: str) -> str:
+        normalized = re.sub(r"\s+", " ", (query or "").strip())
+        if not normalized:
+            return ""
+
+        expansion_terms = [
+            "caption",
+            "introductory header",
+            "matter information",
+            "court heading",
+            "file number",
+            "court file number",
+            "jurisdiction",
+            "court",
+            "client",
+            "case name",
+            "matter name",
+            "governing forum",
         ]
         expanded = f"{normalized} {' '.join(expansion_terms)}"
         return re.sub(r"\s+", " ", expanded).strip()
@@ -447,6 +483,13 @@ class QueryTransformationService:
                 rewritten_query=self._expand_party_role_query(normalized_query),
                 used_conversation_context=False,
                 rewrite_notes="party_role_entity_query_expansion",
+            )
+        if self._is_matter_metadata_query(normalized_query):
+            return QueryRewriteResult(
+                original_query=original_query,
+                rewritten_query=self._expand_matter_metadata_query(normalized_query),
+                used_conversation_context=False,
+                rewrite_notes="matter_document_metadata_query_expansion",
             )
 
         context_blob = _build_context_blob(conversation_summary, recent_messages)
