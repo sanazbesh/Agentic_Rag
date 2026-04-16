@@ -127,6 +127,49 @@ def test_start_date_question_accepts_effective_date_evidence_without_literal_emp
     assert "January 9, 2023" in answer.answer_text
 
 
+def test_start_date_extraction_accepts_effective_date_with_newline_before_date() -> None:
+    query = "When did employment start?"
+    context = [_parent("p-nl-effective", "Term", "Effective Date:\nJanuary 9, 2023\nThe role starts on this date.")]
+
+    answer = generate_answer(context, query)
+
+    assert answer.sufficient_context is True
+    assert "January 9, 2023" in answer.answer_text
+
+
+def test_start_date_extraction_accepts_commencement_date_with_newline_before_date() -> None:
+    query = "When did employment start?"
+    context = [_parent("p-nl-comm", "Term", "Commencement Date:\nJanuary 9, 2023\nDuties begin on this date.")]
+
+    answer = generate_answer(context, query)
+
+    assert answer.sufficient_context is True
+    assert "January 9, 2023" in answer.answer_text
+
+
+def test_start_date_extraction_accepts_start_date_with_newline_before_date() -> None:
+    query = "When did employment start?"
+    context = [_parent("p-nl-start", "Term", "Start Date:\nJanuary 9, 2023\nEmployee onboarding occurs beforehand.")]
+
+    answer = generate_answer(context, query)
+
+    assert answer.sufficient_context is True
+    assert "January 9, 2023" in answer.answer_text
+
+
+def test_lifecycle_when_question_with_linebroken_label_and_real_date_returns_sufficient_answer() -> None:
+    query = "When did employment start?"
+    understanding = understand_query(query)
+    context = [_parent("p-nl-mixed", "Term", "Commencement Date:\nJanuary 9, 2023\nThis agreement governs role duties.")]
+
+    result = assess_answerability(query, understanding, context)
+    answer = generate_answer(context, query)
+
+    assert result.sufficient_context is True
+    assert answer.sufficient_context is True
+    assert "January 9, 2023" in answer.answer_text
+
+
 def test_lifecycle_when_question_without_extracted_date_is_not_sufficient() -> None:
     query = "When did employment start?"
     understanding = understand_query(query)

@@ -660,7 +660,11 @@ class LegalAnswerSynthesizer:
                 return match.group(0).strip() if match else "Offer acceptance terms are present."
             return None
         if target == "employment_start":
-            match = re.search(rf"\b(?:effective date|commence(?:ment|d)?|start date|employment (?:began|begins|commenced|commences|start(?:ed|s)?)).{{0,40}}({date_pattern})", haystack, flags=re.IGNORECASE)
+            match = re.search(
+                rf"\b(?:effective date|commence(?:ment|d)?|start date|employment (?:began|begins|commenced|commences|start(?:ed|s)?))[\s\S]{{0,40}}({date_pattern})",
+                haystack,
+                flags=re.IGNORECASE,
+            )
             if match:
                 return match.group(1).strip()
             if "effective date" in lowered or "commence" in lowered or "start date" in lowered:
