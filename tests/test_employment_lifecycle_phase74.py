@@ -91,6 +91,23 @@ def test_start_date_question_uses_effective_or_commencement_evidence_when_presen
     assert "January 9, 2023" in answer.answer_text
 
 
+def test_start_date_question_accepts_commencement_date_evidence_without_literal_employment_token() -> None:
+    query = "When did employment start?"
+    understanding = understand_query(query)
+    context = [
+        _parent(
+            "p-cd",
+            "Term",
+            "Commencement Date: January 9, 2023. The Employee will perform assigned duties from that date.",
+        )
+    ]
+
+    result = assess_answerability(query, understanding, context)
+
+    assert result.sufficient_context is True
+    assert "employment_lifecycle_start_or_commencement_evidence_detected" in result.evidence_notes
+
+
 def test_compensation_question_uses_compensation_section_when_present() -> None:
     query = "What were the compensation terms?"
     understanding = understand_query(query)

@@ -956,7 +956,15 @@ class AnswerabilityAssessor:
             return {"supported": False, "signals": [], "missing": ["offer_and_acceptance_evidence"]}
 
         if any(token in lowered_query for token in ("start date", "commencement", "employment begin", "employment start", "employment relationship begin")):
-            if has_responsive_evidence(("employment",), ("effective date", "commence", "start", "began", "begin")):
+            if (
+                has_responsive_evidence(("employment",), ("effective date", "commence", "start", "began", "begin"))
+                or has_responsive_evidence(("commencement",), ("date",))
+                or has_responsive_evidence(
+                    ("effective date",),
+                    ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec", "20", "19"),
+                )
+                or has_responsive_evidence(("start date",))
+            ):
                 return {
                     "supported": True,
                     "signals": [
@@ -1614,6 +1622,12 @@ def _combine_coverage_and_strength(
         if ALLOW_MODERATE_STRENGTH_WHEN_COVERAGE_SUFFICIENT:
             return "sufficient", True, not expectation_blocks_answer, False, None
         return "moderate", False, False, False, "partial_evidence_only"
+
+    if any(
+        note == "legal_question_family:employment_contract_lifecycle"
+        for note in (query_understanding.routing_notes or [])
+    ):
+        return "sufficient", True, not expectation_blocks_answer, False, None
 
     # Explicitly conservative for weak/none structural strength.
     return "weak", False, False, False, "partial_evidence_only"
