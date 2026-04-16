@@ -103,6 +103,9 @@ class LegalAnswerSynthesizer:
             party_role_response = self._generate_party_role_answer(normalized_context, normalized_query)
             if party_role_response is not None:
                 return party_role_response
+            correspondence_response = self._generate_correspondence_litigation_answer(normalized_context, normalized_query)
+            if correspondence_response is not None:
+                return correspondence_response
             lifecycle_response = self._generate_employment_lifecycle_answer(normalized_context, normalized_query)
             if lifecycle_response is not None:
                 return lifecycle_response
@@ -454,6 +457,188 @@ class LegalAnswerSynthesizer:
         if target == "case_or_matter_name":
             return f"The case/matter name is {value}."
         return f"The matter/document is about {value}."
+
+    def _generate_correspondence_litigation_answer(
+        self,
+        context: Sequence[dict[str, Any]],
+        query: str,
+    ) -> GenerateAnswerResult | None:
+        lowered_query = query.lower()
+        target = self._correspondence_litigation_target(lowered_query)
+        if target is None:
+            return None
+
+        if target == "procedural_history":
+            milestones = self._extract_procedural_milestones(context)
+            if not milestones:
+                return self._insufficient_response("insufficient_context: procedural milestone evidence not found")
+            lines: list[str] = []
+            citations: list[AnswerCitation] = []
+            for milestone in milestones[: self.max_support_points]:
+                lines.append(f"- {milestone['label']}")
+                citations.append(
+                    AnswerCitation(
+                        parent_chunk_id=str(milestone["parent_chunk_id"]),
+                        document_id=milestone.get("document_id"),
+                        source_name=milestone.get("source_name"),
+                        heading=milestone.get("heading"),
+                        supporting_excerpt=str(milestone["excerpt"]),
+                    )
+                )
+            return GenerateAnswerResult(
+                answer_text=(
+                    "Direct answer: The retrieved context supports the following procedural milestones.\n\n"
+                    "Supporting points:\n"
+                    + "\n".join(lines)
+                    + "\n\nCaveats / limitations:\n"
+                    "- Response is limited to correspondence/procedural milestone evidence in the retrieved context."
+                ),
+                grounded=True,
+                sufficient_context=True,
+                citations=citations,
+                warnings=[],
+            )
+
+        match = self._resolve_correspondence_litigation_value(context, target)
+        if match is None:
+            return self._insufficient_response("insufficient_context: correspondence/procedural-responsive evidence not found")
+
+        if self._procedural_when_date_required(lowered_query, target) and not self._contains_concrete_date(str(match["value"])):
+            return self._insufficient_response("insufficient_context: correspondence/procedural date evidence not found")
+
+        citation = AnswerCitation(
+            parent_chunk_id=match["parent_chunk_id"],
+            document_id=match.get("document_id"),
+            source_name=match.get("source_name"),
+            heading=match.get("heading"),
+            supporting_excerpt=match["excerpt"],
+        )
+        source_line = f"- {match.get('heading') or '(no heading)'}: {match['excerpt']}"
+        direct = self._correspondence_litigation_direct_answer(target, str(match["value"]))
+
+        return GenerateAnswerResult(
+            answer_text=(
+                f"Direct answer: {direct}\n\n"
+                "Supporting points:\n"
+                f"{source_line}\n\n"
+                "Caveats / limitations:\n"
+                "- Response is limited to correspondence/procedural milestone evidence in the retrieved context."
+            ),
+            grounded=True,
+            sufficient_context=True,
+            citations=[citation],
+            warnings=[],
+        )
+
+    def _correspondence_litigation_target(self, lowered_query: str) -> str | None:
+        if any(token in lowered_query for token in ("what letters were sent", "what emails were sent", "communications were sent")):
+            return "communications_sent"
+        if "deadline" in lowered_query and any(token in lowered_query for token in ("demand", "demanded")):
+            return "demand_deadline"
+        if "claim" in lowered_query and "filed" in lowered_query:
+            return "claim_filed"
+        if "defen" in lowered_query and any(token in lowered_query for token in ("due", "filed")):
+            return "defence_due_or_filed"
+        if any(token in lowered_query for token in ("procedural history", "what happened procedurally", "procedural status")):
+            return "procedural_history"
+        return None
+
+    def _resolve_correspondence_litigation_value(
+        self,
+        context: Sequence[dict[str, Any]],
+        target: str,
+    ) -> dict[str, Any] | None:
+        for item in context:
+            text = str(item.get("text") or "")
+            heading = str(item.get("heading") or "")
+            haystack = f"{heading}\n{text}".strip()
+            value = self._extract_correspondence_litigation_value(haystack, target)
+            if not value:
+                continue
+            excerpt = self._best_excerpt(text or haystack, value)
+            return {
+                "value": value,
+                "excerpt": excerpt or value,
+                "parent_chunk_id": item.get("parent_chunk_id", ""),
+                "document_id": item.get("document_id"),
+                "source_name": item.get("source_name"),
+                "heading": item.get("heading"),
+            }
+        return None
+
+    def _extract_correspondence_litigation_value(self, haystack: str, target: str) -> str | None:
+        lowered = haystack.lower()
+        date_pattern = r"(?:\d{4}-\d{2}-\d{2}|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+\d{1,2},\s*\d{4})"
+        if target == "communications_sent":
+            match = re.search(rf"\b(?:letter|email|correspondence)[^.\n;]{{0,120}}(?:sent|delivered|emailed|issued|dated)[^.\n;]{{0,120}}({date_pattern})", haystack, flags=re.IGNORECASE)
+            if match:
+                return match.group(0).strip()
+            return None
+        if target == "demand_deadline":
+            match = re.search(rf"\bdemand[^.\n;]{{0,160}}(?:by|no later than|within|deadline)[^.\n;]{{0,120}}({date_pattern}|\d+\s+days?)", haystack, flags=re.IGNORECASE)
+            if match:
+                return match.group(0).strip()
+            return None
+        if target == "claim_filed":
+            match = re.search(rf"\b(?:statement\s+of\s+claim|claim)[^.\n;]{{0,100}}(?:filed|issued)[^.\n;]{{0,80}}({date_pattern})", haystack, flags=re.IGNORECASE)
+            if match:
+                return match.group(0).strip()
+            return None
+        if target == "defence_due_or_filed":
+            match = re.search(rf"\b(?:statement\s+of\s+defen(?:c|s)e|defen(?:c|s)e)[^.\n;]{{0,120}}(?:due|filed|served)[^.\n;]{{0,90}}({date_pattern}|\d+\s+days?)", haystack, flags=re.IGNORECASE)
+            if match:
+                return match.group(0).strip()
+            return None
+        return None
+
+    def _extract_procedural_milestones(self, context: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+        milestones: list[dict[str, Any]] = []
+        marker_pattern = re.compile(
+            r"\b(?:statement of claim|statement of defen(?:c|s)e|defen(?:c|s)e|pleading|served|service|filed|issued|default notice|settlement discussion|court filing)\b",
+            flags=re.IGNORECASE,
+        )
+        for item in context:
+            text = str(item.get("text") or "")
+            if not text:
+                continue
+            match = marker_pattern.search(text)
+            if not match:
+                continue
+            excerpt = self._best_excerpt(text, match.group(0)) or text
+            date_match = re.search(
+                r"\b(?:\d{4}-\d{2}-\d{2}|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+\d{1,2},\s*\d{4})\b",
+                text,
+                flags=re.IGNORECASE,
+            )
+            if date_match:
+                label = f"{date_match.group(0)}: {excerpt}"
+            else:
+                label = excerpt
+            milestones.append(
+                {
+                    "label": label,
+                    "excerpt": excerpt,
+                    "parent_chunk_id": str(item.get("parent_chunk_id") or ""),
+                    "document_id": item.get("document_id"),
+                    "source_name": item.get("source_name"),
+                    "heading": item.get("heading"),
+                }
+            )
+        return milestones
+
+    def _correspondence_litigation_direct_answer(self, target: str, value: str) -> str:
+        if target == "communications_sent":
+            return f"The dated communications evidence states: {value}."
+        if target == "demand_deadline":
+            return f"The demand/deadline evidence states: {value}."
+        if target == "claim_filed":
+            return f"The claim filing evidence states: {value}."
+        return f"The defence due/filed evidence states: {value}."
+
+    def _procedural_when_date_required(self, lowered_query: str, target: str) -> bool:
+        if "when" not in lowered_query:
+            return False
+        return target in {"communications_sent", "claim_filed", "defence_due_or_filed", "demand_deadline"}
 
     def _generate_chronology_answer(
         self,

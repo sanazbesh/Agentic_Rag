@@ -321,6 +321,44 @@ def _is_employment_contract_lifecycle_query(normalized_query: str) -> bool:
     return any(re.search(pattern, lowered) for pattern in patterns)
 
 
+
+
+def _is_correspondence_litigation_milestone_query(normalized_query: str) -> bool:
+    lowered = _canonicalize_phrase(normalized_query)
+    if not lowered:
+        return False
+
+    patterns = (
+        r"\bwhat\s+letters?\s+(?:were|was)\s+sent\b",
+        r"\bwhat\s+emails?\s+(?:were|was)\s+sent\b",
+        r"\bwhat\s+communications?\s+(?:were|was)\s+sent\b",
+        r"\bwhen\s+(?:was|were|did)\s+.+\b(?:letter|email|communication|correspondence)\b",
+        r"\bwhat\s+deadlines?\s+(?:were|was)\s+demanded\b",
+        r"\bwhen\s+was\s+the\s+claim\s+filed\b",
+        r"\bwhen\s+was\s+the\s+statement\s+of\s+claim\s+filed\b",
+        r"\bwhen\s+was\s+the\s+defen(?:c|s)e\s+(?:due|filed)\b",
+        r"\bwhat\s+pleadings?\s+.*\b(?:filed|served)\b",
+        r"\bwhat\s+happened\s+procedurally\b",
+        r"\bprocedural\s+(?:history|status)\b",
+        r"\bcourt\s+filings?\b",
+        r"\bdefault\s+notice\b",
+        r"\bsettlement\s+discussion",
+    )
+    if any(re.search(pattern, lowered) for pattern in patterns):
+        return True
+
+    marker_groups = (
+        ("letter", "email", "communication", "correspondence", "demand"),
+        ("claim", "statement of claim", "pleading", "defence", "defense", "reply", "default notice"),
+        ("filed", "served", "service", "issued", "delivered"),
+    )
+    return (
+        any(marker in lowered for marker in marker_groups[0])
+        and any(marker in lowered for marker in ("when", "what", "deadline", "deadlines", "demanded", "sent"))
+    ) or (
+        any(marker in lowered for marker in marker_groups[1])
+        and any(marker in lowered for marker in marker_groups[2] + ("due", "deadline", "procedurally", "status"))
+    )
 def understand_query(
     query: str,
     conversation_summary: str | None = None,
@@ -343,6 +381,7 @@ def understand_query(
     is_chronology_date_event_query = _is_chronology_date_event_query(normalized)
     is_matter_metadata_query = _is_matter_metadata_query(normalized)
     is_employment_contract_lifecycle_query = _is_employment_contract_lifecycle_query(normalized)
+    is_correspondence_litigation_milestone_query = _is_correspondence_litigation_milestone_query(normalized)
 
     meta_markers = ("how many documents", "what files are loaded", "what documents are uploaded", "what docs are loaded")
     comparison_markers = ("compare", "differ", "difference", "vs ", "versus")
@@ -430,6 +469,7 @@ def understand_query(
         or is_chronology_date_event_query
         or is_matter_metadata_query
         or is_employment_contract_lifecycle_query
+        or is_correspondence_litigation_milestone_query
         or any(marker in lowered for marker in extractive_markers)
     ):
         question_type = "extractive_fact_query"
@@ -564,6 +604,7 @@ def understand_query(
         or is_party_role_entity_query
         or is_matter_metadata_query
         or is_employment_contract_lifecycle_query
+        or is_correspondence_litigation_milestone_query
     )
     should_extract_entities = is_party_role_entity_query or is_matter_metadata_query or any(
         marker in lowered
@@ -589,6 +630,8 @@ def understand_query(
         routing_notes.append("legal_question_family:matter_document_metadata")
     if is_employment_contract_lifecycle_query:
         routing_notes.append("legal_question_family:employment_contract_lifecycle")
+    if is_correspondence_litigation_milestone_query:
+        routing_notes.append("legal_question_family:correspondence_litigation_milestone")
 
     if question_type == "other_query" and refers_to_prior_document_scope and not context_available:
         ambiguity_notes.append("pronoun_reference_without_resolvable_scope")
