@@ -463,6 +463,31 @@ class AnswerabilityAssessor:
                     warnings=["heading_only_context"] if heading_only else [],
                 )
 
+            is_correspondence_query = self._is_correspondence_litigation_milestone_query(original_query, query_understanding)
+            if is_correspondence_query:
+                correspondence_support = self._evaluate_correspondence_litigation_milestone_support(
+                    query=original_query,
+                    substantive=matched,
+                )
+                if correspondence_support["supported"]:
+                    return build(
+                        status="sufficient",
+                        has_any_coverage=True,
+                        sufficient_coverage=True,
+                        partial_coverage=False,
+                        reason="fact_supported",
+                        supporting_signals=list(correspondence_support["signals"]),
+                    )
+                return build(
+                    status="weak",
+                    has_any_coverage=bool(matched),
+                    sufficient_coverage=False,
+                    partial_coverage=False,
+                    reason="fact_not_found",
+                    missing_requirements=list(correspondence_support["missing"]),
+                    warnings=["heading_only_context"] if heading_only else [],
+                )
+
             is_matter_metadata_query = self._is_matter_metadata_query(original_query, query_understanding)
             if is_matter_metadata_query:
                 found = self._has_matter_metadata_evidence(substantive, original_query)
@@ -928,6 +953,45 @@ class AnswerabilityAssessor:
         )
         return any(re.search(pattern, lowered) for pattern in patterns)
 
+    def _is_correspondence_litigation_milestone_query(
+        self,
+        query: str,
+        query_understanding: QueryUnderstandingResult,
+    ) -> bool:
+        if any(
+            note == "legal_question_family:correspondence_litigation_milestone"
+            for note in (query_understanding.routing_notes or [])
+        ):
+            return True
+        lowered = self._canonical_phrase(query)
+        patterns = (
+            r"\bwhat\s+letters?\s+(?:were|was)\s+sent\b",
+            r"\bwhat\s+emails?\s+(?:were|was)\s+sent\b",
+            r"\bwhat\s+deadlines?\s+(?:were|was)\s+demanded\b",
+            r"\bwhen\s+was\s+the\s+claim\s+filed\b",
+            r"\bwhen\s+was\s+the\s+defen(?:c|s)e\s+(?:due|filed)\b",
+            r"\bwhat\s+happened\s+procedurally\b",
+            r"\bprocedural\s+(?:history|status)\b",
+            r"\bcourt\s+filings?\b",
+            r"\bdefault\s+notice\b",
+        )
+        return any(re.search(pattern, lowered) for pattern in patterns)
+
+    def _procedural_target(self, lowered_query: str) -> str:
+        if any(token in lowered_query for token in ("what letters", "what emails", "communications were sent", "correspondence")):
+            return "communications_sent"
+        if "deadline" in lowered_query and any(token in lowered_query for token in ("demand", "demanded", "demand letter")):
+            return "demand_deadlines"
+        if "claim" in lowered_query and "filed" in lowered_query:
+            return "claim_filed"
+        if "defen" in lowered_query and any(token in lowered_query for token in ("due", "filed")):
+            return "defence_due_or_filed"
+        if "procedural" in lowered_query or "court filing" in lowered_query or "what happened procedurally" in lowered_query:
+            return "procedural_history"
+        if any(token in lowered_query for token in ("pleading", "served", "service", "default notice", "settlement")):
+            return "procedural_milestone"
+        return "unknown"
+
     def _evaluate_employment_lifecycle_support(
         self,
         *,
@@ -1048,6 +1112,83 @@ class AnswerabilityAssessor:
                 "accept",
             )
         )
+
+    def _evaluate_correspondence_litigation_milestone_support(
+        self,
+        *,
+        query: str,
+        substantive: Sequence[Mapping[str, str]],
+    ) -> dict[str, object]:
+        lowered_query = self._canonical_phrase(query)
+        target = self._procedural_target(lowered_query)
+        requires_date = "when" in lowered_query or any(token in lowered_query for token in ("date", "due", "deadline"))
+        if not substantive:
+            return {"supported": False, "signals": [], "missing": ["procedural_or_correspondence_responsive_evidence"]}
+
+        rows: list[tuple[str, str]] = []
+        for item in substantive:
+            raw_text = f"{item.get('heading', '')} {item.get('text', '')}".strip()
+            canonical = self._canonical_phrase(raw_text)
+            if canonical:
+                rows.append((canonical, raw_text))
+
+        def has(required: Sequence[str], any_of: Sequence[str] = ()) -> bool:
+            for canonical, _raw in rows:
+                if not all(token in canonical for token in required):
+                    continue
+                if any_of and not any(token in canonical for token in any_of):
+                    continue
+                return True
+            return False
+
+        def has_dated(required: Sequence[str], any_of: Sequence[str] = ()) -> bool:
+            for canonical, raw in rows:
+                if not all(token in canonical for token in required):
+                    continue
+                if any_of and not any(token in canonical for token in any_of):
+                    continue
+                if self._extract_datetimes(raw):
+                    return True
+            return False
+
+        if target == "communications_sent":
+            supported = has_dated(("letter",), ("sent", "email", "dated")) or has_dated(("email",), ("sent", "subject", "dated"))
+            if not supported and not requires_date:
+                supported = has(("letter",), ("sent", "email", "dated")) or has(("email",), ("sent", "subject", "dated"))
+            if supported:
+                return {"supported": True, "signals": ["correspondence_dated_communication_evidence_detected"], "missing": []}
+            return {"supported": False, "signals": [], "missing": ["dated_letter_or_email_sent_evidence"]}
+
+        if target == "demand_deadlines":
+            supported = has_dated(("demand",), ("by", "no later", "deadline", "within")) if requires_date else has(("demand",), ("by", "no later", "deadline", "within"))
+            if supported:
+                return {"supported": True, "signals": ["procedural_demand_deadline_evidence_detected"], "missing": []}
+            return {"supported": False, "signals": [], "missing": ["demand_deadline_language_evidence"]}
+
+        if target == "claim_filed":
+            supported = has_dated(("claim",), ("filed", "issued")) or has_dated(("statement", "claim"), ("filed", "issued"))
+            if supported:
+                return {"supported": True, "signals": ["procedural_claim_filing_evidence_detected"], "missing": []}
+            return {"supported": False, "signals": [], "missing": ["claim_filed_reference_with_date"]}
+
+        if target == "defence_due_or_filed":
+            supported = has_dated(("defence",), ("due", "filed", "served")) or has_dated(("defense",), ("due", "filed", "served"))
+            if not supported and not requires_date:
+                supported = has(("defence",), ("due", "filed", "served")) or has(("defense",), ("due", "filed", "served"))
+            if supported:
+                return {"supported": True, "signals": ["procedural_defence_deadline_or_filing_evidence_detected"], "missing": []}
+            return {"supported": False, "signals": [], "missing": ["defence_due_or_filed_evidence"]}
+
+        if target in {"procedural_history", "procedural_milestone"}:
+            milestone_required = ("filed", "served", "service", "pleading", "default notice", "settlement", "court filing", "issued")
+            for canonical, raw in rows:
+                if any(marker in canonical for marker in milestone_required):
+                    if self._extract_datetimes(raw) or not requires_date:
+                        return {"supported": True, "signals": ["procedural_milestone_responsive_evidence_detected"], "missing": []}
+            missing = "procedural_milestone_dated_evidence" if requires_date else "procedural_milestone_evidence"
+            return {"supported": False, "signals": [], "missing": [missing]}
+
+        return {"supported": False, "signals": [], "missing": ["procedural_or_correspondence_responsive_evidence"]}
 
     def _evaluate_chronology_support(
         self,
@@ -1667,6 +1808,12 @@ def _combine_coverage_and_strength(
 
     if any(
         note == "legal_question_family:employment_contract_lifecycle"
+        for note in (query_understanding.routing_notes or [])
+    ):
+        return "sufficient", True, not expectation_blocks_answer, False, None
+
+    if any(
+        note == "legal_question_family:correspondence_litigation_milestone"
         for note in (query_understanding.routing_notes or [])
     ):
         return "sufficient", True, not expectation_blocks_answer, False, None
