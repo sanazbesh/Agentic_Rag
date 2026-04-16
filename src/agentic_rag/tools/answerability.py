@@ -438,6 +438,28 @@ class AnswerabilityAssessor:
             )
 
         if expectation == "fact_extraction":
+            is_matter_metadata_query = self._is_matter_metadata_query(original_query, query_understanding)
+            if is_matter_metadata_query:
+                found = self._has_matter_metadata_evidence(substantive, original_query)
+                if found:
+                    return build(
+                        status="sufficient",
+                        has_any_coverage=True,
+                        sufficient_coverage=True,
+                        partial_coverage=False,
+                        reason="fact_supported",
+                        supporting_signals=["matter_document_metadata_responsive_evidence_detected"],
+                    )
+                return build(
+                    status="weak",
+                    has_any_coverage=bool(matched),
+                    sufficient_coverage=False,
+                    partial_coverage=False,
+                    reason="fact_not_found",
+                    missing_requirements=["matter_or_document_metadata_evidence_in_context"],
+                    warnings=["heading_only_context"] if heading_only else [],
+                )
+
             is_chronology_query = self._is_chronology_date_event_query(original_query, query_understanding)
             if is_chronology_query:
                 chronology_support = self._evaluate_chronology_support(
@@ -565,7 +587,6 @@ class AnswerabilityAssessor:
         separates titles/headings from substantive clause body text.
         """
 
-        del query_understanding  # intentionally not a primary strength driver
         original_query = (query or "").strip()
         normalized_context = [self._unit_to_item(unit) for unit in build_evidence_units(list(context or []))]
 
@@ -601,6 +622,10 @@ class AnswerabilityAssessor:
         has_title_only_match = bool(title_only_items) and not substantive_items and len(title_only_items) == total_items
         has_heading_only_match = bool(heading_only_items) and not substantive_items and len(heading_only_items) == total_items
         has_substantive_clause_text = bool(substantive_items)
+        metadata_responsive_support = self._is_matter_metadata_query(query, query_understanding) and self._has_matter_metadata_evidence(
+            normalized_context,
+            query,
+        )
         has_multiple_substantive_sections = (
             substantive_heading_count >= threshold.multiple_substantive_sections_threshold
             or substantive_parent_count >= threshold.multiple_substantive_sections_threshold
@@ -661,6 +686,22 @@ class AnswerabilityAssessor:
             )
 
         if not substantive_items and thin_body_items:
+            if metadata_responsive_support:
+                return EvidenceStrengthEvaluation(
+                    original_query=original_query,
+                    evidence_strength="moderate",
+                    has_title_only_match=False,
+                    has_heading_only_match=False,
+                    has_substantive_clause_text=False,
+                    has_multiple_substantive_sections=False,
+                    distinct_parent_chunk_count=distinct_parent_chunk_count,
+                    distinct_heading_count=distinct_heading_count,
+                    approximate_text_span_count=approximate_text_span_count,
+                    strength_reason="other",
+                    supporting_signals=[*supporting_signals, "metadata_responsive_header_or_caption_evidence"],
+                    weakness_signals=weakness_signals,
+                    warnings=[],
+                )
             return EvidenceStrengthEvaluation(
                 original_query=original_query,
                 evidence_strength="weak",
@@ -787,21 +828,22 @@ class AnswerabilityAssessor:
             return "topic_match_but_not_answer"
         return "other"
 
-    def _unit_to_item(self, unit: EvidenceUnit) -> dict[str, str]:
+    def _unit_to_item(self, unit: EvidenceUnit) -> dict[str, Any]:
         return {
             "evidence_unit_id": unit.evidence_unit_id,
             "parent_chunk_id": unit.parent_chunk_id,
             "heading": unit.heading,
             "text": unit.evidence_text,
             "source_name": unit.source_name,
+            "metadata": unit.metadata,
         }
 
-    def _is_relevant(self, item: Mapping[str, str], query_terms: set[str]) -> bool:
+    def _is_relevant(self, item: Mapping[str, Any], query_terms: set[str]) -> bool:
         haystack = f"{item.get('heading', '').lower()} {item.get('text', '').lower()}"
         tokens = set(re.findall(r"[a-z0-9]+", haystack))
         return any(term in tokens for term in query_terms)
 
-    def _is_heading_or_title_only(self, item: Mapping[str, str]) -> bool:
+    def _is_heading_or_title_only(self, item: Mapping[str, Any]) -> bool:
         body = (item.get("text") or "").strip()
         heading = (item.get("heading") or "").strip()
         if not body:
@@ -1064,6 +1106,123 @@ class AnswerabilityAssessor:
             r"\bis\s+this\s+agreement\s+between\b",
         )
         return any(re.search(pattern, lowered) for pattern in patterns)
+
+    def _is_matter_metadata_query(
+        self,
+        query: str,
+        query_understanding: QueryUnderstandingResult,
+    ) -> bool:
+        if any(note == "legal_question_family:matter_document_metadata" for note in (query_understanding.routing_notes or [])):
+            return True
+
+        lowered = self._canonical_phrase(query)
+        patterns = (
+            r"\bwhat\s+is\s+the\s+file\s+number\b",
+            r"\b(?:what|which)\s+jurisdiction\s+applies\b",
+            r"\b(?:what|which)\s+court\s+is\s+involved\b",
+            r"\bwho\s+is\s+the\s+client\b",
+            r"\bwhat\s+is\s+the\s+(?:case|matter)\s+name\b",
+            r"\bwhat\s+is\s+this\s+(?:matter|document)\s+about\b",
+        )
+        return any(re.search(pattern, lowered) for pattern in patterns)
+
+    def _has_matter_metadata_evidence(self, substantive: Sequence[Mapping[str, Any]], query: str) -> bool:
+        lowered_query = self._canonical_phrase(query)
+        target = self._metadata_target(lowered_query)
+        if target == "unknown":
+            return False
+
+        heading_markers = (
+            "caption",
+            "header",
+            "introduction",
+            "matter information",
+            "case information",
+            "style of cause",
+            "court",
+            "file",
+        )
+        for item in substantive:
+            text = (item.get("text") or "").strip().lower()
+            heading = (item.get("heading") or "").strip().lower()
+            source = (item.get("source_name") or "").strip().lower()
+            metadata_map = item.get("metadata") if isinstance(item.get("metadata"), Mapping) else {}
+            metadata_text = " ".join(self._metadata_values(metadata_map)).lower()
+            haystack = "\n".join(part for part in (heading, text, source, metadata_text) if part).strip()
+            if not haystack:
+                continue
+
+            has_metadata_container_signal = any(marker in haystack for marker in heading_markers)
+            if target == "file_number":
+                if re.search(r"\b(file|court file|docket|case)\s*(no\.?|number)\b", haystack):
+                    return True
+            elif target == "jurisdiction":
+                if re.search(r"\bjurisdiction\b\s*[:\-]", haystack):
+                    return True
+                if "jurisdiction" in haystack and ("exclusive" in haystack or "governing" in haystack or "applies" in haystack):
+                    return True
+                if re.search(r"\bgoverned\s+by\s+the\s+laws?\s+of\b", haystack):
+                    return True
+            elif target == "court":
+                if re.search(r"\b(supreme|district|chancery|appeal|high)\s+court\b", haystack):
+                    return True
+                if "court" in haystack and has_metadata_container_signal:
+                    return True
+            elif target == "client":
+                if re.search(r"\bclient\b\s*[:\-]", haystack):
+                    return True
+                if "client" in haystack and has_metadata_container_signal:
+                    return True
+            elif target == "case_or_matter_name":
+                if re.search(r"\b(case|matter)\s+name\b", haystack):
+                    return True
+                if " v. " in f" {haystack} " and has_metadata_container_signal:
+                    return True
+            elif target == "matter_about":
+                if re.search(r"\b(subject|re|regarding|matter)\b\s*[:\-]", haystack):
+                    return True
+                if "this matter concerns" in haystack or "this matter is about" in haystack:
+                    return True
+        return False
+
+    def _metadata_target(self, lowered_query: str) -> str:
+        if "file number" in lowered_query or "docket number" in lowered_query or "court file" in lowered_query:
+            return "file_number"
+        if "jurisdiction" in lowered_query:
+            return "jurisdiction"
+        if "court" in lowered_query:
+            return "court"
+        if "client" in lowered_query:
+            return "client"
+        if "case name" in lowered_query or "matter name" in lowered_query:
+            return "case_or_matter_name"
+        if "matter about" in lowered_query or "document about" in lowered_query:
+            return "matter_about"
+        return "unknown"
+
+    def _metadata_values(self, metadata: Mapping[str, object]) -> list[str]:
+        values: list[str] = []
+        for key, value in metadata.items():
+            key_text = str(key).strip().lower()
+            if key_text not in {
+                "matter_name",
+                "case_name",
+                "client",
+                "client_name",
+                "file_number",
+                "court_file_number",
+                "docket_number",
+                "jurisdiction",
+                "court",
+                "document_type",
+                "subject",
+                "matter",
+                "title",
+            }:
+                continue
+            if isinstance(value, str) and value.strip():
+                values.append(f"{key_text}: {value.strip()}")
+        return values
 
     def _has_party_role_evidence(self, substantive: Sequence[Mapping[str, str]], query: str) -> bool:
         fact_markers = self._fact_markers(query)

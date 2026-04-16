@@ -194,3 +194,11 @@ def test_non_party_clause_lookup_behavior_remains_unchanged() -> None:
     assert result.question_type == "document_content_query"
     assert result.answerability_expectation == "clause_lookup"
     assert "legal_question_family:party_role_entity" not in result.routing_notes
+
+
+def test_matter_metadata_question_recognized_as_distinct_legal_question_family() -> None:
+    result = understand_query("What court is involved?")
+
+    assert result.question_type == "extractive_fact_query"
+    assert result.answerability_expectation == "fact_extraction"
+    assert "legal_question_family:matter_document_metadata" in result.routing_notes

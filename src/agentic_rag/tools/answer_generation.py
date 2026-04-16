@@ -97,6 +97,9 @@ class LegalAnswerSynthesizer:
                     warnings=["insufficient_context: no retrieved parent chunks"],
                 )
 
+            matter_metadata_response = self._generate_matter_metadata_answer(normalized_context, normalized_query)
+            if matter_metadata_response is not None:
+                return matter_metadata_response
             party_role_response = self._generate_party_role_answer(normalized_context, normalized_query)
             if party_role_response is not None:
                 return party_role_response
@@ -257,6 +260,44 @@ class LegalAnswerSynthesizer:
 
         return None
 
+    def _generate_matter_metadata_answer(
+        self,
+        context: Sequence[dict[str, Any]],
+        query: str,
+    ) -> GenerateAnswerResult | None:
+        lowered_query = query.lower()
+        target = self._metadata_target(lowered_query)
+        if target is None:
+            return None
+
+        match = self._resolve_matter_metadata_value(context, target)
+        if match is None:
+            return self._insufficient_response("insufficient_context: metadata-responsive evidence not found")
+
+        citation = AnswerCitation(
+            parent_chunk_id=match["parent_chunk_id"],
+            document_id=match.get("document_id"),
+            source_name=match.get("source_name"),
+            heading=match.get("heading"),
+            supporting_excerpt=match["excerpt"],
+        )
+        source_line = f"- {match.get('heading') or '(no heading)'}: {match['excerpt']}"
+        direct = self._metadata_direct_answer(target, match["value"])
+
+        return GenerateAnswerResult(
+            answer_text=(
+                f"Direct answer: {direct}\n\n"
+                "Supporting points:\n"
+                f"{source_line}\n\n"
+                "Caveats / limitations:\n"
+                "- Response is limited to metadata-responsive caption/header/matter-information evidence in retrieved context."
+            ),
+            grounded=True,
+            sufficient_context=True,
+            citations=[citation],
+            warnings=[],
+        )
+
     def _party_role_success(
         self,
         *,
@@ -306,6 +347,110 @@ class LegalAnswerSynthesizer:
             r"\bis\s+this\s+agreement\s+between\b",
         )
         return any(re.search(pattern, lowered_query) for pattern in patterns)
+
+    def _metadata_target(self, lowered_query: str) -> str | None:
+        patterns: tuple[tuple[str, tuple[str, ...]], ...] = (
+            ("file_number", (r"\bfile\s+number\b", r"\bdocket\s+number\b", r"\bcourt\s+file\b")),
+            ("jurisdiction", (r"\bjurisdiction\b",)),
+            ("court", (r"\bwhat\s+court\b", r"\bwhich\s+court\b", r"\bcourt\s+is\s+involved\b")),
+            ("client", (r"\bwho\s+is\s+the\s+client\b", r"\bclient\b")),
+            ("case_or_matter_name", (r"\bcase\s+name\b", r"\bmatter\s+name\b")),
+            ("matter_about", (r"\bwhat\s+is\s+this\s+matter\s+about\b", r"\bwhat\s+is\s+this\s+document\s+about\b")),
+        )
+        for target, target_patterns in patterns:
+            if any(re.search(pattern, lowered_query) for pattern in target_patterns):
+                return target
+        return None
+
+    def _resolve_matter_metadata_value(
+        self,
+        context: Sequence[dict[str, Any]],
+        target: str,
+    ) -> dict[str, Any] | None:
+        for item in context:
+            haystack = " ".join(
+                (
+                    str(item.get("heading") or ""),
+                    str(item.get("text") or ""),
+                    " ".join(f"{k}: {v}" for k, v in dict(item.get("metadata") or {}).items()),
+                )
+            )
+            value = self._extract_metadata_value(haystack, target, dict(item.get("metadata") or {}))
+            if not value:
+                continue
+            excerpt = self._best_excerpt(str(item.get("text") or haystack), target.replace("_", " "))
+            return {
+                "value": value,
+                "excerpt": excerpt or value,
+                "parent_chunk_id": item.get("parent_chunk_id", ""),
+                "document_id": item.get("document_id"),
+                "source_name": item.get("source_name"),
+                "heading": item.get("heading"),
+            }
+        return None
+
+    def _extract_metadata_value(self, haystack: str, target: str, metadata: dict[str, Any]) -> str | None:
+        lower = haystack.lower()
+        if target == "file_number":
+            for key in ("file_number", "court_file_number", "docket_number"):
+                value = metadata.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+            match = re.search(r"\b(?:file|court file|docket|case)\s*(?:no\.?|number)\s*[:#-]?\s*([a-z0-9\-\/]+)", lower)
+            return match.group(1).strip().upper() if match else None
+        if target == "jurisdiction":
+            value = metadata.get("jurisdiction")
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+            match = re.search(r"\bjurisdiction\s*[:\-]\s*([a-z][a-z\s]+)", lower)
+            if match:
+                return match.group(1).strip().title()
+            match = re.search(r"\bgoverned by the laws of\s+([a-z][a-z\s]+)", lower)
+            return match.group(1).strip().title() if match else None
+        if target == "court":
+            value = metadata.get("court")
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+            match = re.search(r"\b((?:supreme|district|chancery|high|appeal)\s+court(?:\s+of\s+[a-z\s]+)?)\b", lower)
+            return match.group(1).strip().title() if match else None
+        if target == "client":
+            for key in ("client", "client_name"):
+                value = metadata.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+            match = re.search(r"\bclient\s*[:\-]\s*([a-z0-9.,&()' -]+)", haystack, flags=re.IGNORECASE)
+            return match.group(1).strip() if match else None
+        if target == "case_or_matter_name":
+            for key in ("case_name", "matter_name", "title"):
+                value = metadata.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+            match = re.search(r"\b(?:case|matter)\s+name\s*[:\-]\s*([^\n.;]+)", haystack, flags=re.IGNORECASE)
+            if match:
+                return match.group(1).strip()
+            match = re.search(r"\b([A-Z][A-Za-z0-9&.,' -]+\s+v\.\s+[A-Z][A-Za-z0-9&.,' -]+)\b", haystack)
+            return match.group(1).strip() if match else None
+        if target == "matter_about":
+            for key in ("subject", "matter"):
+                value = metadata.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+            match = re.search(r"\b(?:subject|re|regarding|matter)\s*[:\-]\s*([^\n.;]+)", haystack, flags=re.IGNORECASE)
+            return match.group(1).strip() if match else None
+        return None
+
+    def _metadata_direct_answer(self, target: str, value: str) -> str:
+        if target == "file_number":
+            return f"The file number is {value}."
+        if target == "jurisdiction":
+            return f"The applicable jurisdiction is {value}."
+        if target == "court":
+            return f"The court involved is {value}."
+        if target == "client":
+            return f"The client is {value}."
+        if target == "case_or_matter_name":
+            return f"The case/matter name is {value}."
+        return f"The matter/document is about {value}."
 
     def _generate_chronology_answer(
         self,
@@ -772,6 +917,7 @@ def _unit_to_context_row(unit: EvidenceUnit) -> dict[str, Any]:
         "source_name": _as_optional_str(unit.source_name),
         "heading": _as_optional_str(unit.heading),
         "text": unit.evidence_text,
+        "metadata": dict(unit.metadata),
     }
 
 

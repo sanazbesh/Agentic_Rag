@@ -247,3 +247,13 @@ def test_rewrite_query_expands_party_role_entity_query_for_intro_line_retrieval(
     assert result.rewrite_notes == "party_role_entity_query_expansion"
     assert "by and between" in result.rewritten_query.lower()
     assert "employer" in result.rewritten_query.lower()
+
+
+def test_rewrite_query_expands_matter_document_metadata_query_for_caption_header_retrieval() -> None:
+    query = "what is the file number?"
+
+    result = rewrite_query(query)
+
+    assert result.rewrite_notes == "matter_document_metadata_query_expansion"
+    assert "caption" in result.rewritten_query.lower()
+    assert "matter information" in result.rewritten_query.lower()

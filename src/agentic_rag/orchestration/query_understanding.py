@@ -243,6 +243,59 @@ def _is_chronology_date_event_query(normalized_query: str) -> bool:
     return has_temporal_word and has_question_frame
 
 
+def _is_matter_metadata_query(normalized_query: str) -> bool:
+    lowered = _canonicalize_phrase(normalized_query)
+    if not lowered:
+        return False
+
+    metadata_patterns = (
+        r"\bwhat\s+is\s+the\s+file\s+number\b",
+        r"\bwhat\s+is\s+the\s+matter\s+name\b",
+        r"\bwhat\s+is\s+the\s+case\s+name\b",
+        r"\bwho\s+is\s+the\s+client\b",
+        r"\bwhat\s+jurisdiction\s+applies\b",
+        r"\bwhich\s+jurisdiction\s+applies\b",
+        r"\bwhat\s+court\s+is\s+involved\b",
+        r"\bwhich\s+court\s+is\s+involved\b",
+        r"\bwhat\s+is\s+this\s+matter\s+about\b",
+        r"\bwhat\s+is\s+this\s+document\s+about\b",
+    )
+    if any(re.search(pattern, lowered) for pattern in metadata_patterns):
+        return True
+
+    metadata_markers = (
+        "matter name",
+        "case name",
+        "client",
+        "file number",
+        "court file number",
+        "docket number",
+        "jurisdiction",
+        "governing forum",
+        "court",
+        "caption",
+        "matter information",
+    )
+    has_marker = any(marker in lowered for marker in metadata_markers)
+    has_question_frame = any(
+        marker in lowered
+        for marker in (
+            "what is",
+            "which is",
+            "which",
+            "who is",
+            "who's",
+            "what court",
+            "what jurisdiction",
+            "which court",
+            "which jurisdiction",
+            "about this matter",
+            "about this document",
+        )
+    )
+    return has_marker and has_question_frame
+
+
 def understand_query(
     query: str,
     conversation_summary: str | None = None,
@@ -263,6 +316,7 @@ def understand_query(
     context_available = bool(_text(conversation_summary) or list(recent_messages or []))
     is_party_role_entity_query = _is_party_role_entity_query(normalized)
     is_chronology_date_event_query = _is_chronology_date_event_query(normalized)
+    is_matter_metadata_query = _is_matter_metadata_query(normalized)
 
     meta_markers = ("how many documents", "what files are loaded", "what documents are uploaded", "what docs are loaded")
     comparison_markers = ("compare", "differ", "difference", "vs ", "versus")
@@ -331,7 +385,12 @@ def understand_query(
         question_type = "document_summary_query"
     elif explicit_document_scope and any(marker in lowered for marker in doc_content_markers):
         question_type = "document_content_query"
-    elif is_party_role_entity_query or is_chronology_date_event_query or any(marker in lowered for marker in extractive_markers):
+    elif (
+        is_party_role_entity_query
+        or is_chronology_date_event_query
+        or is_matter_metadata_query
+        or any(marker in lowered for marker in extractive_markers)
+    ):
         question_type = "extractive_fact_query"
     elif lowered.startswith(definition_starters):
         question_type = "definition_query"
@@ -346,7 +405,7 @@ def understand_query(
 
     # Deterministic "what is X?" rule insertion point:
     # apply only after hint extraction and before final answerability assignment.
-    if is_canonical_what_is:
+    if is_canonical_what_is and not is_matter_metadata_query:
         available_documents = bool(active_documents or selected_documents)
         combined_hints = [*resolved_topic_hints, *resolved_clause_hints]
         canonical_subject = _canonicalize_phrase(what_is_subject or "")
@@ -462,8 +521,9 @@ def understand_query(
         question_type in {"ambiguous_query"}
         or (is_context_dependent and not explicit_document_scope)
         or is_party_role_entity_query
+        or is_matter_metadata_query
     )
-    should_extract_entities = is_party_role_entity_query or any(
+    should_extract_entities = is_party_role_entity_query or is_matter_metadata_query or any(
         marker in lowered
         for marker in ("law", "jurisdiction", "court", "statute", "regulation", "clause", "section", "ontario", "california")
     )
@@ -483,6 +543,8 @@ def understand_query(
         routing_notes.append("legal_question_family:party_role_entity")
     if is_chronology_date_event_query:
         routing_notes.append("legal_question_family:chronology_date_event")
+    if is_matter_metadata_query:
+        routing_notes.append("legal_question_family:matter_document_metadata")
 
     if question_type == "other_query" and refers_to_prior_document_scope and not context_available:
         ambiguity_notes.append("pronoun_reference_without_resolvable_scope")

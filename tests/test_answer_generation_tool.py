@@ -15,7 +15,13 @@ class _CompressedLike:
     compressed_text: str
 
 
-def _parent(parent_id: str, heading: str, text: str, document_id: str = "doc-1") -> ParentChunkResult:
+def _parent(
+    parent_id: str,
+    heading: str,
+    text: str,
+    document_id: str = "doc-1",
+    metadata: dict[str, str] | None = None,
+) -> ParentChunkResult:
     return ParentChunkResult(
         parent_chunk_id=parent_id,
         document_id=document_id,
@@ -27,6 +33,7 @@ def _parent(parent_id: str, heading: str, text: str, document_id: str = "doc-1")
         parent_order=0,
         part_number=1,
         total_parts=1,
+        metadata=metadata or {},
     )
 
 
@@ -266,3 +273,34 @@ def test_non_party_clause_lookup_behavior_remains_unchanged() -> None:
     assert result.grounded is True
     assert result.citations
     assert "confidential" in result.answer_text.lower()
+
+
+def test_matter_metadata_file_number_answer_uses_metadata_responsive_evidence() -> None:
+    context = [
+        _parent(
+            "p-1",
+            "Matter Information",
+            "File Number: CV-2025-0192",
+            metadata={"file_number": "CV-2025-0192"},
+        )
+    ]
+
+    result = generate_answer(context, "What is the file number?")
+
+    assert result.sufficient_context is True
+    assert "CV-2025-0192" in result.answer_text
+
+
+def test_matter_metadata_question_does_not_use_unrelated_clause_text() -> None:
+    context = [
+        _parent(
+            "p-1",
+            "Termination",
+            "Either party may terminate this Agreement with thirty days written notice.",
+        )
+    ]
+
+    result = generate_answer(context, "What is the file number?")
+
+    assert result.sufficient_context is False
+    assert result.grounded is False
