@@ -57,6 +57,21 @@ class FinalAnswerModel(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class SubqueryGroundedSubanswer(BaseModel):
+    """Intermediate per-subquery grounded answer artifact for future synthesis."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    subquery_id: str
+    subquery_question: str
+    answer_text: str
+    grounded: bool
+    support_classification: Literal["supported", "weak", "unsupported"]
+    citations: list[AnswerCitation] = Field(default_factory=list)
+    insufficiency_reason: str | None = None
+    warnings: list[str] = Field(default_factory=list)
+
+
 class LegalRagState(RetrievalStageState, total=False):
     """Retrieval + answer stage state.
 
@@ -77,6 +92,7 @@ class LegalRagState(RetrievalStageState, total=False):
     should_return_partial_response: bool
     should_return_insufficient_response: bool
     response_route: str
+    subquery_subanswers: list[SubqueryGroundedSubanswer]
 
 
 class AnswerGenerator(Protocol):
@@ -139,6 +155,7 @@ def default_legal_rag_state(
             "should_return_partial_response": False,
             "should_return_insufficient_response": True,
             "response_route": "unresolved",
+            "subquery_subanswers": [],
         }
     )
     return cast(LegalRagState, merged)
@@ -453,6 +470,133 @@ class AnswerStageNodes:
             logger.info("node_exit name=assess_answerability success=false reason=%s", type(exc).__name__)
         return cast(LegalRagState, updated)
 
+    def generate_subquery_subanswers(self, state: LegalRagState) -> LegalRagState:
+        """Generate one intermediate grounded subanswer for each covered subquery."""
+
+        logger.info("node_enter name=generate_subquery_subanswers")
+        updated = dict(state)
+        warnings = list(updated.get("warnings", []))
+        plan = updated.get("decomposition_plan")
+        should_generate_answer = bool(updated.get("should_generate_answer", False))
+        coverage_records = [
+            item for item in list(updated.get("subquery_coverage", [])) if isinstance(item, SubqueryCoverageRecord)
+        ]
+        answer_context = list(updated.get("answer_context", []))
+
+        if not isinstance(plan, DecompositionPlan) or not plan.subqueries or not coverage_records:
+            updated["subquery_subanswers"] = []
+            logger.info("node_exit name=generate_subquery_subanswers skipped=true")
+            return cast(LegalRagState, updated)
+
+        subquery_by_id = {subquery.id: subquery for subquery in plan.subqueries if subquery.id}
+        subanswers: list[SubqueryGroundedSubanswer] = []
+        for record in coverage_records:
+            subquery = subquery_by_id.get(record.subquery_id)
+            subquery_question = subquery.question if subquery is not None else ""
+
+            if record.support_classification != "supported":
+                subanswers.append(
+                    SubqueryGroundedSubanswer(
+                        subquery_id=record.subquery_id,
+                        subquery_question=subquery_question,
+                        answer_text="No grounded subanswer generated due to insufficient subquery support.",
+                        citations=[],
+                        grounded=False,
+                        support_classification=record.support_classification,
+                        insufficiency_reason=record.insufficiency_reason,
+                        warnings=[
+                            f"subquery_not_answerable:{record.support_classification}",
+                            *(
+                                [f"subquery_insufficiency_reason:{record.insufficiency_reason}"]
+                                if record.insufficiency_reason
+                                else []
+                            ),
+                        ],
+                    )
+                )
+                continue
+
+            if not should_generate_answer:
+                subanswers.append(
+                    SubqueryGroundedSubanswer(
+                        subquery_id=record.subquery_id,
+                        subquery_question=subquery_question,
+                        answer_text="No grounded subanswer generated because answerability did not approve answer generation.",
+                        citations=[],
+                        grounded=False,
+                        support_classification="weak",
+                        insufficiency_reason="answerability_gate_blocked_generation",
+                        warnings=["subquery_generation_blocked_by_answerability_gate"],
+                    )
+                )
+                continue
+
+            allowed_parent_ids = {
+                parent_chunk_id
+                for parent_chunk_id in record.evidence_parent_chunk_ids
+                if isinstance(parent_chunk_id, str) and parent_chunk_id
+            }
+            scoped_context = [
+                item
+                for item in answer_context
+                if str(getattr(item, "parent_chunk_id", "") or (item.get("parent_chunk_id") if isinstance(item, Mapping) else ""))
+                in allowed_parent_ids
+            ]
+            if not scoped_context:
+                subanswers.append(
+                    SubqueryGroundedSubanswer(
+                        subquery_id=record.subquery_id,
+                        subquery_question=subquery_question,
+                        answer_text="No grounded subanswer generated because no subquery-linked evidence was available.",
+                        citations=[],
+                        grounded=False,
+                        support_classification="unsupported",
+                        insufficiency_reason="no_subquery_scoped_context",
+                        warnings=["subquery_scoped_context_empty"],
+                    )
+                )
+                continue
+
+            try:
+                raw = self.answer_generator(scoped_context, subquery_question)
+                validated = _validate_answer_payload(raw)
+                filtered_citations = [
+                    citation for citation in validated.citations if citation.parent_chunk_id in allowed_parent_ids
+                ]
+                citation_scope_warnings = []
+                if len(filtered_citations) != len(validated.citations):
+                    citation_scope_warnings.append("subquery_citation_scope_adjusted")
+                subanswers.append(
+                    SubqueryGroundedSubanswer(
+                        subquery_id=record.subquery_id,
+                        subquery_question=subquery_question,
+                        answer_text=validated.answer_text,
+                        citations=filtered_citations,
+                        grounded=bool(validated.grounded and filtered_citations),
+                        support_classification="supported",
+                        insufficiency_reason=None,
+                        warnings=[*validated.warnings, *citation_scope_warnings],
+                    )
+                )
+            except Exception as exc:
+                subanswers.append(
+                    SubqueryGroundedSubanswer(
+                        subquery_id=record.subquery_id,
+                        subquery_question=subquery_question,
+                        answer_text="No grounded subanswer generated because generation failed safely.",
+                        citations=[],
+                        grounded=False,
+                        support_classification="unsupported",
+                        insufficiency_reason=f"generation_failed:{type(exc).__name__}",
+                        warnings=[f"subquery_answer_generation_failed:{record.subquery_id}:{type(exc).__name__}"],
+                    )
+                )
+
+        updated["subquery_subanswers"] = subanswers
+        updated["warnings"] = warnings
+        logger.info("node_exit name=generate_subquery_subanswers subanswer_count=%s", len(subanswers))
+        return cast(LegalRagState, updated)
+
     def generate_grounded_answer(self, state: LegalRagState) -> LegalRagState:
         """Call `generate_answer(context, effective_query)` and persist structured output."""
 
@@ -655,6 +799,7 @@ class _FallbackAnswerGraph:
         current = state
         current = self._nodes.prepare_answer_context(current)
         current = self._nodes.assess_answerability(current)
+        current = self._nodes.generate_subquery_subanswers(current)
         route = self._nodes.route_after_answerability(current)
         if route == "generate_grounded_answer":
             current = self._nodes.generate_grounded_answer(current)
@@ -679,14 +824,16 @@ def build_answer_graph(
     graph = StateGraph(LegalRagState)
     graph.add_node("prepare_answer_context", nodes.prepare_answer_context)
     graph.add_node("assess_answerability", nodes.assess_answerability)
+    graph.add_node("generate_subquery_subanswers", nodes.generate_subquery_subanswers)
     graph.add_node("generate_grounded_answer", nodes.generate_grounded_answer)
     graph.add_node("build_insufficient_response", nodes.build_insufficient_response)
     graph.add_node("finalize_response", nodes.finalize_response)
 
     graph.add_edge(START, "prepare_answer_context")
     graph.add_edge("prepare_answer_context", "assess_answerability")
+    graph.add_edge("assess_answerability", "generate_subquery_subanswers")
     graph.add_conditional_edges(
-        "assess_answerability",
+        "generate_subquery_subanswers",
         nodes.route_after_answerability,
         {
             "generate_grounded_answer": "generate_grounded_answer",
