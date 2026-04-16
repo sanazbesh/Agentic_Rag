@@ -109,6 +109,9 @@ class LegalAnswerSynthesizer:
             mitigation_response = self._generate_employment_mitigation_answer(normalized_context, normalized_query)
             if mitigation_response is not None:
                 return mitigation_response
+            financial_response = self._generate_financial_entitlement_answer(normalized_context, normalized_query)
+            if financial_response is not None:
+                return financial_response
             lifecycle_response = self._generate_employment_lifecycle_answer(normalized_context, normalized_query)
             if lifecycle_response is not None:
                 return lifecycle_response
@@ -813,6 +816,128 @@ class LegalAnswerSynthesizer:
         if "roe" in lowered_query or "record of employment" in lowered_query:
             return "roe"
         return None
+
+    def _generate_financial_entitlement_answer(
+        self,
+        context: Sequence[dict[str, Any]],
+        query: str,
+    ) -> GenerateAnswerResult | None:
+        lowered_query = query.lower()
+        target = self._financial_entitlement_target(lowered_query)
+        if target is None:
+            return None
+
+        match = self._resolve_financial_entitlement_value(context, target)
+        if match is None:
+            return self._insufficient_response("insufficient_context: financial entitlement-responsive evidence not found")
+
+        citation = AnswerCitation(
+            parent_chunk_id=match["parent_chunk_id"],
+            document_id=match.get("document_id"),
+            source_name=match.get("source_name"),
+            heading=match.get("heading"),
+            supporting_excerpt=match["excerpt"],
+        )
+        source_line = f"- {match.get('heading') or '(no heading)'}: {match['excerpt']}"
+        direct = self._financial_entitlement_direct_answer(target, str(match["value"]))
+
+        return GenerateAnswerResult(
+            answer_text=(
+                f"Direct answer: {direct}\n\n"
+                "Supporting points:\n"
+                f"{source_line}\n\n"
+                "Caveats / limitations:\n"
+                "- Response is limited to financial entitlement evidence in the retrieved employment-law context."
+            ),
+            grounded=True,
+            sufficient_context=True,
+            citations=[citation],
+            warnings=[],
+        )
+
+    def _financial_entitlement_target(self, lowered_query: str) -> str | None:
+        if "financial records" in lowered_query or "what records support" in lowered_query or "support the claim" in lowered_query:
+            return "financial_records"
+        if "unpaid" in lowered_query:
+            return "unpaid_amounts"
+        if "bonus" in lowered_query or "vacation pay" in lowered_query:
+            return "bonus_or_vacation_pay"
+        if "reimbursement" in lowered_query or "expense" in lowered_query:
+            return "reimbursement"
+        if "severance" in lowered_query:
+            return "severance"
+        if any(token in lowered_query for token in ("compensation", "salary", "pay rate", "remuneration", "promised")):
+            return "compensation"
+        return None
+
+    def _resolve_financial_entitlement_value(
+        self,
+        context: Sequence[dict[str, Any]],
+        target: str,
+    ) -> dict[str, Any] | None:
+        if target == "financial_records":
+            preferred_markers = ("pay stub", "payroll record", "payroll")
+            fallback: dict[str, Any] | None = None
+            for item in context:
+                haystack = f"{item.get('heading', '')} {item.get('text', '')}".strip()
+                value = self._extract_financial_entitlement_value(haystack, target)
+                if not value:
+                    continue
+                excerpt = self._best_excerpt(str(item.get("text", "")), str(value)) or str(value)
+                candidate = {**item, "value": value, "excerpt": excerpt}
+                canonical = value.lower()
+                if any(marker in canonical for marker in preferred_markers):
+                    return candidate
+                if fallback is None:
+                    fallback = candidate
+            return fallback
+
+        for item in context:
+            haystack = f"{item.get('heading', '')} {item.get('text', '')}".strip()
+            value = self._extract_financial_entitlement_value(haystack, target)
+            if not value:
+                continue
+            excerpt = self._best_excerpt(str(item.get("text", "")), str(value)) or str(value)
+            return {**item, "value": value, "excerpt": excerpt}
+        return None
+
+    def _extract_financial_entitlement_value(self, haystack: str, target: str) -> str | None:
+        if target == "compensation":
+            match = re.search(r"\b(?:compensation|salary|base salary|pay rate|remuneration)[^.\n;]{0,180}", haystack, flags=re.IGNORECASE)
+            return match.group(0).strip() if match else None
+        if target == "unpaid_amounts":
+            match = re.search(r"\b(?:unpaid|outstanding|owing)[^.\n;]{0,180}", haystack, flags=re.IGNORECASE)
+            return match.group(0).strip() if match else None
+        if target == "bonus_or_vacation_pay":
+            match = re.search(r"\b(?:bonus|vacation pay|vacation)[^.\n;]{0,180}", haystack, flags=re.IGNORECASE)
+            return match.group(0).strip() if match else None
+        if target == "reimbursement":
+            match = re.search(r"\b(?:reimburse(?:ment|ments)?|expense(?:s)?)[^.\n;]{0,180}", haystack, flags=re.IGNORECASE)
+            return match.group(0).strip() if match else None
+        if target == "severance":
+            match = re.search(r"\bseverance[^.\n;]{0,180}", haystack, flags=re.IGNORECASE)
+            return match.group(0).strip() if match else None
+        if target == "financial_records":
+            match = re.search(
+                r"\b(?:pay stub(?:s)?|payroll record(?:s)?|expense record(?:s)?|reimbursement record(?:s)?|demand letter|financial summary)[^.\n;]{0,180}",
+                haystack,
+                flags=re.IGNORECASE,
+            )
+            return match.group(0).strip() if match else None
+        return None
+
+    def _financial_entitlement_direct_answer(self, target: str, value: str) -> str:
+        if target == "compensation":
+            return f"The compensation evidence states: {value}."
+        if target == "unpaid_amounts":
+            return f"The unpaid-amount evidence states: {value}."
+        if target == "bonus_or_vacation_pay":
+            return f"The bonus/vacation-pay evidence states: {value}."
+        if target == "reimbursement":
+            return f"The reimbursement evidence states: {value}."
+        if target == "severance":
+            return f"The severance evidence states: {value}."
+        return f"The financial-records evidence states: {value}."
 
     def _resolve_employment_lifecycle_value(
         self,
