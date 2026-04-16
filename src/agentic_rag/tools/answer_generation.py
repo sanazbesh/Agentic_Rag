@@ -656,7 +656,14 @@ class LegalAnswerSynthesizer:
         date_pattern = r"(?:\d{4}-\d{2}-\d{2}|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+\d{1,2},\s*\d{4})"
         if target == "offer_acceptance":
             if "offer" in lowered and any(token in lowered for token in ("accept", "accepted", "acceptance")):
-                match = re.search(rf"\boffer.{0,80}(?:accepted|acceptance).{{0,40}}(?:on\s+({date_pattern}))?", haystack, flags=re.IGNORECASE)
+                dated_match = re.search(
+                    rf"\boffer[^.\n;]{{0,80}}(?:accepted|acceptance)[^.\n;]{{0,80}}(?:on\s+)?({date_pattern})",
+                    haystack,
+                    flags=re.IGNORECASE,
+                )
+                if dated_match:
+                    return dated_match.group(0).strip()
+                match = re.search(r"\boffer[^.\n;]{0,120}(?:accepted|acceptance)[^.\n;]{0,120}", haystack, flags=re.IGNORECASE)
                 return match.group(0).strip() if match else "Offer acceptance terms are present."
             return None
         if target == "employment_start":
@@ -710,7 +717,7 @@ class LegalAnswerSynthesizer:
     def _is_lifecycle_when_date_required_query(self, lowered_query: str, target: str) -> bool:
         if "when" not in lowered_query:
             return False
-        return target in {"offer_acceptance", "employment_start", "probation", "termination_effective", "roe"}
+        return target in {"offer_acceptance", "employment_start", "probation", "termination_effective"}
 
     def _contains_concrete_date(self, value: str) -> bool:
         return bool(

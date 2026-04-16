@@ -91,6 +91,17 @@ def test_start_date_question_uses_effective_or_commencement_evidence_when_presen
     assert "January 9, 2023" in answer.answer_text
 
 
+def test_offer_acceptance_question_uses_offer_acceptance_evidence_when_present() -> None:
+    query = "When was the offer accepted?"
+    understanding = understand_query(query)
+    result = assess_answerability(query, understanding, _lifecycle_context())
+    answer = generate_answer(_lifecycle_context(), query)
+
+    assert result.sufficient_context is True
+    assert "employment_lifecycle_offer_acceptance_evidence_detected" in result.evidence_notes
+    assert "offer/acceptance evidence" in answer.answer_text.lower()
+
+
 def test_start_date_question_accepts_commencement_date_evidence_without_literal_employment_token() -> None:
     query = "When did employment start?"
     understanding = understand_query(query)
@@ -212,9 +223,10 @@ def test_roe_question_uses_roe_reference_when_present() -> None:
     result = assess_answerability(query, understanding, _lifecycle_context())
     answer = generate_answer(_lifecycle_context(), query)
 
-    assert result.sufficient_context is False
-    assert result.insufficiency_reason == "fact_not_found"
-    assert answer.sufficient_context is False
+    assert result.sufficient_context is True
+    assert "employment_lifecycle_roe_evidence_detected" in result.evidence_notes
+    assert answer.sufficient_context is True
+    assert "record of employment" in answer.answer_text.lower() or "roe" in answer.answer_text.lower()
 
 
 def test_missing_or_ambiguous_lifecycle_evidence_fails_safely() -> None:

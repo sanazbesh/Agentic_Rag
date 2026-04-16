@@ -1044,8 +1044,6 @@ class AnswerabilityAssessor:
                 "commencement",
                 "probation",
                 "termination",
-                "roe",
-                "record of employment",
                 "offer",
                 "accept",
             )
