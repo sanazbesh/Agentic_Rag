@@ -355,6 +355,34 @@ def _is_employment_mitigation_query(normalized_query: str) -> bool:
     return has_employment_frame and any(marker in lowered for marker in evidence_markers)
 
 
+def _is_financial_entitlement_query(normalized_query: str) -> bool:
+    lowered = _canonicalize_phrase(normalized_query)
+    if not lowered:
+        return False
+
+    patterns = (
+        r"\bwhat\s+compensation\s+was\s+promised\b",
+        r"\bpromised\s+compensation\b",
+        r"\bsalary\b",
+        r"\bpay\s+rate\b",
+        r"\bremuneration\b",
+        r"\bunpaid\b",
+        r"\bunpaid\s+(?:wages?|amounts?)\b",
+        r"\bamounts?\s+(?:are|were)\s+unpaid\b",
+        r"\bbonus\b",
+        r"\bvacation\s+pay\b",
+        r"\breimburse(?:ment|ments)?\b",
+        r"\bexpense(?:s)?\b",
+        r"\bseverance\b",
+        r"\bfinancial\s+records?\b",
+        r"\bpay\s+stub(?:s)?\b",
+        r"\bpayroll\s+records?\b",
+        r"\bdemand\s+letter\b",
+        r"\bmonetary\s+claim\b",
+    )
+    return any(re.search(pattern, lowered) for pattern in patterns)
+
+
 
 
 def _is_correspondence_litigation_milestone_query(normalized_query: str) -> bool:
@@ -416,6 +444,7 @@ def understand_query(
     is_matter_metadata_query = _is_matter_metadata_query(normalized)
     is_employment_contract_lifecycle_query = _is_employment_contract_lifecycle_query(normalized)
     is_employment_mitigation_query = _is_employment_mitigation_query(normalized)
+    is_financial_entitlement_query = _is_financial_entitlement_query(normalized)
     is_correspondence_litigation_milestone_query = _is_correspondence_litigation_milestone_query(normalized)
 
     meta_markers = ("how many documents", "what files are loaded", "what documents are uploaded", "what docs are loaded")
@@ -505,6 +534,7 @@ def understand_query(
         or is_matter_metadata_query
         or is_employment_contract_lifecycle_query
         or is_employment_mitigation_query
+        or is_financial_entitlement_query
         or is_correspondence_litigation_milestone_query
         or any(marker in lowered for marker in extractive_markers)
     ):
@@ -669,6 +699,8 @@ def understand_query(
         routing_notes.append("legal_question_family:employment_contract_lifecycle")
     if is_employment_mitigation_query:
         routing_notes.append("legal_question_family:employment_mitigation")
+    if is_financial_entitlement_query:
+        routing_notes.append("legal_question_family:financial_entitlement")
     if is_correspondence_litigation_milestone_query:
         routing_notes.append("legal_question_family:correspondence_litigation_milestone")
 

@@ -488,6 +488,31 @@ class AnswerabilityAssessor:
                     warnings=["heading_only_context"] if heading_only else [],
                 )
 
+            is_financial_query = self._is_financial_entitlement_query(original_query, query_understanding)
+            if is_financial_query:
+                financial_support = self._evaluate_financial_entitlement_support(
+                    query=original_query,
+                    substantive=matched,
+                )
+                if financial_support["supported"]:
+                    return build(
+                        status="sufficient",
+                        has_any_coverage=True,
+                        sufficient_coverage=True,
+                        partial_coverage=False,
+                        reason="fact_supported",
+                        supporting_signals=list(financial_support["signals"]),
+                    )
+                return build(
+                    status="weak",
+                    has_any_coverage=bool(matched),
+                    sufficient_coverage=False,
+                    partial_coverage=False,
+                    reason="fact_not_found",
+                    missing_requirements=list(financial_support["missing"]),
+                    warnings=["heading_only_context"] if heading_only else [],
+                )
+
             is_correspondence_query = self._is_correspondence_litigation_milestone_query(original_query, query_understanding)
             if is_correspondence_query:
                 correspondence_support = self._evaluate_correspondence_litigation_milestone_support(
@@ -1146,6 +1171,136 @@ class AnswerabilityAssessor:
             return {"supported": False, "signals": [], "missing": [missing]}
 
         return {"supported": False, "signals": [], "missing": ["employment_lifecycle_responsive_evidence"]}
+
+    def _is_financial_entitlement_query(
+        self,
+        query: str,
+        query_understanding: QueryUnderstandingResult,
+    ) -> bool:
+        if any(note == "legal_question_family:financial_entitlement" for note in (query_understanding.routing_notes or [])):
+            return True
+        lowered = self._canonical_phrase(query)
+        patterns = (
+            r"\bcompensation\b",
+            r"\bpromised\s+compensation\b",
+            r"\bsalary\b",
+            r"\bpay\s+rate\b",
+            r"\bunpaid\b",
+            r"\bbonus\b",
+            r"\bvacation\s+pay\b",
+            r"\breimburse(?:ment|ments)?\b",
+            r"\bexpenses?\b",
+            r"\bseverance\b",
+            r"\bfinancial\s+records?\b",
+            r"\bpay\s+stub(?:s)?\b",
+            r"\bpayroll\s+records?\b",
+        )
+        return any(re.search(pattern, lowered) for pattern in patterns)
+
+    def _financial_target(self, lowered_query: str) -> str:
+        if "financial records" in lowered_query or "what records support" in lowered_query or "support the claim" in lowered_query:
+            return "financial_records"
+        if "unpaid" in lowered_query:
+            return "unpaid_amounts"
+        if "bonus" in lowered_query or "vacation pay" in lowered_query:
+            return "bonus_or_vacation_pay"
+        if "reimbursement" in lowered_query or "expense" in lowered_query:
+            return "reimbursement"
+        if "severance" in lowered_query:
+            return "severance"
+        if any(token in lowered_query for token in ("compensation", "salary", "pay rate", "remuneration", "promised")):
+            return "compensation"
+        return "general_financial_entitlement"
+
+    def _evaluate_financial_entitlement_support(
+        self,
+        *,
+        query: str,
+        substantive: Sequence[Mapping[str, str]],
+    ) -> dict[str, object]:
+        lowered_query = self._canonical_phrase(query)
+        target = self._financial_target(lowered_query)
+        if not substantive:
+            return {"supported": False, "signals": [], "missing": ["financial_entitlement_responsive_evidence"]}
+
+        rows: list[str] = []
+        for item in substantive:
+            text = self._canonical_phrase(f"{item.get('heading', '')} {item.get('text', '')}")
+            if text:
+                rows.append(text)
+
+        def has(required: Sequence[str], any_of: Sequence[str] = ()) -> bool:
+            for text in rows:
+                if not all(token in text for token in required):
+                    continue
+                if any_of and not any(token in text for token in any_of):
+                    continue
+                return True
+            return False
+
+        if target == "compensation":
+            supported = (
+                has(("compensation",), ("salary", "base", "annual", "payable", "$"))
+                or has(("salary",), ("annual", "per year", "payable", "$", "bi weekly", "hourly"))
+                or has(("pay rate",), ("hourly", "salary", "$"))
+            )
+            if supported:
+                return {"supported": True, "signals": ["financial_entitlement_compensation_evidence_detected"], "missing": []}
+            return {"supported": False, "signals": [], "missing": ["promised_compensation_or_salary_terms_evidence"]}
+
+        if target == "unpaid_amounts":
+            supported = has(("unpaid",), ("amount", "$", "wage", "salary", "bonus", "vacation", "claim")) or has(
+                ("amount",),
+                ("owing", "outstanding", "unpaid"),
+            )
+            if supported:
+                return {"supported": True, "signals": ["financial_entitlement_unpaid_amount_evidence_detected"], "missing": []}
+            return {"supported": False, "signals": [], "missing": ["unpaid_amount_or_outstanding_claim_evidence"]}
+
+        if target == "bonus_or_vacation_pay":
+            supported = has(("bonus",), ("entitle", "eligible", "earned", "payable", "claim")) or has(
+                ("vacation",),
+                ("pay", "accrued", "entitle", "earned", "claim"),
+            )
+            if supported:
+                return {"supported": True, "signals": ["financial_entitlement_bonus_or_vacation_evidence_detected"], "missing": []}
+            return {"supported": False, "signals": [], "missing": ["bonus_or_vacation_pay_entitlement_evidence"]}
+
+        if target == "reimbursement":
+            supported = has(("reimburse",), ("expense", "invoice", "receipt", "mileage", "claim", "submitted")) or has(
+                ("expense",),
+                ("reimburse", "receipt", "claim", "submitted"),
+            )
+            if supported:
+                return {"supported": True, "signals": ["financial_entitlement_reimbursement_evidence_detected"], "missing": []}
+            return {"supported": False, "signals": [], "missing": ["expense_or_reimbursement_record_evidence"]}
+
+        if target == "severance":
+            supported = has(("severance",), ("pay", "payable", "weeks", "salary", "offered", "entitle"))
+            if supported:
+                return {"supported": True, "signals": ["financial_entitlement_severance_evidence_detected"], "missing": []}
+            return {"supported": False, "signals": [], "missing": ["severance_payment_or_entitlement_evidence"]}
+
+        if target == "financial_records":
+            supported = (
+                has(("pay stub",), ("pay period", "gross", "net", "earnings"))
+                or has(("payroll",), ("record", "register", "earnings", "deduction"))
+                or has(("expense",), ("record", "receipt", "reimburse"))
+                or has(("demand letter",), ("amount", "claim", "owed", "unpaid"))
+                or has(("financial summary",), ("amount", "claim", "owed"))
+            )
+            if supported:
+                return {"supported": True, "signals": ["financial_entitlement_records_evidence_detected"], "missing": []}
+            return {"supported": False, "signals": [], "missing": ["pay_stub_payroll_expense_or_financial_records_evidence"]}
+
+        supported = (
+            has(("compensation",), ("salary", "pay", "bonus", "vacation"))
+            or has(("unpaid",), ("amount", "claim", "owed"))
+            or has(("severance",), ("pay", "weeks", "salary"))
+        )
+        if supported:
+            return {"supported": True, "signals": ["financial_entitlement_responsive_evidence_detected"], "missing": []}
+        return {"supported": False, "signals": [], "missing": ["financial_entitlement_responsive_evidence"]}
 
     def _is_lifecycle_when_date_required_query(self, lowered_query: str) -> bool:
         return "when" in lowered_query and any(
@@ -1983,6 +2138,12 @@ def _combine_coverage_and_strength(
 
     if any(
         note == "legal_question_family:correspondence_litigation_milestone"
+        for note in (query_understanding.routing_notes or [])
+    ):
+        return "sufficient", True, not expectation_blocks_answer, False, None
+
+    if any(
+        note == "legal_question_family:financial_entitlement"
         for note in (query_understanding.routing_notes or [])
     ):
         return "sufficient", True, not expectation_blocks_answer, False, None
