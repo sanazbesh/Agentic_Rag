@@ -585,6 +585,7 @@ def test_no_decomposition_plan_skips_subquery_retrieval() -> None:
 
     assert state["decomposition_plan"] is None
     assert state["subquery_results"] == {}
+    assert state["subquery_coverage"] == []
     assert state["subquery_merged_candidates"] == {}
     assert state["merged_candidates"] == []
     assert len(services.hybrid_calls) == 1
@@ -626,6 +627,7 @@ def test_invalid_decomposition_plan_skips_subquery_retrieval(monkeypatch) -> Non
 
     assert state["decomposition_plan"] is None
     assert state["subquery_results"] == {}
+    assert state["subquery_coverage"] == []
     assert state["subquery_merged_candidates"] == {}
     assert state["merged_candidates"] == []
     assert len(services.hybrid_calls) == 1
@@ -945,9 +947,137 @@ def test_non_decomposition_parent_collection_behavior_remains_unchanged() -> Non
     state = run_retrieval_stage(query="termination clause", dependencies=services.as_dependencies())
 
     assert state["decomposition_plan"] is None
+    assert state["subquery_coverage"] == []
     assert state["parent_expansion_child_results"] == []
     assert state["parent_ids"] == ["p2", "p1"]
     assert services.parent_fetch_calls == [["p2", "p1"]]
+
+
+def test_valid_decomposition_plan_produces_one_coverage_record_per_subquery() -> None:
+    services = FakeServices(
+        classifier=_decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False),
+        hybrid_results=[_hybrid("root-c1", "root-p1")],
+        hybrid_results_by_query={
+            "Locate clauses about governing law within the same agreement scope as the root question.": [_hybrid("sq-c1", "sq-p1")],
+            "Locate clauses about dispute resolution within the same agreement scope as the root question.": [_hybrid("sq-c2", "sq-p2")],
+        },
+        reranked_results=[_reranked("root-c1", "root-p1")],
+        parent_results=[_parent("root-p1"), _parent("sq-p1"), _parent("sq-p2")],
+    )
+
+    state = run_retrieval_stage(query="Compare governing law versus dispute resolution.", dependencies=services.as_dependencies())
+
+    assert [item.subquery_id for item in state["subquery_coverage"]] == ["sq-1", "sq-2"]
+
+
+def test_subquery_coverage_preserves_required_and_optional_flags(monkeypatch) -> None:
+    import agentic_rag.orchestration.retrieval_graph as retrieval_graph_module
+
+    def _forced_plan(**_: Any) -> DecompositionPlan:
+        return DecompositionPlan(
+            should_decompose=True,
+            root_question="Compare clauses.",
+            strategy="comparison",
+            subqueries=[
+                SubQueryPlan(
+                    id="sq-1",
+                    question="Locate governing law clause text in the agreement.",
+                    purpose="required",
+                    required=True,
+                    expected_answer_type="cross_reference",
+                ),
+                SubQueryPlan(
+                    id="sq-2",
+                    question="Locate related venue clause text in the agreement.",
+                    purpose="optional",
+                    required=False,
+                    expected_answer_type="cross_reference",
+                ),
+            ],
+        )
+
+    monkeypatch.setattr(retrieval_graph_module, "build_decomposition_plan", _forced_plan)
+    services = FakeServices(
+        classifier=_decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False),
+        hybrid_results=[_hybrid("root-c1", "root-p1")],
+        hybrid_results_by_query={
+            "Locate governing law clause text in the agreement.": [_hybrid("sq-c1", "sq-p1")],
+            "Locate related venue clause text in the agreement.": [_hybrid("sq-c2", "sq-p2")],
+        },
+        reranked_results=[_reranked("root-c1", "root-p1")],
+        parent_results=[_parent("root-p1")],
+    )
+
+    state = run_retrieval_stage(query="Compare clauses.", dependencies=services.as_dependencies())
+
+    assert [(item.subquery_id, item.required) for item in state["subquery_coverage"]] == [("sq-1", True), ("sq-2", False)]
+
+
+def test_subquery_coverage_marks_supported_with_evidence_references() -> None:
+    services = FakeServices(
+        classifier=_decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False),
+        hybrid_results=[_hybrid("root-c1", "root-p1")],
+        hybrid_results_by_query={
+            "Locate clauses about governing law within the same agreement scope as the root question.": [_hybrid("sq-c1", "sq-p1")],
+            "Locate clauses about dispute resolution within the same agreement scope as the root question.": [],
+        },
+        reranked_results=[_reranked("root-c1", "root-p1")],
+        parent_results=[_parent("root-p1")],
+    )
+
+    state = run_retrieval_stage(query="Compare governing law versus dispute resolution.", dependencies=services.as_dependencies())
+
+    supported = state["subquery_coverage"][0]
+    assert supported.support_classification == "supported"
+    assert supported.evidence_child_chunk_ids == ["sq-c1"]
+    assert supported.evidence_parent_chunk_ids == ["sq-p1"]
+    assert supported.insufficiency_reason is None
+
+
+def test_subquery_coverage_marks_unsupported_with_deterministic_reason() -> None:
+    services = FakeServices(
+        classifier=_decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False),
+        hybrid_results=[_hybrid("root-c1", "root-p1")],
+        hybrid_results_by_query={
+            "Locate clauses about governing law within the same agreement scope as the root question.": [],
+            "Locate clauses about dispute resolution within the same agreement scope as the root question.": [],
+        },
+        reranked_results=[_reranked("root-c1", "root-p1")],
+        parent_results=[_parent("root-p1")],
+    )
+
+    state = run_retrieval_stage(query="Compare governing law versus dispute resolution.", dependencies=services.as_dependencies())
+
+    assert [item.support_classification for item in state["subquery_coverage"]] == ["unsupported", "unsupported"]
+    assert [item.insufficiency_reason for item in state["subquery_coverage"]] == [
+        "no_retrieval_evidence",
+        "no_retrieval_evidence",
+    ]
+
+
+def test_fallback_executor_subquery_coverage_matches_main_path(monkeypatch) -> None:
+    import agentic_rag.orchestration.retrieval_graph as retrieval_graph_module
+
+    query = "Compare governing law versus dispute resolution."
+    services = FakeServices(
+        classifier=_decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False),
+        hybrid_results=[_hybrid("root-c1", "root-p1")],
+        hybrid_results_by_query={
+            "Locate clauses about governing law within the same agreement scope as the root question.": [_hybrid("sq-c1", "sq-p1")],
+            "Locate clauses about dispute resolution within the same agreement scope as the root question.": [],
+        },
+        reranked_results=[_reranked("root-c1", "root-p1")],
+        parent_results=[_parent("root-p1")],
+    )
+    state_main = run_retrieval_stage(query=query, dependencies=services.as_dependencies())
+
+    monkeypatch.setattr(retrieval_graph_module, "StateGraph", None)
+    app = build_retrieval_graph(dependencies=services.as_dependencies())
+    state_fallback = app.invoke(default_retrieval_state(query=query))
+
+    assert [item.model_dump() for item in state_fallback["subquery_coverage"]] == [
+        item.model_dump() for item in state_main["subquery_coverage"]
+    ]
 
 
 

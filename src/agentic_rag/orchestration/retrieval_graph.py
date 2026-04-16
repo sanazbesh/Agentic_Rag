@@ -104,6 +104,23 @@ class SubqueryRetrievalResult(BaseModel):
     hits: list[HybridSearchResult] = Field(default_factory=list)
 
 
+SubquerySupportClassification = Literal["supported", "weak", "unsupported"]
+SubqueryInsufficiencyReason = Literal["no_retrieval_evidence", "missing_evidence_references"]
+
+
+class SubqueryCoverageRecord(BaseModel):
+    """Per-subquery evidence coverage artifact for decomposed retrieval flows."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    subquery_id: str
+    required: bool
+    support_classification: SubquerySupportClassification
+    evidence_child_chunk_ids: list[str] = Field(default_factory=list)
+    evidence_parent_chunk_ids: list[str] = Field(default_factory=list)
+    insufficiency_reason: SubqueryInsufficiencyReason | None = None
+
+
 class RetrievalCandidateProvenance(BaseModel):
     """Query-path provenance for future merged retrieval candidates."""
 
@@ -148,6 +165,7 @@ class RetrievalStageState(TypedDict):
 
     child_results: list[HybridSearchResult]
     subquery_results: dict[str, SubqueryRetrievalResult]
+    subquery_coverage: list[SubqueryCoverageRecord]
     root_merged_candidates: list[MergedRetrievalCandidate]
     subquery_merged_candidates: dict[str, list[MergedRetrievalCandidate]]
     merged_candidates: list[MergedRetrievalCandidate]
@@ -238,6 +256,7 @@ def default_retrieval_state(
         filters=None,
         child_results=[],
         subquery_results={},
+        subquery_coverage=[],
         root_merged_candidates=[],
         subquery_merged_candidates={},
         merged_candidates=[],
@@ -728,6 +747,9 @@ class RetrievalGraphNodes:
             updated["subquery_results"] = normalized_subquery_results
         else:
             updated["subquery_results"] = {}
+        updated["subquery_coverage"] = [
+            item for item in list(updated.get("subquery_coverage", [])) if isinstance(item, SubqueryCoverageRecord)
+        ]
         updated["root_merged_candidates"] = list(updated.get("root_merged_candidates", []))
         updated["merged_candidates"] = list(updated.get("merged_candidates", []))
         raw_subquery_candidates = updated.get("subquery_merged_candidates", {})
@@ -1069,6 +1091,55 @@ class RetrievalGraphNodes:
         logger.info("node_exit name=run_hybrid_search child_count=%s", len(updated["child_results"]))
         return cast(RetrievalStageState, updated)
 
+    def score_subquery_coverage(self, state: RetrievalStageState) -> RetrievalStageState:
+        """Score typed per-subquery retrieval coverage for valid decomposition plans."""
+
+        logger.info("node_enter name=score_subquery_coverage")
+        updated = dict(state)
+        plan = updated.get("decomposition_plan")
+        if plan is None or not plan.subqueries:
+            updated["subquery_coverage"] = []
+            logger.info("node_exit name=score_subquery_coverage skipped=true")
+            return cast(RetrievalStageState, updated)
+
+        subquery_results = dict(updated.get("subquery_results") or {})
+        coverage_records: list[SubqueryCoverageRecord] = []
+        for subquery in plan.subqueries:
+            retrieval_result = subquery_results.get(subquery.id)
+            hits = list(retrieval_result.hits) if isinstance(retrieval_result, SubqueryRetrievalResult) else []
+            evidence_child_chunk_ids: list[str] = []
+            evidence_parent_chunk_ids: list[str] = []
+            for hit in hits:
+                if hit.child_chunk_id and hit.child_chunk_id not in evidence_child_chunk_ids:
+                    evidence_child_chunk_ids.append(hit.child_chunk_id)
+                if hit.parent_chunk_id and hit.parent_chunk_id not in evidence_parent_chunk_ids:
+                    evidence_parent_chunk_ids.append(hit.parent_chunk_id)
+
+            if not hits:
+                support_classification: SubquerySupportClassification = "unsupported"
+                insufficiency_reason: SubqueryInsufficiencyReason | None = "no_retrieval_evidence"
+            elif not evidence_child_chunk_ids and not evidence_parent_chunk_ids:
+                support_classification = "weak"
+                insufficiency_reason = "missing_evidence_references"
+            else:
+                support_classification = "supported"
+                insufficiency_reason = None
+
+            coverage_records.append(
+                SubqueryCoverageRecord(
+                    subquery_id=subquery.id,
+                    required=subquery.required,
+                    support_classification=support_classification,
+                    evidence_child_chunk_ids=evidence_child_chunk_ids,
+                    evidence_parent_chunk_ids=evidence_parent_chunk_ids,
+                    insufficiency_reason=insufficiency_reason,
+                )
+            )
+
+        updated["subquery_coverage"] = coverage_records
+        logger.info("node_exit name=score_subquery_coverage subquery_count=%s", len(coverage_records))
+        return cast(RetrievalStageState, updated)
+
     def merge_retrieval_candidates(self, state: RetrievalStageState) -> RetrievalStageState:
         """Merge root/subquery retrieval candidates into one deduped deterministic pool."""
 
@@ -1278,6 +1349,7 @@ class _FallbackCompiledGraph:
         current = self._nodes.rerank_results(current)
         current = self._nodes.collect_parent_ids(current)
         current = self._nodes.fetch_parent_chunks(current)
+        current = self._nodes.score_subquery_coverage(current)
         current = self._nodes.maybe_compress_context(current)
         if _route_after_compression_check(current) == "compress_context_node":
             current = self._nodes.compress_context_node(current)
@@ -1314,6 +1386,7 @@ def build_retrieval_graph(
     graph.add_node("rerank_results", nodes.rerank_results)
     graph.add_node("collect_parent_ids", nodes.collect_parent_ids)
     graph.add_node("fetch_parent_chunks", nodes.fetch_parent_chunks)
+    graph.add_node("score_subquery_coverage", nodes.score_subquery_coverage)
     graph.add_node("maybe_compress_context", nodes.maybe_compress_context)
     graph.add_node("compress_context_node", nodes.compress_context_node)
     graph.add_node("mark_complete_without_compression", nodes.mark_complete_without_compression)
@@ -1339,7 +1412,8 @@ def build_retrieval_graph(
     graph.add_edge("merge_retrieval_candidates", "rerank_results")
     graph.add_edge("rerank_results", "collect_parent_ids")
     graph.add_edge("collect_parent_ids", "fetch_parent_chunks")
-    graph.add_edge("fetch_parent_chunks", "maybe_compress_context")
+    graph.add_edge("fetch_parent_chunks", "score_subquery_coverage")
+    graph.add_edge("score_subquery_coverage", "maybe_compress_context")
     graph.add_conditional_edges(
         "maybe_compress_context",
         _route_after_compression_check,
