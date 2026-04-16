@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import re
 import logging
+from datetime import datetime
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 try:  # pragma: no cover - optional runtime dependency
     from pydantic import BaseModel, ConfigDict, Field
@@ -437,6 +438,31 @@ class AnswerabilityAssessor:
             )
 
         if expectation == "fact_extraction":
+            is_chronology_query = self._is_chronology_date_event_query(original_query, query_understanding)
+            if is_chronology_query:
+                chronology_support = self._evaluate_chronology_support(
+                    query=original_query,
+                    substantive=substantive,
+                )
+                if chronology_support["supported"]:
+                    return build(
+                        status="sufficient",
+                        has_any_coverage=True,
+                        sufficient_coverage=True,
+                        partial_coverage=False,
+                        reason="fact_supported",
+                        supporting_signals=list(chronology_support["signals"]),
+                    )
+                return build(
+                    status="weak",
+                    has_any_coverage=bool(matched),
+                    sufficient_coverage=False,
+                    partial_coverage=False,
+                    reason="fact_not_found",
+                    missing_requirements=list(chronology_support["missing"]),
+                    warnings=["heading_only_context"] if heading_only else [],
+                )
+
             is_party_role_query = self._is_party_role_entity_query(original_query, query_understanding)
             if is_party_role_query:
                 found = self._has_party_role_evidence(substantive, original_query)
@@ -781,6 +807,183 @@ class AnswerabilityAssessor:
         if not body:
             return True
         if heading and body.lower() == heading.lower():
+            return True
+        return False
+
+    def _is_chronology_date_event_query(
+        self,
+        query: str,
+        query_understanding: QueryUnderstandingResult,
+    ) -> bool:
+        if any(note == "legal_question_family:chronology_date_event" for note in (query_understanding.routing_notes or [])):
+            return True
+        lowered = self._canonical_phrase(query)
+        chronology_patterns = (
+            r"\bwhen did\b",
+            r"\bwhen was\b",
+            r"\btimeline\b",
+            r"\bchronology\b",
+            r"\bwhat happened first\b",
+            r"\bwhat happened last\b",
+            r"\bwhat happened after\b",
+            r"\bwhat happened before\b",
+            r"\bbetween\b.+\band\b",
+            r"\ball dated events\b",
+        )
+        return any(re.search(pattern, lowered) for pattern in chronology_patterns)
+
+    def _evaluate_chronology_support(
+        self,
+        *,
+        query: str,
+        substantive: Sequence[Mapping[str, str]],
+    ) -> dict[str, object]:
+        events = self._extract_chronology_events(substantive)
+        if not events:
+            return {
+                "supported": False,
+                "signals": [],
+                "missing": ["chronology_responsive_dated_event_evidence"],
+            }
+
+        lowered_query = self._canonical_phrase(query)
+        signals = ["chronology_responsive_dated_event_evidence_detected"]
+
+        if "what happened first" in lowered_query or "first event" in lowered_query:
+            if len(events) >= 2:
+                return {"supported": True, "signals": [*signals, "chronology_ordering_supported"], "missing": []}
+            return {"supported": False, "signals": signals, "missing": ["multiple_dated_events_for_ordering"]}
+
+        if "what happened last" in lowered_query or "last event" in lowered_query:
+            if len(events) >= 2:
+                return {"supported": True, "signals": [*signals, "chronology_ordering_supported"], "missing": []}
+            return {"supported": False, "signals": signals, "missing": ["multiple_dated_events_for_ordering"]}
+
+        if "after" in lowered_query:
+            anchor = self._extract_after_before_anchor(lowered_query, relation="after")
+            if anchor and self._supports_relative_events(events, anchor, relation="after"):
+                return {"supported": True, "signals": [*signals, "after_event_supported"], "missing": []}
+            return {"supported": False, "signals": signals, "missing": ["dated_anchor_and_subsequent_event_support"]}
+
+        if "before" in lowered_query:
+            anchor = self._extract_after_before_anchor(lowered_query, relation="before")
+            if anchor and self._supports_relative_events(events, anchor, relation="before"):
+                return {"supported": True, "signals": [*signals, "before_event_supported"], "missing": []}
+            return {"supported": False, "signals": signals, "missing": ["dated_anchor_and_prior_event_support"]}
+
+        if "between" in lowered_query:
+            query_dates = self._extract_datetimes(query)
+            if len(query_dates) >= 2 and self._has_events_within_range(events, min(query_dates), max(query_dates)):
+                return {"supported": True, "signals": [*signals, "date_range_supported"], "missing": []}
+            return {"supported": False, "signals": signals, "missing": ["dated_events_within_requested_range"]}
+
+        if "all dated events" in lowered_query or "timeline" in lowered_query or "chronology" in lowered_query:
+            return {"supported": True, "signals": [*signals, "timeline_event_set_supported"], "missing": []}
+
+        if (
+            "employment start" in lowered_query
+            or "employment began" in lowered_query
+            or "employment commence" in lowered_query
+            or "start date" in lowered_query
+        ):
+            if self._has_event_with_markers(events, ("employment", "start"), optional=("commence", "effective", "begin")):
+                return {"supported": True, "signals": [*signals, "employment_start_date_supported"], "missing": []}
+            return {"supported": False, "signals": signals, "missing": ["employment_start_dated_event_evidence"]}
+
+        if "termination notice" in lowered_query or ("termination" in lowered_query and "notice" in lowered_query):
+            if self._has_event_with_markers(events, ("termination", "notice"), optional=("letter", "email", "served")):
+                return {"supported": True, "signals": [*signals, "termination_notice_date_supported"], "missing": []}
+            return {"supported": False, "signals": signals, "missing": ["termination_notice_dated_event_evidence"]}
+
+        return {"supported": True, "signals": signals, "missing": []}
+
+    def _extract_chronology_events(self, substantive: Sequence[Mapping[str, str]]) -> list[dict[str, object]]:
+        events: list[dict[str, object]] = []
+        for item in substantive:
+            text = (item.get("text") or "").strip()
+            heading = (item.get("heading") or "").strip()
+            if not text:
+                continue
+            for match in self._iter_date_matches(text):
+                dt = self._parse_datetime(match.group(0))
+                if dt is None:
+                    continue
+                start = max(0, match.start() - 90)
+                end = min(len(text), match.end() + 120)
+                snippet = " ".join(text[start:end].split())
+                event_text = f"{heading}. {snippet}".strip(". ").lower()
+                events.append({"datetime": dt, "event_text": event_text})
+        events.sort(key=lambda item: cast(datetime, item["datetime"]))
+        return events
+
+    def _iter_date_matches(self, text: str) -> list[re.Match[str]]:
+        pattern = re.compile(
+            r"\b(?:\d{4}-\d{2}-\d{2}|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+\d{1,2},\s*\d{4})\b",
+            flags=re.IGNORECASE,
+        )
+        return list(pattern.finditer(text or ""))
+
+    def _parse_datetime(self, raw: str) -> datetime | None:
+        value = (raw or "").strip()
+        if not value:
+            return None
+        for fmt in ("%Y-%m-%d", "%B %d, %Y", "%b %d, %Y"):
+            try:
+                return datetime.strptime(value, fmt)
+            except ValueError:
+                continue
+        return None
+
+    def _extract_datetimes(self, text: str) -> list[datetime]:
+        values: list[datetime] = []
+        for match in self._iter_date_matches(text):
+            dt = self._parse_datetime(match.group(0))
+            if dt is not None:
+                values.append(dt)
+        return values
+
+    def _extract_after_before_anchor(self, query: str, *, relation: str) -> str:
+        pattern = re.compile(rf"\b{relation}\s+(.+?)(?:\?|$)")
+        match = pattern.search(query)
+        if not match:
+            return ""
+        anchor = self._canonical_phrase(match.group(1))
+        anchor = re.sub(r"\b(the|a|an)\b", " ", anchor)
+        return " ".join(anchor.split())
+
+    def _supports_relative_events(self, events: Sequence[Mapping[str, object]], anchor: str, *, relation: str) -> bool:
+        if not anchor:
+            return False
+        anchor_events = [event for event in events if anchor in str(event.get("event_text", ""))]
+        if not anchor_events:
+            return False
+        anchor_dt = min(cast(datetime, event["datetime"]) for event in anchor_events)
+        if relation == "after":
+            return any(cast(datetime, event["datetime"]) > anchor_dt for event in events)
+        return any(cast(datetime, event["datetime"]) < anchor_dt for event in events)
+
+    def _has_events_within_range(
+        self,
+        events: Sequence[Mapping[str, object]],
+        start: datetime,
+        end: datetime,
+    ) -> bool:
+        return any(start <= cast(datetime, event["datetime"]) <= end for event in events)
+
+    def _has_event_with_markers(
+        self,
+        events: Sequence[Mapping[str, object]],
+        required: Sequence[str],
+        optional: Sequence[str] = (),
+    ) -> bool:
+        required_lower = [part.lower() for part in required]
+        optional_lower = [part.lower() for part in optional]
+        for event in events:
+            text = str(event.get("event_text") or "")
+            if not all(part in text for part in required_lower):
+                continue
+            if optional_lower and not any(part in text for part in optional_lower):
+                continue
             return True
         return False
 
