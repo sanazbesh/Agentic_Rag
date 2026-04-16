@@ -1201,3 +1201,198 @@ def test_fallback_or_shared_path_matches_main_behavior_if_applicable_for_subansw
     assert [item.model_dump() for item in main_state["subquery_subanswers"]] == [
         item.model_dump() for item in fallback_state["subquery_subanswers"]
     ]
+
+
+def test_all_supported_required_subqueries_produce_fully_synthesized_final_answer() -> None:
+    calls: list[str] = []
+
+    def _generator(context: list[object], query: str) -> GenerateAnswerResult:
+        calls.append(query)
+        return GenerateAnswerResult(
+            answer_text=f"Subanswer::{query}",
+            grounded=True,
+            sufficient_context=True,
+            citations=[
+                AnswerCitation(
+                    parent_chunk_id=str(getattr(context[0], "parent_chunk_id", "missing")),
+                    document_id="doc-1",
+                    source_name="source",
+                    heading="Section",
+                    supporting_excerpt=f"Excerpt::{query}",
+                )
+            ],
+            warnings=[],
+        )
+
+    app = build_answer_graph(answer_generator=_generator, answerability_evaluator=lambda *_args, **_kwargs: _sufficient_assessment())
+    state = default_legal_rag_state(query="compare clauses")
+    state["query_classification"] = _decision()
+    state["parent_chunks"] = [_parent("p1"), _parent("p2"), _parent("p3")]
+    state["decomposition_plan"] = _plan()
+    state["subquery_coverage"] = _coverage("supported", "supported", "supported")
+
+    final_state = app.invoke(state)
+    final = final_state["final_answer"]
+    assert final.sufficient_context is True
+    assert "Direct answer (synthesized from grounded subanswers)" in final.answer_text
+    assert "Find governing law text." in final.answer_text
+    assert "Find dispute resolution text." in final.answer_text
+    assert "Support gaps:" not in final.answer_text
+    assert calls == ["Find governing law text.", "Find dispute resolution text.", "Find optional venue text."]
+
+
+def test_missing_required_subquery_produces_partial_or_insufficient_final_answer_in_repo_consistent_way() -> None:
+    app = build_answer_graph(
+        answer_generator=lambda context, query: GenerateAnswerResult(
+            answer_text=f"Subanswer::{query}",
+            grounded=True,
+            sufficient_context=True,
+            citations=[
+                AnswerCitation(
+                    parent_chunk_id=str(getattr(context[0], "parent_chunk_id", "missing")),
+                    document_id="doc-1",
+                    source_name="source",
+                    heading="Section",
+                    supporting_excerpt=f"Excerpt::{query}",
+                )
+            ],
+            warnings=[],
+        ),
+        answerability_evaluator=lambda *_args, **_kwargs: _sufficient_assessment(),
+    )
+    state = default_legal_rag_state(query="compare clauses")
+    state["query_classification"] = _decision()
+    state["parent_chunks"] = [_parent("p1"), _parent("p2"), _parent("p3")]
+    state["decomposition_plan"] = _plan()
+    state["subquery_coverage"] = _coverage("supported", "unsupported", "supported")
+
+    final_state = app.invoke(state)
+    final = final_state["final_answer"]
+    assert final.sufficient_context is False
+    assert final.grounded is True
+    assert "Support gaps:" in final.answer_text
+    assert "Required gap: Find dispute resolution text." in final.answer_text
+    assert final_state["response_route"] == "build_insufficient_response"
+
+
+def test_missing_optional_subquery_does_not_block_full_final_answer_when_required_support_is_complete() -> None:
+    app = build_answer_graph(
+        answer_generator=lambda context, query: GenerateAnswerResult(
+            answer_text=f"Subanswer::{query}",
+            grounded=True,
+            sufficient_context=True,
+            citations=[
+                AnswerCitation(
+                    parent_chunk_id=str(getattr(context[0], "parent_chunk_id", "missing")),
+                    document_id="doc-1",
+                    source_name="source",
+                    heading="Section",
+                    supporting_excerpt=f"Excerpt::{query}",
+                )
+            ],
+            warnings=[],
+        ),
+        answerability_evaluator=lambda *_args, **_kwargs: _sufficient_assessment(),
+    )
+    state = default_legal_rag_state(query="compare clauses")
+    state["query_classification"] = _decision()
+    state["parent_chunks"] = [_parent("p1"), _parent("p2"), _parent("p3")]
+    state["decomposition_plan"] = _plan()
+    state["subquery_coverage"] = _coverage("supported", "supported", "unsupported")
+
+    final = app.invoke(state)["final_answer"]
+    assert final.sufficient_context is True
+    assert "Optional gap: Find optional venue text." in final.answer_text
+
+
+def test_no_supported_subanswers_produces_insufficient_final_answer() -> None:
+    state = _invoke_answer_graph(
+        assessment=_sufficient_assessment(),
+        decomposition_plan=_plan(),
+        subquery_coverage=_coverage("unsupported", "unsupported", "unsupported"),
+    )
+    final = state["final_answer"]
+    assert final.sufficient_context is False
+    assert final.grounded is False
+    assert "does not contain enough information" in final.answer_text
+
+
+def test_final_citations_are_aggregated_from_grounded_subanswers_only() -> None:
+    app = build_answer_graph(
+        answer_generator=lambda context, query: GenerateAnswerResult(
+            answer_text=f"Subanswer::{query}",
+            grounded=True,
+            sufficient_context=True,
+            citations=[
+                AnswerCitation(
+                    parent_chunk_id=str(getattr(context[0], "parent_chunk_id", "missing")),
+                    document_id="doc-1",
+                    source_name="source",
+                    heading="Section",
+                    supporting_excerpt=f"Excerpt::{query}",
+                ),
+                AnswerCitation(
+                    parent_chunk_id="p-extra",
+                    document_id="doc-1",
+                    source_name="source",
+                    heading="Section",
+                    supporting_excerpt="extra",
+                ),
+            ],
+            warnings=[],
+        ),
+        answerability_evaluator=lambda *_args, **_kwargs: _sufficient_assessment(),
+    )
+    state = default_legal_rag_state(query="compare clauses")
+    state["query_classification"] = _decision()
+    state["parent_chunks"] = [_parent("p1"), _parent("p2")]
+    state["decomposition_plan"] = _plan()
+    state["subquery_coverage"] = _coverage("supported", "supported", "unsupported")
+    final = app.invoke(state)["final_answer"]
+    assert [citation.parent_chunk_id for citation in final.citations] == ["p1", "p2"]
+
+
+def test_non_decomposition_final_answer_behavior_remains_unchanged() -> None:
+    state = _invoke_answer_graph(
+        assessment=_sufficient_assessment(),
+        decomposition_plan=None,
+        subquery_coverage=[],
+    )
+    assert state["final_answer"].answer_text == "Grounded answer"
+    assert state["response_route"] == "generate_answer"
+
+
+def test_fallback_or_shared_path_matches_main_behavior_if_applicable_for_final_synthesis(monkeypatch: Any) -> None:
+    import agentic_rag.orchestration.legal_rag_graph as legal_graph_module
+
+    assessment = _sufficient_assessment()
+    state = default_legal_rag_state(query="compare clauses")
+    state["query_classification"] = _decision()
+    state["parent_chunks"] = [_parent("p1"), _parent("p2")]
+    state["decomposition_plan"] = _plan()
+    state["subquery_coverage"] = _coverage("supported", "unsupported", "supported")
+    generator = lambda context, query: GenerateAnswerResult(
+        answer_text=f"Subanswer::{query}",
+        grounded=True,
+        sufficient_context=True,
+        citations=[
+            AnswerCitation(
+                parent_chunk_id=str(getattr(context[0], "parent_chunk_id", "missing")),
+                document_id="doc-1",
+                source_name="source",
+                heading="Section",
+                supporting_excerpt=f"Excerpt::{query}",
+            )
+        ],
+        warnings=[],
+    )
+    main_app = build_answer_graph(answer_generator=generator, answerability_evaluator=lambda *_args, **_kwargs: assessment)
+    main_state = main_app.invoke(state)
+
+    monkeypatch.setattr(legal_graph_module, "StateGraph", None)
+    fallback_app = legal_graph_module.build_answer_graph(
+        answer_generator=generator,
+        answerability_evaluator=lambda *_args, **_kwargs: assessment,
+    )
+    fallback_state = fallback_app.invoke(state)
+    assert main_state["final_answer"] == fallback_state["final_answer"]

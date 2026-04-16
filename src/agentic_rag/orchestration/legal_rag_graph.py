@@ -360,6 +360,94 @@ def _validate_answer_payload(payload: object) -> FinalAnswerModel:
     return answer
 
 
+def _dedupe_citations_preserve_order(citations: Sequence[AnswerCitation]) -> list[AnswerCitation]:
+    seen: set[tuple[str, str | None, str | None, str | None, str | None]] = set()
+    deduped: list[AnswerCitation] = []
+    for citation in citations:
+        key = (
+            citation.parent_chunk_id,
+            citation.document_id,
+            citation.source_name,
+            citation.heading,
+            citation.supporting_excerpt,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(citation)
+    return deduped
+
+
+def _synthesize_from_grounded_subanswers(
+    *,
+    decomposition_plan: DecompositionPlan | None,
+    subquery_subanswers: Sequence[SubqueryGroundedSubanswer],
+    baseline_warnings: Sequence[str],
+    sufficient_context: bool,
+) -> FinalAnswerModel | None:
+    """Compose decomposed final answer strictly from grounded subanswers + explicit gaps."""
+
+    if not isinstance(decomposition_plan, DecompositionPlan) or not decomposition_plan.subqueries:
+        return None
+    if not subquery_subanswers:
+        return None
+
+    by_id = {item.subquery_id: item for item in subquery_subanswers if item.subquery_id}
+    supported_sections: list[str] = []
+    aggregated_citations: list[AnswerCitation] = []
+    required_gap_ids: list[str] = []
+    gap_lines: list[str] = []
+    subanswer_warnings: list[str] = []
+
+    for subquery in decomposition_plan.subqueries:
+        artifact = by_id.get(subquery.id)
+        if artifact is None:
+            if subquery.required:
+                required_gap_ids.append(subquery.id)
+                gap_lines.append(f"- Required gap: {subquery.question} (reason: no_subanswer_artifact)")
+            else:
+                gap_lines.append(f"- Optional gap: {subquery.question} (reason: no_subanswer_artifact)")
+            continue
+
+        subanswer_warnings.extend(list(artifact.warnings))
+        is_supported = artifact.support_classification == "supported" and artifact.grounded and bool(artifact.citations)
+        if is_supported:
+            supported_sections.append(f"- {subquery.question}: {artifact.answer_text}")
+            aggregated_citations.extend(list(artifact.citations))
+            continue
+
+        reason = artifact.insufficiency_reason or f"subquery_not_{artifact.support_classification}"
+        if subquery.required:
+            required_gap_ids.append(subquery.id)
+            gap_lines.append(f"- Required gap: {subquery.question} (reason: {reason})")
+        else:
+            gap_lines.append(f"- Optional gap: {subquery.question} (reason: {reason})")
+
+    aggregated_citations = _dedupe_citations_preserve_order(aggregated_citations)
+    if not supported_sections:
+        return None
+
+    sections = ["Direct answer (synthesized from grounded subanswers):", *supported_sections]
+    if gap_lines:
+        sections.extend(["", "Support gaps:", *gap_lines])
+    answer_text = "\n".join(sections)
+
+    merged_warnings = _dedupe_preserve_order(
+        [
+            *list(baseline_warnings),
+            *subanswer_warnings,
+            *([f"decomposition_required_support_gaps:{','.join(required_gap_ids)}"] if required_gap_ids else []),
+        ]
+    )
+    return FinalAnswerModel(
+        answer_text=answer_text,
+        grounded=bool(aggregated_citations),
+        sufficient_context=bool(sufficient_context),
+        citations=aggregated_citations,
+        warnings=merged_warnings,
+    )
+
+
 class AnswerStageNodes:
     """Explicit answer-stage node implementations.
 
@@ -478,6 +566,14 @@ class AnswerStageNodes:
         warnings = list(updated.get("warnings", []))
         plan = updated.get("decomposition_plan")
         should_generate_answer = bool(updated.get("should_generate_answer", False))
+        assessment = updated.get("answerability_result")
+        decomposition_gap_override = False
+        if isinstance(assessment, AnswerabilityAssessment):
+            decomposition_gap_override = any(
+                str(warning).startswith("decomposition_required_subquery_coverage_below_threshold:")
+                for warning in assessment.warnings
+            )
+        allow_subanswer_generation = should_generate_answer or decomposition_gap_override
         coverage_records = [
             item for item in list(updated.get("subquery_coverage", [])) if isinstance(item, SubqueryCoverageRecord)
         ]
@@ -516,16 +612,16 @@ class AnswerStageNodes:
                 )
                 continue
 
-            if not should_generate_answer:
+            if not allow_subanswer_generation:
                 subanswers.append(
                     SubqueryGroundedSubanswer(
                         subquery_id=record.subquery_id,
                         subquery_question=subquery_question,
-                        answer_text="No grounded subanswer generated because answerability did not approve answer generation.",
+                        answer_text="No grounded subanswer generated because answerability did not approve subquery synthesis.",
                         citations=[],
                         grounded=False,
                         support_classification="weak",
-                        insufficiency_reason="answerability_gate_blocked_generation",
+                        insufficiency_reason="answerability_gate_blocked_subquery_synthesis",
                         warnings=["subquery_generation_blocked_by_answerability_gate"],
                     )
                 )
@@ -605,6 +701,30 @@ class AnswerStageNodes:
         warnings = list(updated.get("warnings", []))
         answer_context = list(updated.get("answer_context", []))
         should_generate_answer = bool(updated.get("should_generate_answer", False))
+        synthesized = _synthesize_from_grounded_subanswers(
+            decomposition_plan=updated.get("decomposition_plan")
+            if isinstance(updated.get("decomposition_plan"), DecompositionPlan)
+            else None,
+            subquery_subanswers=[
+                item
+                for item in list(updated.get("subquery_subanswers", []))
+                if isinstance(item, SubqueryGroundedSubanswer)
+            ],
+            baseline_warnings=warnings,
+            sufficient_context=True,
+        )
+        if synthesized is not None:
+            updated["final_answer"] = synthesized
+            updated["citations"] = list(synthesized.citations)
+            updated["grounded"] = synthesized.grounded
+            updated["sufficient_context"] = synthesized.sufficient_context
+            updated["warnings"] = list(synthesized.warnings)
+            updated["response_route"] = "generate_answer"
+            logger.info(
+                "node_exit name=generate_grounded_answer success=true synthesized_from_subanswers=true citations=%s",
+                len(synthesized.citations),
+            )
+            return cast(LegalRagState, updated)
 
         if not answer_context:
             fallback = FinalAnswerModel(
@@ -686,6 +806,30 @@ class AnswerStageNodes:
         updated = dict(state)
         warnings = list(updated.get("warnings", []))
         assessment = updated.get("answerability_result")
+        synthesized = _synthesize_from_grounded_subanswers(
+            decomposition_plan=updated.get("decomposition_plan")
+            if isinstance(updated.get("decomposition_plan"), DecompositionPlan)
+            else None,
+            subquery_subanswers=[
+                item
+                for item in list(updated.get("subquery_subanswers", []))
+                if isinstance(item, SubqueryGroundedSubanswer)
+            ],
+            baseline_warnings=warnings,
+            sufficient_context=False,
+        )
+        if synthesized is not None:
+            updated["final_answer"] = synthesized
+            updated["citations"] = list(synthesized.citations)
+            updated["grounded"] = synthesized.grounded
+            updated["sufficient_context"] = synthesized.sufficient_context
+            updated["warnings"] = list(synthesized.warnings)
+            updated["response_route"] = "build_insufficient_response"
+            logger.info(
+                "node_exit name=build_insufficient_response route=synthesized_partial_or_insufficient citations=%s",
+                len(synthesized.citations),
+            )
+            return cast(LegalRagState, updated)
 
         insufficiency_message = (
             "Direct answer: The retrieved context does not contain enough information to answer the question fully."
