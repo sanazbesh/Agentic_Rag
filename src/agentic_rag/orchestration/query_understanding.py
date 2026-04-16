@@ -193,6 +193,56 @@ def _is_party_role_entity_query(normalized_query: str) -> bool:
         return True
     return False
 
+
+def _is_chronology_date_event_query(normalized_query: str) -> bool:
+    lowered = _canonicalize_phrase(normalized_query)
+    if not lowered:
+        return False
+
+    direct_patterns = (
+        r"\bwhen did\b",
+        r"\bwhen was\b",
+        r"\btimeline\b",
+        r"\bchronology\b",
+        r"\bwhat happened first\b",
+        r"\bwhat happened last\b",
+        r"\bfirst event\b",
+        r"\blast event\b",
+        r"\bwhat happened after\b",
+        r"\bwhat happened before\b",
+        r"\bbetween\b.+\band\b",
+        r"\ball dated events\b",
+    )
+    if any(re.search(pattern, lowered) for pattern in direct_patterns):
+        return True
+
+    temporal_words = (
+        "effective date",
+        "commencement",
+        "start date",
+        "termination date",
+        "notice date",
+        "letter date",
+        "email date",
+        "filing date",
+        "service date",
+    )
+    has_temporal_word = any(word in lowered for word in temporal_words)
+    has_question_frame = any(
+        phrase in lowered
+        for phrase in (
+            "what date",
+            "on what date",
+            "what happened",
+            "when",
+            "after",
+            "before",
+            "between",
+        )
+    )
+    return has_temporal_word and has_question_frame
+
+
 def understand_query(
     query: str,
     conversation_summary: str | None = None,
@@ -212,6 +262,7 @@ def understand_query(
     lowered = normalized.lower()
     context_available = bool(_text(conversation_summary) or list(recent_messages or []))
     is_party_role_entity_query = _is_party_role_entity_query(normalized)
+    is_chronology_date_event_query = _is_chronology_date_event_query(normalized)
 
     meta_markers = ("how many documents", "what files are loaded", "what documents are uploaded", "what docs are loaded")
     comparison_markers = ("compare", "differ", "difference", "vs ", "versus")
@@ -280,7 +331,7 @@ def understand_query(
         question_type = "document_summary_query"
     elif explicit_document_scope and any(marker in lowered for marker in doc_content_markers):
         question_type = "document_content_query"
-    elif is_party_role_entity_query or any(marker in lowered for marker in extractive_markers):
+    elif is_party_role_entity_query or is_chronology_date_event_query or any(marker in lowered for marker in extractive_markers):
         question_type = "extractive_fact_query"
     elif lowered.startswith(definition_starters):
         question_type = "definition_query"
@@ -430,6 +481,8 @@ def understand_query(
         routing_notes.append("entity_extraction_useful")
     if is_party_role_entity_query:
         routing_notes.append("legal_question_family:party_role_entity")
+    if is_chronology_date_event_query:
+        routing_notes.append("legal_question_family:chronology_date_event")
 
     if question_type == "other_query" and refers_to_prior_document_scope and not context_available:
         ambiguity_notes.append("pronoun_reference_without_resolvable_scope")

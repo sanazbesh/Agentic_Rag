@@ -11,6 +11,7 @@ from __future__ import annotations
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from agentic_rag.tools.evidence_units import EvidenceUnit, build_evidence_units
@@ -39,6 +40,18 @@ class GenerateAnswerResult:
     sufficient_context: bool
     citations: list[AnswerCitation]
     warnings: list[str]
+
+
+@dataclass(slots=True)
+class _ChronologyEvent:
+    parent_chunk_id: str
+    document_id: str | None
+    source_name: str | None
+    heading: str | None
+    event_date: datetime
+    event_date_text: str
+    event_text: str
+    supporting_excerpt: str
 
 
 @dataclass(slots=True)
@@ -87,6 +100,9 @@ class LegalAnswerSynthesizer:
             party_role_response = self._generate_party_role_answer(normalized_context, normalized_query)
             if party_role_response is not None:
                 return party_role_response
+            chronology_response = self._generate_chronology_answer(normalized_context, normalized_query)
+            if chronology_response is not None:
+                return chronology_response
 
             ranked = self._rank_relevant_chunks(normalized_context, normalized_query)
             if not ranked:
@@ -290,6 +306,204 @@ class LegalAnswerSynthesizer:
             r"\bis\s+this\s+agreement\s+between\b",
         )
         return any(re.search(pattern, lowered_query) for pattern in patterns)
+
+    def _generate_chronology_answer(
+        self,
+        context: Sequence[dict[str, Any]],
+        query: str,
+    ) -> GenerateAnswerResult | None:
+        lowered_query = query.lower()
+        if not self._is_chronology_question(lowered_query):
+            return None
+
+        events = self._extract_chronology_events(context)
+        if not events:
+            return self._insufficient_response("insufficient_context: chronology-responsive dated events not found")
+
+        selected: list[_ChronologyEvent] = []
+        direct = ""
+        missing_reason = "insufficient_context: chronology query not supported by available dated event evidence"
+
+        if "what happened first" in lowered_query or "first event" in lowered_query:
+            if len(events) < 2:
+                return self._insufficient_response(missing_reason)
+            selected = [events[0]]
+            direct = f"The first dated event is {selected[0].event_text} on {selected[0].event_date_text}."
+        elif "what happened last" in lowered_query or "last event" in lowered_query:
+            if len(events) < 2:
+                return self._insufficient_response(missing_reason)
+            selected = [events[-1]]
+            direct = f"The last dated event is {selected[0].event_text} on {selected[0].event_date_text}."
+        elif "after" in lowered_query:
+            anchor = self._extract_anchor_phrase(lowered_query, "after")
+            anchor_event = self._find_anchor_event(events, anchor)
+            if anchor_event is None:
+                return self._insufficient_response(missing_reason)
+            selected = [event for event in events if event.event_date > anchor_event.event_date]
+            if not selected:
+                return self._insufficient_response(missing_reason)
+            direct = f"After {anchor_event.event_text} ({anchor_event.event_date_text}), the next dated events are listed below."
+        elif "before" in lowered_query:
+            anchor = self._extract_anchor_phrase(lowered_query, "before")
+            anchor_event = self._find_anchor_event(events, anchor)
+            if anchor_event is None:
+                return self._insufficient_response(missing_reason)
+            selected = [event for event in events if event.event_date < anchor_event.event_date]
+            if not selected:
+                return self._insufficient_response(missing_reason)
+            direct = f"Before {anchor_event.event_text} ({anchor_event.event_date_text}), the dated events are listed below."
+        elif "between" in lowered_query:
+            range_dates = self._extract_query_dates(query)
+            if len(range_dates) < 2:
+                return self._insufficient_response(missing_reason)
+            start, end = min(range_dates), max(range_dates)
+            selected = [event for event in events if start <= event.event_date <= end]
+            if not selected:
+                return self._insufficient_response(missing_reason)
+            direct = f"Between {start.strftime('%B %d, %Y')} and {end.strftime('%B %d, %Y')}, the supported dated events are:"
+        elif "employment start" in lowered_query or "employment began" in lowered_query or "start date" in lowered_query:
+            for event in events:
+                lowered = event.event_text.lower()
+                if "employment" in lowered and any(token in lowered for token in ("start", "commenc", "effective", "begin")):
+                    selected = [event]
+                    break
+            if not selected:
+                return self._insufficient_response(missing_reason)
+            direct = f"The employment start-related dated event is {selected[0].event_date_text}."
+        elif "termination notice" in lowered_query or ("termination" in lowered_query and "notice" in lowered_query):
+            for event in events:
+                lowered = event.event_text.lower()
+                if "termination" in lowered and any(token in lowered for token in ("notice", "letter", "email", "served")):
+                    selected = [event]
+                    break
+            if not selected:
+                return self._insufficient_response(missing_reason)
+            direct = f"The termination notice-related dated event is {selected[0].event_date_text}."
+        elif "all dated events" in lowered_query or "timeline" in lowered_query or "chronology" in lowered_query:
+            selected = events
+            direct = "The dated chronology evidence in the retrieved context is listed below."
+        elif "when did" in lowered_query or "when was" in lowered_query:
+            selected = events[:1]
+            direct = f"The best-supported dated event answer is {selected[0].event_date_text}."
+        else:
+            return None
+
+        if not selected:
+            return self._insufficient_response(missing_reason)
+
+        citations: list[AnswerCitation] = []
+        lines: list[str] = []
+        for event in selected[: self.max_support_points]:
+            lines.append(f"- {event.event_date_text}: {event.event_text}")
+            citations.append(
+                AnswerCitation(
+                    parent_chunk_id=event.parent_chunk_id,
+                    document_id=event.document_id,
+                    source_name=event.source_name,
+                    heading=event.heading,
+                    supporting_excerpt=event.supporting_excerpt,
+                )
+            )
+
+        return GenerateAnswerResult(
+            answer_text=(
+                f"Direct answer: {direct}\n\n"
+                "Supporting points:\n"
+                + "\n".join(lines)
+                + "\n\nCaveats / limitations:\n"
+                "- Response is limited to chronology-responsive dated events in the retrieved context."
+            ),
+            grounded=True,
+            sufficient_context=True,
+            citations=citations,
+            warnings=[],
+        )
+
+    def _is_chronology_question(self, lowered_query: str) -> bool:
+        patterns = (
+            r"\bwhen did\b",
+            r"\bwhen was\b",
+            r"\btimeline\b",
+            r"\bchronology\b",
+            r"\bwhat happened first\b",
+            r"\bwhat happened last\b",
+            r"\bwhat happened after\b",
+            r"\bwhat happened before\b",
+            r"\bwhat happened between\b",
+            r"\ball dated events\b",
+        )
+        return any(re.search(pattern, lowered_query) for pattern in patterns)
+
+    def _extract_chronology_events(self, context: Sequence[dict[str, Any]]) -> list[_ChronologyEvent]:
+        date_pattern = re.compile(
+            r"\b(?:\d{4}-\d{2}-\d{2}|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+\d{1,2},\s*\d{4})\b",
+            flags=re.IGNORECASE,
+        )
+        events: list[_ChronologyEvent] = []
+        for item in context:
+            text = str(item.get("text") or "")
+            if not text:
+                continue
+            for match in date_pattern.finditer(text):
+                parsed = self._parse_date(match.group(0))
+                if parsed is None:
+                    continue
+                start = max(0, match.start() - 80)
+                end = min(len(text), match.end() + 120)
+                excerpt = " ".join(text[start:end].split())
+                event_text = excerpt
+                events.append(
+                    _ChronologyEvent(
+                        parent_chunk_id=str(item.get("parent_chunk_id") or ""),
+                        document_id=item.get("document_id"),
+                        source_name=item.get("source_name"),
+                        heading=item.get("heading"),
+                        event_date=parsed,
+                        event_date_text=match.group(0),
+                        event_text=event_text,
+                        supporting_excerpt=excerpt,
+                    )
+                )
+        events.sort(key=lambda event: event.event_date)
+        return events
+
+    def _parse_date(self, value: str) -> datetime | None:
+        raw = (value or "").strip()
+        for fmt in ("%Y-%m-%d", "%B %d, %Y", "%b %d, %Y"):
+            try:
+                return datetime.strptime(raw, fmt)
+            except ValueError:
+                continue
+        return None
+
+    def _extract_anchor_phrase(self, query: str, relation: str) -> str:
+        match = re.search(rf"\b{relation}\s+(.+?)(?:\?|$)", query)
+        if not match:
+            return ""
+        anchor = re.sub(r"[^a-z0-9\s]+", " ", match.group(1).lower())
+        anchor = re.sub(r"\b(the|a|an)\b", " ", anchor)
+        return " ".join(anchor.split())
+
+    def _find_anchor_event(self, events: Sequence[_ChronologyEvent], anchor_phrase: str) -> _ChronologyEvent | None:
+        if not anchor_phrase:
+            return None
+        for event in events:
+            normalized = re.sub(r"[^a-z0-9\s]+", " ", event.event_text.lower())
+            if anchor_phrase in " ".join(normalized.split()):
+                return event
+        return None
+
+    def _extract_query_dates(self, query: str) -> list[datetime]:
+        date_pattern = re.compile(
+            r"\b(?:\d{4}-\d{2}-\d{2}|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+\d{1,2},\s*\d{4})\b",
+            flags=re.IGNORECASE,
+        )
+        values: list[datetime] = []
+        for match in date_pattern.finditer(query):
+            parsed = self._parse_date(match.group(0))
+            if parsed is not None:
+                values.append(parsed)
+        return values
 
     def _resolve_party_roles_from_intro(self, context: Sequence[dict[str, Any]]) -> "_PartyRoleAssignment | None":
         for item in context:
