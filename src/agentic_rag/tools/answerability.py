@@ -1926,6 +1926,8 @@ class AnswerabilityAssessor:
             r"\bwho\s+are\s+the\s+parties\b",
             r"\bwhich\s+company\s+is\s+this\s+agreement\s+for\b",
             r"\bis\s+this\s+agreement\s+between\b",
+            r"\bis\s+(?:this|the)\s+agreement\s+with\b",
+            r"\bis\s+(?:this|the)\s+agreement\s+for\b",
         )
         return any(re.search(pattern, lowered) for pattern in patterns)
 
@@ -2107,13 +2109,16 @@ class AnswerabilityAssessor:
                 "missing": ["party_set_incomplete"],
             }
 
-        between_match = re.search(r"\bis\s+this\s+agreement\s+between\s+(.+?)\s+and\s+(.+?)\??$", lowered_query)
-        if between_match:
-            requested_a = self._normalize_party_text(between_match.group(1))
-            requested_b = self._normalize_party_text(between_match.group(2))
+        verification_targets = self._extract_party_verification_targets(lowered_query)
+        if verification_targets is not None:
+            if len(role_assignment.parties) < 2:
+                return {
+                    "supported": False,
+                    "signals": ["party_role_assignment_resolved"],
+                    "missing": ["party_set_incomplete_for_agreement_verification"],
+                }
             extracted = {self._normalize_party_text(party) for party in role_assignment.parties}
-            matches_pair = requested_a in extracted and requested_b in extracted
-            if matches_pair:
+            if all(target in extracted for target in verification_targets):
                 return {
                     "supported": True,
                     "signals": [
@@ -2152,6 +2157,19 @@ class AnswerabilityAssessor:
             "signals": [],
             "missing": ["party_role_query_not_supported"],
         }
+
+    def _extract_party_verification_targets(self, lowered_query: str) -> tuple[str, ...] | None:
+        between_match = re.search(r"\bis\s+(?:this|the)\s+agreement\s+between\s+(.+?)\s+and\s+(.+?)\??$", lowered_query)
+        if between_match:
+            return (
+                self._normalize_party_text(between_match.group(1)),
+                self._normalize_party_text(between_match.group(2)),
+            )
+
+        single_party_match = re.search(r"\bis\s+(?:this|the)\s+agreement\s+(?:with|for)\s+(.+?)\??$", lowered_query)
+        if single_party_match:
+            return (self._normalize_party_text(single_party_match.group(1)),)
+        return None
 
     def _resolve_party_roles_from_intro(self, substantive: Sequence[Mapping[str, Any]]) -> _PartyRoleAssignment | None:
         for item in substantive:

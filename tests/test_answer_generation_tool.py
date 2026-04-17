@@ -240,6 +240,38 @@ def test_agreement_between_x_and_y_checks_both_extracted_parties() -> None:
     assert "no" in no_result.answer_text.lower()
 
 
+def test_agreement_between_query_returns_supported_verification_answer_when_both_parties_match() -> None:
+    context = [
+        _parent(
+            "p-1",
+            "Introduction",
+            "This Employment Agreement is made by and between Acme Corp and Jane Smith.",
+        )
+    ]
+
+    result = generate_answer(context, "Is this agreement with Jane Smith?")
+
+    assert result.sufficient_context is True
+    assert result.grounded is True
+    assert "yes" in result.answer_text.lower()
+
+
+def test_agreement_between_query_fails_safely_when_party_set_is_ambiguous_or_incomplete() -> None:
+    context = [
+        _parent(
+            "p-1",
+            "Introduction",
+            "This Employment Agreement is made between the Company and the Employee.",
+        )
+    ]
+
+    result = generate_answer(context, "Is this agreement between Acme Corp and Jane Smith?")
+
+    assert result.sufficient_context is False
+    assert result.grounded is False
+    assert any("party_role_assignment_unresolved" in warning for warning in result.warnings)
+
+
 def test_ambiguous_or_incomplete_party_intro_fails_safely() -> None:
     context = [
         _parent(
