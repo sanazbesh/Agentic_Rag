@@ -392,6 +392,158 @@ class QueryTransformationService:
     )
     llm_client: QueryTransformationLLM | None = None
 
+    _PARTY_ROLE_QUERY_PATTERNS: tuple[re.Pattern[str], ...] = (
+        re.compile(r"\bwho\s+is\s+the\s+(employer|employee)\b", flags=re.IGNORECASE),
+        re.compile(r"\bwho\s+are\s+the\s+parties\b", flags=re.IGNORECASE),
+        re.compile(r"\bwhich\s+company\s+is\s+this\s+agreement\s+for\b", flags=re.IGNORECASE),
+        re.compile(r"\bis\s+this\s+agreement\s+between\b", flags=re.IGNORECASE),
+        re.compile(r"\bis\s+(?:this|the)\s+agreement\s+with\b", flags=re.IGNORECASE),
+        re.compile(r"\bis\s+(?:this|the)\s+agreement\s+for\b", flags=re.IGNORECASE),
+    )
+    _MATTER_METADATA_QUERY_PATTERNS: tuple[re.Pattern[str], ...] = (
+        re.compile(r"\bwhat\s+is\s+the\s+file\s+number\b", flags=re.IGNORECASE),
+        re.compile(r"\b(?:what|which)\s+jurisdiction\s+applies\b", flags=re.IGNORECASE),
+        re.compile(r"\b(?:what|which)\s+court\s+is\s+involved\b", flags=re.IGNORECASE),
+        re.compile(r"\bwho\s+is\s+the\s+client\b", flags=re.IGNORECASE),
+        re.compile(r"\bwhat\s+is\s+the\s+(?:case|matter)\s+name\b", flags=re.IGNORECASE),
+        re.compile(r"\bwhat\s+is\s+this\s+(?:matter|document)\s+about\b", flags=re.IGNORECASE),
+    )
+    _EMPLOYMENT_LIFECYCLE_QUERY_PATTERNS: tuple[re.Pattern[str], ...] = (
+        re.compile(r"\bwhen\s+did\s+(?:employment|the employment relationship)\s+(?:begin|start|commence)\b", flags=re.IGNORECASE),
+        re.compile(r"\b(?:employment\s+)?start\s+date\b", flags=re.IGNORECASE),
+        re.compile(r"\bcommencement\s+date\b", flags=re.IGNORECASE),
+        re.compile(r"\boffer\s+and\s+acceptance\b", flags=re.IGNORECASE),
+        re.compile(r"\bwhen\s+was\s+the\s+offer\s+accepted\b", flags=re.IGNORECASE),
+        re.compile(r"\bprobation(?:ary)?\b", flags=re.IGNORECASE),
+        re.compile(r"\bcompensation\s+terms\b", flags=re.IGNORECASE),
+        re.compile(r"\bsalary\b", flags=re.IGNORECASE),
+        re.compile(r"\bbenefits\b", flags=re.IGNORECASE),
+        re.compile(r"\btermination\s+effective\s+date\b", flags=re.IGNORECASE),
+        re.compile(r"\bwhen\s+did\s+termination\s+take\s+effect\b", flags=re.IGNORECASE),
+        re.compile(r"\bseverance\b", flags=re.IGNORECASE),
+        re.compile(r"\broe\b", flags=re.IGNORECASE),
+        re.compile(r"\brecord\s+of\s+employment\b", flags=re.IGNORECASE),
+    )
+    _EMPLOYMENT_MITIGATION_QUERY_PATTERNS: tuple[re.Pattern[str], ...] = (
+        re.compile(r"\bmitigat(?:e|ion)\b", flags=re.IGNORECASE),
+        re.compile(r"\bmitigation\s+efforts?\b", flags=re.IGNORECASE),
+        re.compile(r"\bjob\s+applications?\b", flags=re.IGNORECASE),
+        re.compile(r"\bhow\s+many\s+job\s+applications?\b", flags=re.IGNORECASE),
+        re.compile(r"\binterviews?\b", flags=re.IGNORECASE),
+        re.compile(r"\boffers?\s+(?:received|rejected)\b", flags=re.IGNORECASE),
+        re.compile(r"\balternative\s+employment\b", flags=re.IGNORECASE),
+        re.compile(r"\bnew\s+employment\b", flags=re.IGNORECASE),
+        re.compile(r"\bmitigation\s+evidence\b", flags=re.IGNORECASE),
+        re.compile(r"\bjob\s+search\s+log\b", flags=re.IGNORECASE),
+    )
+
+    def _is_party_role_entity_query(self, query: str) -> bool:
+        normalized = (query or "").strip()
+        if not normalized:
+            return False
+        return any(pattern.search(normalized) for pattern in self._PARTY_ROLE_QUERY_PATTERNS)
+
+    def _expand_party_role_query(self, query: str) -> str:
+        normalized = re.sub(r"\s+", " ", (query or "").strip())
+        if not normalized:
+            return ""
+
+        expansion_terms = [
+            "agreement parties",
+            "between",
+            "by and between",
+            "made effective",
+            "employment agreement",
+            "employer",
+            "employee",
+            "company",
+        ]
+        expanded = f"{normalized} {' '.join(expansion_terms)}"
+        return re.sub(r"\s+", " ", expanded).strip()
+
+    def _is_matter_metadata_query(self, query: str) -> bool:
+        normalized = (query or "").strip()
+        if not normalized:
+            return False
+        return any(pattern.search(normalized) for pattern in self._MATTER_METADATA_QUERY_PATTERNS)
+
+    def _expand_matter_metadata_query(self, query: str) -> str:
+        normalized = re.sub(r"\s+", " ", (query or "").strip())
+        if not normalized:
+            return ""
+
+        expansion_terms = [
+            "caption",
+            "introductory header",
+            "matter information",
+            "court heading",
+            "file number",
+            "court file number",
+            "jurisdiction",
+            "court",
+            "client",
+            "case name",
+            "matter name",
+            "governing forum",
+        ]
+        expanded = f"{normalized} {' '.join(expansion_terms)}"
+        return re.sub(r"\s+", " ", expanded).strip()
+
+    def _is_employment_lifecycle_query(self, query: str) -> bool:
+        normalized = (query or "").strip()
+        if not normalized:
+            return False
+        return any(pattern.search(normalized) for pattern in self._EMPLOYMENT_LIFECYCLE_QUERY_PATTERNS)
+
+    def _expand_employment_lifecycle_query(self, query: str) -> str:
+        normalized = re.sub(r"\s+", " ", (query or "").strip())
+        if not normalized:
+            return ""
+
+        expansion_terms = [
+            "effective date",
+            "commencement",
+            "term of employment",
+            "offer acceptance",
+            "probation period",
+            "compensation",
+            "salary",
+            "benefits",
+            "termination",
+            "severance",
+            "record of employment",
+            "ROE",
+        ]
+        expanded = f"{normalized} {' '.join(expansion_terms)}"
+        return re.sub(r"\s+", " ", expanded).strip()
+
+    def _is_employment_mitigation_query(self, query: str) -> bool:
+        normalized = (query or "").strip()
+        if not normalized:
+            return False
+        return any(pattern.search(normalized) for pattern in self._EMPLOYMENT_MITIGATION_QUERY_PATTERNS)
+
+    def _expand_employment_mitigation_query(self, query: str) -> str:
+        normalized = re.sub(r"\s+", " ", (query or "").strip())
+        if not normalized:
+            return ""
+
+        expansion_terms = [
+            "mitigation efforts",
+            "job search log",
+            "mitigation journal",
+            "application records",
+            "resume submission",
+            "interview invitation",
+            "interview date",
+            "offer letter",
+            "offer received",
+            "new employment start date",
+            "employment update email",
+        ]
+        expanded = f"{normalized} {' '.join(expansion_terms)}"
+        return re.sub(r"\s+", " ", expanded).strip()
+
     def rewrite_query(
         self,
         query: str,
@@ -408,6 +560,35 @@ class QueryTransformationService:
                 rewritten_query="",
                 used_conversation_context=False,
                 rewrite_notes="empty_input",
+            )
+
+        if self._is_party_role_entity_query(normalized_query):
+            return QueryRewriteResult(
+                original_query=original_query,
+                rewritten_query=self._expand_party_role_query(normalized_query),
+                used_conversation_context=False,
+                rewrite_notes="party_role_entity_query_expansion",
+            )
+        if self._is_matter_metadata_query(normalized_query):
+            return QueryRewriteResult(
+                original_query=original_query,
+                rewritten_query=self._expand_matter_metadata_query(normalized_query),
+                used_conversation_context=False,
+                rewrite_notes="matter_document_metadata_query_expansion",
+            )
+        if self._is_employment_lifecycle_query(normalized_query):
+            return QueryRewriteResult(
+                original_query=original_query,
+                rewritten_query=self._expand_employment_lifecycle_query(normalized_query),
+                used_conversation_context=False,
+                rewrite_notes="employment_contract_lifecycle_query_expansion",
+            )
+        if self._is_employment_mitigation_query(normalized_query):
+            return QueryRewriteResult(
+                original_query=original_query,
+                rewritten_query=self._expand_employment_mitigation_query(normalized_query),
+                used_conversation_context=False,
+                rewrite_notes="employment_mitigation_query_expansion",
             )
 
         context_blob = _build_context_blob(conversation_summary, recent_messages)

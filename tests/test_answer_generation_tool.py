@@ -15,7 +15,13 @@ class _CompressedLike:
     compressed_text: str
 
 
-def _parent(parent_id: str, heading: str, text: str, document_id: str = "doc-1") -> ParentChunkResult:
+def _parent(
+    parent_id: str,
+    heading: str,
+    text: str,
+    document_id: str = "doc-1",
+    metadata: dict[str, str] | None = None,
+) -> ParentChunkResult:
     return ParentChunkResult(
         parent_chunk_id=parent_id,
         document_id=document_id,
@@ -27,6 +33,7 @@ def _parent(parent_id: str, heading: str, text: str, document_id: str = "doc-1")
         parent_order=0,
         part_number=1,
         total_parts=1,
+        metadata=metadata or {},
     )
 
 
@@ -150,3 +157,291 @@ def test_generate_answer_query_not_in_context_no_fabrication() -> None:
     assert result.sufficient_context is False
     assert result.grounded is False
     assert "limitation of liability cap" not in result.answer_text.lower()
+
+
+def test_agreement_intro_role_assignment_identifies_employer_and_employee() -> None:
+    context = [
+        _parent(
+            "p-1",
+            "Introduction",
+            "This Employment Agreement is made effective January 1, 2025, by and between Acme Corp, Inc. and Jane Smith.",
+        )
+    ]
+
+    employer = generate_answer(context, "Who is the employer?")
+    employee = generate_answer(context, "Who is the employee?")
+
+    assert "acme corp" in employer.answer_text.lower()
+    assert "jane smith" in employee.answer_text.lower()
+    assert employer.sufficient_context is True
+    assert employee.sufficient_context is True
+
+
+def test_who_is_the_employer_returns_company_side_party_when_supported() -> None:
+    context = [
+        _parent(
+            "p-1",
+            "Parties",
+            'This Employment Agreement is between Acme Holdings LLC ("Employer") and Jane Smith ("Employee").',
+        )
+    ]
+
+    result = generate_answer(context, "Who is the employer?")
+
+    assert result.sufficient_context is True
+    assert "acme holdings llc" in result.answer_text.lower()
+
+
+def test_who_is_the_employee_returns_individual_side_party_when_supported() -> None:
+    context = [
+        _parent(
+            "p-1",
+            "Parties",
+            'This Employment Agreement is between Acme Holdings LLC ("Employer") and Jane Smith ("Employee").',
+        )
+    ]
+
+    result = generate_answer(context, "Who is the employee?")
+
+    assert result.sufficient_context is True
+    assert "jane smith" in result.answer_text.lower()
+    assert "acme holdings llc" not in result.answer_text.lower().split("direct answer:")[1].split("\n")[0]
+
+
+def test_who_are_the_parties_returns_both_parties_when_supported() -> None:
+    context = [
+        _parent(
+            "p-1",
+            "Introduction",
+            "This Employment Agreement is made by and between Acme Corp and Jane Smith.",
+        )
+    ]
+
+    result = generate_answer(context, "Who are the parties?")
+
+    assert result.sufficient_context is True
+    assert "acme corp" in result.answer_text.lower()
+    assert "jane smith" in result.answer_text.lower()
+
+
+def test_agreement_between_x_and_y_checks_both_extracted_parties() -> None:
+    context = [
+        _parent(
+            "p-1",
+            "Introduction",
+            "This Employment Agreement is made by and between Acme Corp and Jane Smith.",
+        )
+    ]
+
+    yes_result = generate_answer(context, "Is this agreement between Acme Corp and Jane Smith?")
+    no_result = generate_answer(context, "Is this agreement between Acme Corp and John Roe?")
+
+    assert "yes" in yes_result.answer_text.lower()
+    assert "no" in no_result.answer_text.lower()
+
+
+def test_agreement_between_query_returns_supported_verification_answer_when_both_parties_match() -> None:
+    context = [
+        _parent(
+            "p-1",
+            "Introduction",
+            "This Employment Agreement is made by and between Acme Corp and Jane Smith.",
+        )
+    ]
+
+    result = generate_answer(context, "Is this agreement with Jane Smith?")
+
+    assert result.sufficient_context is True
+    assert result.grounded is True
+    assert "yes" in result.answer_text.lower()
+
+
+def test_agreement_between_query_fails_safely_when_party_set_is_ambiguous_or_incomplete() -> None:
+    context = [
+        _parent(
+            "p-1",
+            "Introduction",
+            "This Employment Agreement is made between the Company and the Employee.",
+        )
+    ]
+
+    result = generate_answer(context, "Is this agreement between Acme Corp and Jane Smith?")
+
+    assert result.sufficient_context is False
+    assert result.grounded is False
+    assert any("party_role_assignment_unresolved" in warning for warning in result.warnings)
+
+
+def test_ambiguous_or_incomplete_party_intro_fails_safely() -> None:
+    context = [
+        _parent(
+            "p-1",
+            "Introduction",
+            "This Employment Agreement is made between the Company and the Employee.",
+        )
+    ]
+
+    result = generate_answer(context, "Who is the employee?")
+
+    assert result.sufficient_context is False
+    assert result.grounded is False
+    assert any("party_role_assignment_unresolved" in warning for warning in result.warnings)
+
+
+def test_employer_question_returns_company_side_party_when_supported() -> None:
+    context = [
+        _parent(
+            "p-1",
+            "Introduction",
+            "This Employment Agreement is made by and between Acme Corp and Jane Smith.",
+        )
+    ]
+
+    result = generate_answer(context, "Who is the employer?")
+
+    assert result.sufficient_context is True
+    assert "acme corp" in result.answer_text.lower()
+
+
+def test_employee_question_returns_individual_side_party_when_supported() -> None:
+    context = [
+        _parent(
+            "p-1",
+            "Introduction",
+            "This Employment Agreement is made by and between Acme Corp and Jane Smith.",
+        )
+    ]
+
+    result = generate_answer(context, "Who is the employee?")
+
+    assert result.sufficient_context is True
+    assert "jane smith" in result.answer_text.lower()
+
+
+def test_parties_question_returns_both_parties_when_supported() -> None:
+    context = [
+        _parent(
+            "p-1",
+            "Introduction",
+            "This Employment Agreement is made by and between Acme Corp and Jane Smith.",
+        )
+    ]
+
+    result = generate_answer(context, "Who are the parties?")
+
+    assert result.sufficient_context is True
+    assert "acme corp" in result.answer_text.lower()
+    assert "jane smith" in result.answer_text.lower()
+
+
+def test_agreement_between_x_and_y_uses_extracted_party_set_when_supported() -> None:
+    context = [
+        _parent(
+            "p-1",
+            "Introduction",
+            "This Employment Agreement is made by and between Acme Corp and Jane Smith.",
+        )
+    ]
+
+    result = generate_answer(context, "Is this agreement between Acme Corp and Jane Smith?")
+
+    assert result.sufficient_context is True
+    assert "yes" in result.answer_text.lower()
+
+
+def test_ambiguous_or_missing_role_resolution_still_fails_safely() -> None:
+    context = [
+        _parent(
+            "p-1",
+            "Introduction",
+            "This Employment Agreement is made between the Company and the Employee.",
+        )
+    ]
+
+    result = generate_answer(context, "Who is the employer?")
+
+    assert result.sufficient_context is False
+    assert result.grounded is False
+    assert any("party_role_assignment_unresolved" in warning for warning in result.warnings)
+
+
+
+
+def test_agreement_between_query_returns_supported_verification_answer_when_punctuation_differs() -> None:
+    context = [
+        _parent(
+            "p-1",
+            "Introduction",
+            "This Employment Agreement is made by and between Aurora Data Systems Inc and Daniel Reza Mohammadi.",
+        )
+    ]
+
+    result = generate_answer(context, "Is this agreement between Aurora Data Systems Inc. and Daniel Reza Mohammadi?")
+
+    assert result.sufficient_context is True
+    assert result.grounded is True
+    assert "yes" in result.answer_text.lower()
+
+
+def test_agreement_between_query_fails_safely_when_query_entity_set_is_incomplete_or_ambiguous() -> None:
+    context = [
+        _parent(
+            "p-1",
+            "Introduction",
+            "This Employment Agreement is made by and between Acme Corp and Jane Smith.",
+        )
+    ]
+
+    result = generate_answer(context, "Is this agreement between Acme Corp and the employee?")
+
+    assert result.sufficient_context is False
+    assert result.grounded is False
+    assert any("party_role_assignment_unresolved" in warning for warning in result.warnings)
+def test_non_party_clause_lookup_behavior_remains_unchanged() -> None:
+    context = [
+        _parent(
+            "p-1",
+            "Confidentiality",
+            (
+                "Confidentiality obligations apply to all Confidential Information. "
+                "The receiving party shall keep all Confidential Information strictly confidential."
+            ),
+        )
+    ]
+
+    result = generate_answer(context, "What does the document say about confidentiality?")
+
+    assert result.grounded is True
+    assert result.citations
+    assert "confidential" in result.answer_text.lower()
+
+
+def test_matter_metadata_file_number_answer_uses_metadata_responsive_evidence() -> None:
+    context = [
+        _parent(
+            "p-1",
+            "Matter Information",
+            "File Number: CV-2025-0192",
+            metadata={"file_number": "CV-2025-0192"},
+        )
+    ]
+
+    result = generate_answer(context, "What is the file number?")
+
+    assert result.sufficient_context is True
+    assert "CV-2025-0192" in result.answer_text
+
+
+def test_matter_metadata_question_does_not_use_unrelated_clause_text() -> None:
+    context = [
+        _parent(
+            "p-1",
+            "Termination",
+            "Either party may terminate this Agreement with thirty days written notice.",
+        )
+    ]
+
+    result = generate_answer(context, "What is the file number?")
+
+    assert result.sufficient_context is False
+    assert result.grounded is False

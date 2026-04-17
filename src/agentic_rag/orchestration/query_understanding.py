@@ -174,6 +174,291 @@ def _hint_match_confidence(subject: str, hints: Sequence[str]) -> float:
     return best
 
 
+
+
+def _is_party_role_entity_query(normalized_query: str) -> bool:
+    lowered = _canonicalize_phrase(normalized_query)
+    if not lowered:
+        return False
+
+    role_markers = ("employer", "employee", "parties", "party", "company", "entity")
+    if any(marker in lowered for marker in role_markers):
+        role_intents = ("who is", "who are", "which", "what", "is this agreement", "agreement for")
+        if any(intent in lowered for intent in role_intents):
+            return True
+
+    if lowered.startswith("is this agreement between") or lowered.startswith("is the agreement between"):
+        return True
+    if lowered.startswith("is this agreement with") or lowered.startswith("is the agreement with"):
+        return True
+    if lowered.startswith("is this agreement for") or lowered.startswith("is the agreement for"):
+        return True
+    if "which company is this agreement for" in lowered:
+        return True
+    return False
+
+
+def _is_chronology_date_event_query(normalized_query: str) -> bool:
+    lowered = _canonicalize_phrase(normalized_query)
+    if not lowered:
+        return False
+
+    direct_patterns = (
+        r"\bwhen did\b",
+        r"\bwhen was\b",
+        r"\btimeline\b",
+        r"\bchronology\b",
+        r"\bwhat happened first\b",
+        r"\bwhat happened last\b",
+        r"\bfirst event\b",
+        r"\blast event\b",
+        r"\bwhat happened after\b",
+        r"\bwhat happened before\b",
+        r"\bbetween\b.+\band\b",
+        r"\ball dated events\b",
+    )
+    if any(re.search(pattern, lowered) for pattern in direct_patterns):
+        return True
+
+    temporal_words = (
+        "effective date",
+        "commencement",
+        "start date",
+        "termination date",
+        "notice date",
+        "letter date",
+        "email date",
+        "filing date",
+        "service date",
+    )
+    has_temporal_word = any(word in lowered for word in temporal_words)
+    has_question_frame = any(
+        phrase in lowered
+        for phrase in (
+            "what date",
+            "on what date",
+            "what happened",
+            "when",
+            "after",
+            "before",
+            "between",
+        )
+    )
+    return has_temporal_word and has_question_frame
+
+
+def _is_matter_metadata_query(normalized_query: str) -> bool:
+    lowered = _canonicalize_phrase(normalized_query)
+    if not lowered:
+        return False
+
+    metadata_patterns = (
+        r"\bwhat\s+is\s+the\s+file\s+number\b",
+        r"\bwhat\s+is\s+the\s+matter\s+name\b",
+        r"\bwhat\s+is\s+the\s+case\s+name\b",
+        r"\bwho\s+is\s+the\s+client\b",
+        r"\bwhat\s+jurisdiction\s+applies\b",
+        r"\bwhich\s+jurisdiction\s+applies\b",
+        r"\bwhat\s+court\s+is\s+involved\b",
+        r"\bwhich\s+court\s+is\s+involved\b",
+        r"\bwhat\s+is\s+this\s+matter\s+about\b",
+        r"\bwhat\s+is\s+this\s+document\s+about\b",
+    )
+    if any(re.search(pattern, lowered) for pattern in metadata_patterns):
+        return True
+
+    metadata_markers = (
+        "matter name",
+        "case name",
+        "client",
+        "file number",
+        "court file number",
+        "docket number",
+        "jurisdiction",
+        "governing forum",
+        "court",
+        "caption",
+        "matter information",
+    )
+    has_marker = any(marker in lowered for marker in metadata_markers)
+    has_question_frame = any(
+        marker in lowered
+        for marker in (
+            "what is",
+            "which is",
+            "which",
+            "who is",
+            "who's",
+            "what court",
+            "what jurisdiction",
+            "which court",
+            "which jurisdiction",
+            "about this matter",
+            "about this document",
+        )
+    )
+    return has_marker and has_question_frame
+
+
+def _is_employment_contract_lifecycle_query(normalized_query: str) -> bool:
+    lowered = _canonicalize_phrase(normalized_query)
+    if not lowered:
+        return False
+
+    patterns = (
+        r"\bwhen\s+did\s+(?:employment|the employment relationship)\s+(?:begin|start|commence)\b",
+        r"\b(?:employment\s+)?start\s+date\b",
+        r"\bcommencement\s+date\b",
+        r"\boffer\s+and\s+acceptance\b",
+        r"\bwhen\s+was\s+the\s+offer\s+accepted\b",
+        r"\bprobation(?:ary)?\b",
+        r"\bwhen\s+did\s+probation\s+end\b",
+        r"\bcompensation\s+terms\b",
+        r"\bsalary\b",
+        r"\bbenefits\b",
+        r"\btermination\s+effective\s+date\b",
+        r"\bwhen\s+did\s+termination\s+take\s+effect\b",
+        r"\bseverance\b",
+        r"\brecord\s+of\s+employment\b",
+        r"\broe\b",
+    )
+    return any(re.search(pattern, lowered) for pattern in patterns)
+
+
+def _is_employment_mitigation_query(normalized_query: str) -> bool:
+    lowered = _canonicalize_phrase(normalized_query)
+    if not lowered:
+        return False
+
+    patterns = (
+        r"\bmitigation\b",
+        r"\bmitigate\b",
+        r"\bmitigation efforts?\b",
+        r"\bjob applications?\b",
+        r"\bhow many job applications?\b",
+        r"\binterviews?\b",
+        r"\boffers?\s+(?:received|rejected)\b",
+        r"\balternative employment\b",
+        r"\bnew employment\b",
+        r"\bjob search\b",
+        r"\bmitigation evidence\b",
+    )
+    if any(re.search(pattern, lowered) for pattern in patterns):
+        return True
+
+    evidence_markers = (
+        "application record",
+        "application log",
+        "job search log",
+        "mitigation journal",
+        "offer letter",
+        "interview invitation",
+        "employment update",
+    )
+    has_employment_frame = any(token in lowered for token in ("employment", "job", "offer", "interview", "application"))
+    return has_employment_frame and any(marker in lowered for marker in evidence_markers)
+
+
+def _is_financial_entitlement_query(normalized_query: str) -> bool:
+    lowered = _canonicalize_phrase(normalized_query)
+    if not lowered:
+        return False
+
+    patterns = (
+        r"\bwhat\s+compensation\s+was\s+promised\b",
+        r"\bpromised\s+compensation\b",
+        r"\bsalary\b",
+        r"\bpay\s+rate\b",
+        r"\bremuneration\b",
+        r"\bunpaid\b",
+        r"\bunpaid\s+(?:wages?|amounts?)\b",
+        r"\bamounts?\s+(?:are|were)\s+unpaid\b",
+        r"\bbonus\b",
+        r"\bvacation\s+pay\b",
+        r"\breimburse(?:ment|ments)?\b",
+        r"\bexpense(?:s)?\b",
+        r"\bseverance\b",
+        r"\bfinancial\s+records?\b",
+        r"\bpay\s+stub(?:s)?\b",
+        r"\bpayroll\s+records?\b",
+        r"\bdemand\s+letter\b",
+        r"\bmonetary\s+claim\b",
+    )
+    return any(re.search(pattern, lowered) for pattern in patterns)
+
+
+def _is_policy_issue_spotting_query(normalized_query: str) -> bool:
+    lowered = _canonicalize_phrase(normalized_query)
+    if not lowered:
+        return False
+
+    financial_only_markers = ("reimbursement", "reimbursements", "expense", "expenses", "payroll", "pay stub", "salary")
+    has_financial_only_frame = any(marker in lowered for marker in financial_only_markers)
+
+    direct_patterns = (
+        r"\bwhat\s+polic(?:y|ies)\s+(?:are|is)\s+relevant\b",
+        r"\bwhat\s+legal\s+issues?\s+(?:are|is)\s+raised\b",
+        r"\bwhat\s+(?:are|is)\s+the\s+key\s+issues?\b",
+        r"\bwhat\s+are\s+the\s+key\s+issues?\s+in\s+the\s+file\b",
+        r"\bwhat\s+is\s+the\s+nature\s+of\s+the\s+claim\b",
+        r"\bnature\s+of\s+the\s+claim\b",
+        r"\bclauses?\s+or\s+polic(?:y|ies)\s+relat(?:e|ed)\s+to\s+(?:this|the)\s+dispute\b",
+        r"\bwhich\s+clauses?\s+relate\s+to\s+the\s+dispute\b",
+        r"\bwhich\s+polic(?:y|ies)\s+apply\s+to\s+the\s+dispute\b",
+    )
+    if any(re.search(pattern, lowered) for pattern in direct_patterns):
+        return True
+
+    policy_markers = ("policy", "policies", "handbook", "workplace policy", "hr policy")
+    issue_markers = ("issue", "issues", "legal issue", "dispute", "claim", "allegation", "violation")
+    framing_markers = ("relevant", "raised", "key", "nature", "related", "relate", "at issue")
+    if has_financial_only_frame and not any(marker in lowered for marker in ("policy", "dispute", "claim", "legal issue", "legal issues", "clause")):
+        return False
+    if any(marker in lowered for marker in policy_markers) and any(marker in lowered for marker in framing_markers):
+        return True
+    if any(marker in lowered for marker in issue_markers) and any(marker in lowered for marker in framing_markers):
+        return True
+    return False
+
+
+
+
+def _is_correspondence_litigation_milestone_query(normalized_query: str) -> bool:
+    lowered = _canonicalize_phrase(normalized_query)
+    if not lowered:
+        return False
+
+    patterns = (
+        r"\bwhat\s+letters?\s+(?:were|was)\s+sent\b",
+        r"\bwhat\s+emails?\s+(?:were|was)\s+sent\b",
+        r"\bwhat\s+communications?\s+(?:were|was)\s+sent\b",
+        r"\bwhen\s+(?:was|were|did)\s+.+\b(?:letter|email|communication|correspondence)\b",
+        r"\bwhat\s+deadlines?\s+(?:were|was)\s+demanded\b",
+        r"\bwhen\s+was\s+the\s+claim\s+filed\b",
+        r"\bwhen\s+was\s+the\s+statement\s+of\s+claim\s+filed\b",
+        r"\bwhen\s+was\s+the\s+defen(?:c|s)e\s+(?:due|filed)\b",
+        r"\bwhat\s+pleadings?\s+.*\b(?:filed|served)\b",
+        r"\bwhat\s+happened\s+procedurally\b",
+        r"\bprocedural\s+(?:history|status)\b",
+        r"\bcourt\s+filings?\b",
+        r"\bdefault\s+notice\b",
+        r"\bsettlement\s+discussion",
+    )
+    if any(re.search(pattern, lowered) for pattern in patterns):
+        return True
+
+    marker_groups = (
+        ("letter", "email", "communication", "correspondence", "demand"),
+        ("claim", "statement of claim", "pleading", "defence", "defense", "reply", "default notice"),
+        ("filed", "served", "service", "issued", "delivered"),
+    )
+    return (
+        any(marker in lowered for marker in marker_groups[0])
+        and any(marker in lowered for marker in ("when", "what", "deadline", "deadlines", "demanded", "sent"))
+    ) or (
+        any(marker in lowered for marker in marker_groups[1])
+        and any(marker in lowered for marker in marker_groups[2] + ("due", "deadline", "procedurally", "status"))
+    )
 def understand_query(
     query: str,
     conversation_summary: str | None = None,
@@ -192,6 +477,14 @@ def understand_query(
     normalized = " ".join(original.split())
     lowered = normalized.lower()
     context_available = bool(_text(conversation_summary) or list(recent_messages or []))
+    is_party_role_entity_query = _is_party_role_entity_query(normalized)
+    is_chronology_date_event_query = _is_chronology_date_event_query(normalized)
+    is_matter_metadata_query = _is_matter_metadata_query(normalized)
+    is_employment_contract_lifecycle_query = _is_employment_contract_lifecycle_query(normalized)
+    is_employment_mitigation_query = _is_employment_mitigation_query(normalized)
+    is_financial_entitlement_query = _is_financial_entitlement_query(normalized)
+    is_policy_issue_spotting_query = _is_policy_issue_spotting_query(normalized)
+    is_correspondence_litigation_milestone_query = _is_correspondence_litigation_milestone_query(normalized)
 
     meta_markers = ("how many documents", "what files are loaded", "what documents are uploaded", "what docs are loaded")
     comparison_markers = ("compare", "differ", "difference", "vs ", "versus")
@@ -210,6 +503,14 @@ def understand_query(
         "arbitration",
         "liability",
         "assignment",
+        "probation",
+        "compensation",
+        "benefits",
+        "severance",
+        "roe",
+        "record of employment",
+        "commencement",
+        "effective date",
     )
 
     padded = f" {lowered} "
@@ -232,7 +533,13 @@ def understand_query(
         for topic in topic_markers:
             if topic in resolved_topic_hints:
                 continue
-            if subject_tokens & set(topic.split()):
+            topic_tokens = set(topic.split())
+            overlap = subject_tokens & topic_tokens
+            if (
+                (len(topic_tokens) == 1 and overlap)
+                or (len(topic_tokens) > 1 and len(overlap) >= 2)
+                or (len(subject_tokens) == 1 and len(overlap) == 1)
+            ):
                 resolved_topic_hints.append(topic)
     resolved_clause_hints = list(resolved_topic_hints)
     if is_canonical_what_is and what_is_subject:
@@ -260,7 +567,17 @@ def understand_query(
         question_type = "document_summary_query"
     elif explicit_document_scope and any(marker in lowered for marker in doc_content_markers):
         question_type = "document_content_query"
-    elif any(marker in lowered for marker in extractive_markers):
+    elif (
+        is_party_role_entity_query
+        or is_chronology_date_event_query
+        or is_matter_metadata_query
+        or is_employment_contract_lifecycle_query
+        or is_employment_mitigation_query
+        or is_financial_entitlement_query
+        or is_policy_issue_spotting_query
+        or is_correspondence_litigation_milestone_query
+        or any(marker in lowered for marker in extractive_markers)
+    ):
         question_type = "extractive_fact_query"
     elif lowered.startswith(definition_starters):
         question_type = "definition_query"
@@ -275,7 +592,7 @@ def understand_query(
 
     # Deterministic "what is X?" rule insertion point:
     # apply only after hint extraction and before final answerability assignment.
-    if is_canonical_what_is:
+    if is_canonical_what_is and not is_matter_metadata_query and not is_policy_issue_spotting_query:
         available_documents = bool(active_documents or selected_documents)
         combined_hints = [*resolved_topic_hints, *resolved_clause_hints]
         canonical_subject = _canonicalize_phrase(what_is_subject or "")
@@ -387,8 +704,17 @@ def understand_query(
         answerability = "general_grounded_response"
         should_retrieve = True
 
-    should_rewrite = question_type in {"ambiguous_query"} or (is_context_dependent and not explicit_document_scope)
-    should_extract_entities = any(
+    should_rewrite = (
+        question_type in {"ambiguous_query"}
+        or (is_context_dependent and not explicit_document_scope)
+        or is_party_role_entity_query
+        or is_matter_metadata_query
+        or is_employment_contract_lifecycle_query
+        or is_employment_mitigation_query
+        or is_policy_issue_spotting_query
+        or is_correspondence_litigation_milestone_query
+    )
+    should_extract_entities = is_party_role_entity_query or is_matter_metadata_query or any(
         marker in lowered
         for marker in ("law", "jurisdiction", "court", "statute", "regulation", "clause", "section", "ontario", "california")
     )
@@ -404,6 +730,22 @@ def understand_query(
         routing_notes.append("rewrite_recommended")
     if should_extract_entities:
         routing_notes.append("entity_extraction_useful")
+    if is_party_role_entity_query:
+        routing_notes.append("legal_question_family:party_role_entity")
+    if is_chronology_date_event_query:
+        routing_notes.append("legal_question_family:chronology_date_event")
+    if is_matter_metadata_query:
+        routing_notes.append("legal_question_family:matter_document_metadata")
+    if is_employment_contract_lifecycle_query:
+        routing_notes.append("legal_question_family:employment_contract_lifecycle")
+    if is_employment_mitigation_query:
+        routing_notes.append("legal_question_family:employment_mitigation")
+    if is_financial_entitlement_query:
+        routing_notes.append("legal_question_family:financial_entitlement")
+    if is_policy_issue_spotting_query:
+        routing_notes.append("legal_question_family:policy_issue_spotting")
+    if is_correspondence_litigation_milestone_query:
+        routing_notes.append("legal_question_family:correspondence_litigation_milestone")
 
     if question_type == "other_query" and refers_to_prior_document_scope and not context_available:
         ambiguity_notes.append("pronoun_reference_without_resolvable_scope")

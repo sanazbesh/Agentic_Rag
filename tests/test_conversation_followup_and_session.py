@@ -164,6 +164,20 @@ def test_missing_prior_scope_for_pronoun_is_safely_flagged() -> None:
     assert any("missing_prior_scope" in warning for warning in state["warnings"])
 
 
+def test_agreement_between_query_succeeds_with_selected_document_even_without_prior_scope() -> None:
+    deps = MinimalDeps().retrieval()
+    state = run_retrieval_stage(
+        query="Is this agreement between Acme Corp and Jane Smith?",
+        conversation_summary=None,
+        recent_messages=[],
+        selected_documents=[{"id": "doc-employment", "name": "Employment Agreement"}],
+        dependencies=deps,
+    )
+    assert state["context_resolution"] is not None
+    assert state["context_resolution"].resolved_document_ids == ["doc-employment"]
+    assert not any("missing_prior_scope" in warning for warning in state["warnings"])
+
+
 def test_session_continuity_helpers_preserve_turns_across_runs() -> None:
     history: list[dict[str, Any]] = []
     history = append_conversation_turn(history=history, query="Q1", answer_text="A1", metadata={"resolved_document_ids": ["doc-1"]})

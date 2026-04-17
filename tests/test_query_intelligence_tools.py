@@ -237,3 +237,43 @@ def test_extract_legal_entities_non_conflation_validation() -> None:
     assert "Delaware" in result.jurisdictions
     assert "Chancery Court" in result.courts
     assert "UCC" not in result.legal_citations
+
+
+def test_rewrite_query_expands_party_role_entity_query_for_intro_line_retrieval() -> None:
+    query = "who is the employer?"
+
+    result = rewrite_query(query)
+
+    assert result.rewrite_notes == "party_role_entity_query_expansion"
+    assert "by and between" in result.rewritten_query.lower()
+    assert "employer" in result.rewritten_query.lower()
+
+
+def test_rewrite_query_expands_matter_document_metadata_query_for_caption_header_retrieval() -> None:
+    query = "what is the file number?"
+
+    result = rewrite_query(query)
+
+    assert result.rewrite_notes == "matter_document_metadata_query_expansion"
+    assert "caption" in result.rewritten_query.lower()
+    assert "matter information" in result.rewritten_query.lower()
+
+
+def test_rewrite_query_expands_employment_lifecycle_query_for_lifecycle_clause_retrieval() -> None:
+    query = "When did employment start?"
+
+    result = rewrite_query(query)
+
+    assert result.rewrite_notes == "employment_contract_lifecycle_query_expansion"
+    assert "commencement" in result.rewritten_query.lower()
+    assert "compensation" in result.rewritten_query.lower()
+
+
+def test_rewrite_query_expands_employment_mitigation_query_for_mitigation_evidence_retrieval() -> None:
+    query = "What mitigation efforts were made?"
+
+    result = rewrite_query(query)
+
+    assert result.rewrite_notes == "employment_mitigation_query_expansion"
+    assert "job search log" in result.rewritten_query.lower()
+    assert "offer letter" in result.rewritten_query.lower()
