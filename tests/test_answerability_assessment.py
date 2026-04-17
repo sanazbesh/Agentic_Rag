@@ -1131,6 +1131,41 @@ def test_ambiguous_or_missing_role_resolution_still_fails_safely_in_answerabilit
     assert result.insufficiency_reason == "fact_not_found"
 
 
+
+
+def test_agreement_between_query_extracts_query_side_entity_set_for_comparison() -> None:
+    query = "is this agreement between Aurora Data Systems Inc. and Daniel Reza Mohammadi?"
+    understanding = understand_query(query)
+    context = [
+        _parent(
+            "p1",
+            "This Employment Agreement is made by and between Aurora Data Systems Inc and Daniel Reza Mohammadi.",
+            heading="Introduction",
+        )
+    ]
+
+    result = assess_answerability(query, understanding, context)
+
+    assert result.sufficient_context is True
+    assert "agreement_between_query_entity_set_matched_extracted_party_set" in result.evidence_notes
+
+
+def test_agreement_between_query_fails_safely_when_query_entity_set_is_incomplete_or_ambiguous() -> None:
+    query = "is this agreement between Acme Corp and the employee?"
+    understanding = understand_query(query)
+    context = [
+        _parent(
+            "p1",
+            "This Employment Agreement is made by and between Acme Corp and Jane Smith.",
+            heading="Introduction",
+        )
+    ]
+
+    result = assess_answerability(query, understanding, context)
+
+    assert result.sufficient_context is False
+    assert result.should_answer is False
+    assert result.insufficiency_reason == "fact_not_found"
 def test_non_party_clause_lookup_behavior_remains_unchanged_in_answerability() -> None:
     query = "what does the document say about confidentiality?"
     understanding = understand_query(query)

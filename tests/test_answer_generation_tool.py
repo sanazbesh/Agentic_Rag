@@ -365,6 +365,38 @@ def test_ambiguous_or_missing_role_resolution_still_fails_safely() -> None:
     assert any("party_role_assignment_unresolved" in warning for warning in result.warnings)
 
 
+
+
+def test_agreement_between_query_returns_supported_verification_answer_when_punctuation_differs() -> None:
+    context = [
+        _parent(
+            "p-1",
+            "Introduction",
+            "This Employment Agreement is made by and between Aurora Data Systems Inc and Daniel Reza Mohammadi.",
+        )
+    ]
+
+    result = generate_answer(context, "Is this agreement between Aurora Data Systems Inc. and Daniel Reza Mohammadi?")
+
+    assert result.sufficient_context is True
+    assert result.grounded is True
+    assert "yes" in result.answer_text.lower()
+
+
+def test_agreement_between_query_fails_safely_when_query_entity_set_is_incomplete_or_ambiguous() -> None:
+    context = [
+        _parent(
+            "p-1",
+            "Introduction",
+            "This Employment Agreement is made by and between Acme Corp and Jane Smith.",
+        )
+    ]
+
+    result = generate_answer(context, "Is this agreement between Acme Corp and the employee?")
+
+    assert result.sufficient_context is False
+    assert result.grounded is False
+    assert any("party_role_assignment_unresolved" in warning for warning in result.warnings)
 def test_non_party_clause_lookup_behavior_remains_unchanged() -> None:
     context = [
         _parent(

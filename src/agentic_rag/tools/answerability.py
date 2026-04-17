@@ -2109,30 +2109,18 @@ class AnswerabilityAssessor:
                 "missing": ["party_set_incomplete"],
             }
 
-        verification_targets = self._extract_party_verification_targets(lowered_query)
-        if verification_targets is not None:
-            if len(role_assignment.parties) < 2:
+        parsed_verification = self._parse_party_verification_query_entities(lowered_query)
+        if parsed_verification is not None:
+            if cast(bool, parsed_verification["ambiguous"]):
                 return {
                     "supported": False,
                     "signals": ["party_role_assignment_resolved"],
-                    "missing": ["party_set_incomplete_for_agreement_verification"],
+                    "missing": ["query_entity_set_incomplete_or_ambiguous"],
                 }
-            extracted = {self._normalize_party_text(party) for party in role_assignment.parties}
-            if all(target in extracted for target in verification_targets):
-                return {
-                    "supported": True,
-                    "signals": [
-                        "party_role_responsive_evidence_detected",
-                        "party_role_assignment_resolved",
-                        "agreement_between_pair_confirmed_from_extracted_parties",
-                    ],
-                    "missing": [],
-                }
-            return {
-                "supported": False,
-                "signals": ["party_role_assignment_resolved"],
-                "missing": ["requested_party_pair_not_supported_by_extracted_parties"],
-            }
+            return self._compare_query_entities_against_extracted_parties(
+                verification_targets=cast(tuple[str, ...], parsed_verification["targets"]),
+                extracted_parties=role_assignment.parties,
+            )
 
         if "which company is this agreement for" in lowered_query:
             company = role_assignment.employer or self._pick_company_party(role_assignment.parties)
@@ -2159,17 +2147,74 @@ class AnswerabilityAssessor:
         }
 
     def _extract_party_verification_targets(self, lowered_query: str) -> tuple[str, ...] | None:
+        parsed = self._parse_party_verification_query_entities(lowered_query)
+        if parsed is None or parsed["ambiguous"]:
+            return None
+        return cast(tuple[str, ...], parsed["targets"])
+
+    def _parse_party_verification_query_entities(self, lowered_query: str) -> dict[str, object] | None:
         between_match = re.search(r"\bis\s+(?:this|the)\s+agreement\s+between\s+(.+?)\s+and\s+(.+?)\??$", lowered_query)
         if between_match:
-            return (
-                self._normalize_party_text(between_match.group(1)),
-                self._normalize_party_text(between_match.group(2)),
+            first = self._normalize_party_text(between_match.group(1))
+            second = self._normalize_party_text(between_match.group(2))
+            ambiguous = (
+                not self._is_usable_party_entity(first)
+                or not self._is_usable_party_entity(second)
+                or first == second
             )
+            return {"targets": (first, second), "ambiguous": ambiguous}
 
         single_party_match = re.search(r"\bis\s+(?:this|the)\s+agreement\s+(?:with|for)\s+(.+?)\??$", lowered_query)
         if single_party_match:
-            return (self._normalize_party_text(single_party_match.group(1)),)
+            target = self._normalize_party_text(single_party_match.group(1))
+            ambiguous = not self._is_usable_party_entity(target)
+            return {"targets": (target,), "ambiguous": ambiguous}
         return None
+
+    def _compare_query_entities_against_extracted_parties(
+        self,
+        *,
+        verification_targets: tuple[str, ...],
+        extracted_parties: Sequence[str],
+    ) -> dict[str, object]:
+        normalized_extracted = [
+            self._normalize_party_text(party)
+            for party in extracted_parties
+            if self._is_usable_party_entity(self._normalize_party_text(party))
+        ]
+        extracted_set = set(normalized_extracted)
+        if len(extracted_set) < 2:
+            return {
+                "supported": False,
+                "signals": ["party_role_assignment_resolved"],
+                "missing": ["extracted_party_set_incomplete_or_ambiguous"],
+            }
+
+        target_set = set(verification_targets)
+        if len(target_set) != len(verification_targets) or not target_set:
+            return {
+                "supported": False,
+                "signals": ["party_role_assignment_resolved"],
+                "missing": ["query_entity_set_incomplete_or_ambiguous"],
+            }
+
+        if all(target in extracted_set for target in verification_targets):
+            return {
+                "supported": True,
+                "signals": [
+                    "party_role_responsive_evidence_detected",
+                    "party_role_assignment_resolved",
+                    "agreement_between_pair_confirmed_from_extracted_parties",
+                    "agreement_between_query_entity_set_matched_extracted_party_set",
+                ],
+                "missing": [],
+            }
+
+        return {
+            "supported": False,
+            "signals": ["party_role_assignment_resolved"],
+            "missing": ["requested_query_entity_set_not_supported_by_extracted_party_set"],
+        }
 
     def _resolve_party_roles_from_intro(self, substantive: Sequence[Mapping[str, Any]]) -> _PartyRoleAssignment | None:
         for item in substantive:
@@ -2312,13 +2357,20 @@ class AnswerabilityAssessor:
         return lowered in placeholders
 
     def _normalize_party_text(self, value: str) -> str:
-        lowered = value.lower().strip()
+        lowered = (value or "").lower().strip()
         lowered = re.sub(r"[\"'“”]", "", lowered)
         lowered = re.sub(r"\([^)]*\)", " ", lowered)
-        lowered = re.sub(r"[^a-z0-9&.,\-\s]", " ", lowered)
-        lowered = re.sub(r"\b(the|an|a)\b", " ", lowered)
-        lowered = re.sub(r"\s+", " ", lowered).strip(" ,;:-")
-        return lowered
+        lowered = re.sub(r"[^a-z0-9\s]", " ", lowered)
+        lowered = re.sub(r"\b(the|this|that|an|a)\b", " ", lowered)
+        return re.sub(r"\s+", " ", lowered).strip(" ,;:-")
+
+    def _is_usable_party_entity(self, value: str) -> bool:
+        normalized = self._normalize_party_text(value)
+        if not normalized:
+            return False
+        if self._is_placeholder_party(normalized):
+            return False
+        return len(normalized) >= 2
 
     def _comparison_side_hits(self, query: str, context_text: str) -> int:
         normalized_query = query.lower()

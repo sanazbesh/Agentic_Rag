@@ -257,16 +257,20 @@ class LegalAnswerSynthesizer:
                 source_line=source_line,
             )
 
-        verification_targets = self._extract_party_verification_targets(lowered_query)
-        if verification_targets is not None:
-            if len(role_assignment.parties) < 2:
+        parsed_verification = self._parse_party_verification_query_entities(lowered_query)
+        if parsed_verification is not None:
+            if parsed_verification["ambiguous"]:
                 return self._insufficient_party_role_with_citation(citation, source_line)
-            extracted = {self._normalize_party_text(party) for party in role_assignment.parties}
-            both_match = all(target in extracted for target in verification_targets)
+            comparison = self._compare_query_entities_against_extracted_parties(
+                verification_targets=parsed_verification["targets"],
+                extracted_parties=role_assignment.parties,
+            )
+            if comparison["status"] == "incomplete_party_set":
+                return self._insufficient_party_role_with_citation(citation, source_line)
             direct = (
-                "Yes, the agreement-introduction evidence identifies those two parties."
-                if both_match
-                else "No, the agreement-introduction evidence does not identify that exact pair of parties."
+                "Yes, the agreement-introduction evidence identifies the queried party set."
+                if comparison["status"] == "matched"
+                else "No, the agreement-introduction evidence does not identify that queried party set."
             )
             return self._party_role_success(direct=direct, citation=citation, source_line=source_line)
 
@@ -363,17 +367,51 @@ class LegalAnswerSynthesizer:
         return any(re.search(pattern, lowered_query) for pattern in patterns)
 
     def _extract_party_verification_targets(self, lowered_query: str) -> tuple[str, ...] | None:
+        parsed = self._parse_party_verification_query_entities(lowered_query)
+        if parsed is None or parsed["ambiguous"]:
+            return None
+        return parsed["targets"]
+
+    def _parse_party_verification_query_entities(self, lowered_query: str) -> dict[str, Any] | None:
         between_match = re.search(r"\bis\s+(?:this|the)\s+agreement\s+between\s+(.+?)\s+and\s+(.+?)\??$", lowered_query)
         if between_match:
-            return (
-                self._normalize_party_text(between_match.group(1)),
-                self._normalize_party_text(between_match.group(2)),
+            first = self._normalize_party_text(between_match.group(1))
+            second = self._normalize_party_text(between_match.group(2))
+            ambiguous = (
+                not self._is_usable_party_entity(first)
+                or not self._is_usable_party_entity(second)
+                or first == second
             )
+            return {"targets": (first, second), "ambiguous": ambiguous}
 
         single_party_match = re.search(r"\bis\s+(?:this|the)\s+agreement\s+(?:with|for)\s+(.+?)\??$", lowered_query)
         if single_party_match:
-            return (self._normalize_party_text(single_party_match.group(1)),)
+            target = self._normalize_party_text(single_party_match.group(1))
+            return {"targets": (target,), "ambiguous": not self._is_usable_party_entity(target)}
         return None
+
+    def _compare_query_entities_against_extracted_parties(
+        self,
+        *,
+        verification_targets: tuple[str, ...],
+        extracted_parties: Sequence[str],
+    ) -> dict[str, str]:
+        normalized_extracted = [
+            self._normalize_party_text(party)
+            for party in extracted_parties
+            if self._is_usable_party_entity(self._normalize_party_text(party))
+        ]
+        extracted_set = set(normalized_extracted)
+        if len(extracted_set) < 2:
+            return {"status": "incomplete_party_set"}
+
+        target_set = set(verification_targets)
+        if len(target_set) != len(verification_targets) or not target_set:
+            return {"status": "query_ambiguous"}
+
+        if all(target in extracted_set for target in verification_targets):
+            return {"status": "matched"}
+        return {"status": "mismatched"}
 
     def _metadata_target(self, lowered_query: str) -> str | None:
         patterns: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -1413,8 +1451,16 @@ class LegalAnswerSynthesizer:
 
     def _normalize_party_text(self, value: str) -> str:
         normalized = re.sub(r"[^a-z0-9\s]", " ", (value or "").lower())
-        normalized = re.sub(r"\b(the|this|that)\b", " ", normalized)
+        normalized = re.sub(r"\b(the|this|that|an|a)\b", " ", normalized)
         return re.sub(r"\s+", " ", normalized).strip()
+
+    def _is_usable_party_entity(self, value: str) -> bool:
+        normalized = self._normalize_party_text(value)
+        if not normalized:
+            return False
+        if self._is_placeholder_party(normalized):
+            return False
+        return len(normalized) >= 2
 
     def _rank_relevant_chunks(self, context: Sequence[dict[str, Any]], query: str) -> list[dict[str, Any]]:
         query_terms = _query_terms(query)
