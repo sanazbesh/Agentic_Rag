@@ -383,6 +383,40 @@ def _is_financial_entitlement_query(normalized_query: str) -> bool:
     return any(re.search(pattern, lowered) for pattern in patterns)
 
 
+def _is_policy_issue_spotting_query(normalized_query: str) -> bool:
+    lowered = _canonicalize_phrase(normalized_query)
+    if not lowered:
+        return False
+
+    financial_only_markers = ("reimbursement", "reimbursements", "expense", "expenses", "payroll", "pay stub", "salary")
+    has_financial_only_frame = any(marker in lowered for marker in financial_only_markers)
+
+    direct_patterns = (
+        r"\bwhat\s+polic(?:y|ies)\s+(?:are|is)\s+relevant\b",
+        r"\bwhat\s+legal\s+issues?\s+(?:are|is)\s+raised\b",
+        r"\bwhat\s+(?:are|is)\s+the\s+key\s+issues?\b",
+        r"\bwhat\s+are\s+the\s+key\s+issues?\s+in\s+the\s+file\b",
+        r"\bwhat\s+is\s+the\s+nature\s+of\s+the\s+claim\b",
+        r"\bnature\s+of\s+the\s+claim\b",
+        r"\bclauses?\s+or\s+polic(?:y|ies)\s+relat(?:e|ed)\s+to\s+(?:this|the)\s+dispute\b",
+        r"\bwhich\s+clauses?\s+relate\s+to\s+the\s+dispute\b",
+        r"\bwhich\s+polic(?:y|ies)\s+apply\s+to\s+the\s+dispute\b",
+    )
+    if any(re.search(pattern, lowered) for pattern in direct_patterns):
+        return True
+
+    policy_markers = ("policy", "policies", "handbook", "workplace policy", "hr policy")
+    issue_markers = ("issue", "issues", "legal issue", "dispute", "claim", "allegation", "violation")
+    framing_markers = ("relevant", "raised", "key", "nature", "related", "relate", "at issue")
+    if has_financial_only_frame and not any(marker in lowered for marker in ("policy", "dispute", "claim", "legal issue", "legal issues", "clause")):
+        return False
+    if any(marker in lowered for marker in policy_markers) and any(marker in lowered for marker in framing_markers):
+        return True
+    if any(marker in lowered for marker in issue_markers) and any(marker in lowered for marker in framing_markers):
+        return True
+    return False
+
+
 
 
 def _is_correspondence_litigation_milestone_query(normalized_query: str) -> bool:
@@ -445,6 +479,7 @@ def understand_query(
     is_employment_contract_lifecycle_query = _is_employment_contract_lifecycle_query(normalized)
     is_employment_mitigation_query = _is_employment_mitigation_query(normalized)
     is_financial_entitlement_query = _is_financial_entitlement_query(normalized)
+    is_policy_issue_spotting_query = _is_policy_issue_spotting_query(normalized)
     is_correspondence_litigation_milestone_query = _is_correspondence_litigation_milestone_query(normalized)
 
     meta_markers = ("how many documents", "what files are loaded", "what documents are uploaded", "what docs are loaded")
@@ -535,6 +570,7 @@ def understand_query(
         or is_employment_contract_lifecycle_query
         or is_employment_mitigation_query
         or is_financial_entitlement_query
+        or is_policy_issue_spotting_query
         or is_correspondence_litigation_milestone_query
         or any(marker in lowered for marker in extractive_markers)
     ):
@@ -552,7 +588,7 @@ def understand_query(
 
     # Deterministic "what is X?" rule insertion point:
     # apply only after hint extraction and before final answerability assignment.
-    if is_canonical_what_is and not is_matter_metadata_query:
+    if is_canonical_what_is and not is_matter_metadata_query and not is_policy_issue_spotting_query:
         available_documents = bool(active_documents or selected_documents)
         combined_hints = [*resolved_topic_hints, *resolved_clause_hints]
         canonical_subject = _canonicalize_phrase(what_is_subject or "")
@@ -671,6 +707,7 @@ def understand_query(
         or is_matter_metadata_query
         or is_employment_contract_lifecycle_query
         or is_employment_mitigation_query
+        or is_policy_issue_spotting_query
         or is_correspondence_litigation_milestone_query
     )
     should_extract_entities = is_party_role_entity_query or is_matter_metadata_query or any(
@@ -701,6 +738,8 @@ def understand_query(
         routing_notes.append("legal_question_family:employment_mitigation")
     if is_financial_entitlement_query:
         routing_notes.append("legal_question_family:financial_entitlement")
+    if is_policy_issue_spotting_query:
+        routing_notes.append("legal_question_family:policy_issue_spotting")
     if is_correspondence_litigation_milestone_query:
         routing_notes.append("legal_question_family:correspondence_litigation_milestone")
 
