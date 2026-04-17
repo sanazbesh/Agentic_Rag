@@ -1287,7 +1287,7 @@ class LegalAnswerSynthesizer:
     def _extract_intro_assignment(self, text: str) -> "_PartyRoleAssignment | None":
         lowered = text.lower()
         has_intro_anchor = bool(
-            re.search(r"\b(this\s+.+?\s+agreement\s+is\s+made(?:\s+effective)?|by\s+and\s+between|between)\b", lowered)
+            re.search(r"\b(this\s+.+?\s+agreement\s+is\s+made(?:\s+effective)?|by\s+and\s+between|between|parties\s+to\s+this\s+agreement\s+are)\b", lowered)
         )
         if not has_intro_anchor:
             return None
@@ -1298,17 +1298,19 @@ class LegalAnswerSynthesizer:
         employee = self._clean_party_name(employee_label.group(1)) if employee_label else None
 
         between_match = re.search(r"\bbetween\s+(.+?)\s+and\s+(.+?)(?:[.;\n]|$)", text, flags=re.IGNORECASE)
+        parties_are_match = re.search(r"\bparties\s+to\s+this\s+agreement\s+are\s+(.+?)\s+and\s+(.+?)(?:[.;\n]|$)", text, flags=re.IGNORECASE)
+        role_source = between_match or parties_are_match
         parties: list[str] = []
-        if between_match:
-            first = self._clean_party_name(between_match.group(1))
-            second = self._clean_party_name(between_match.group(2))
+        if role_source:
+            first = self._clean_party_name(role_source.group(1))
+            second = self._clean_party_name(role_source.group(2))
             if first:
                 parties.append(first)
             if second:
                 parties.append(second)
 
-            first_role = self._detect_inline_role(between_match.group(1))
-            second_role = self._detect_inline_role(between_match.group(2))
+            first_role = self._detect_inline_role(role_source.group(1))
+            second_role = self._detect_inline_role(role_source.group(2))
             if first_role == "employer":
                 employer = employer or first
             elif first_role == "employee":
