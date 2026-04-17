@@ -438,6 +438,31 @@ class AnswerabilityAssessor:
             )
 
         if expectation == "fact_extraction":
+            is_policy_issue_query = self._is_policy_issue_spotting_query(original_query, query_understanding)
+            if is_policy_issue_query:
+                policy_issue_support = self._evaluate_policy_issue_spotting_support(
+                    query=original_query,
+                    substantive=matched,
+                )
+                if policy_issue_support["supported"]:
+                    return build(
+                        status="sufficient",
+                        has_any_coverage=True,
+                        sufficient_coverage=True,
+                        partial_coverage=False,
+                        reason="fact_supported",
+                        supporting_signals=list(policy_issue_support["signals"]),
+                    )
+                return build(
+                    status="weak",
+                    has_any_coverage=bool(matched),
+                    sufficient_coverage=False,
+                    partial_coverage=False,
+                    reason="fact_not_found",
+                    missing_requirements=list(policy_issue_support["missing"]),
+                    warnings=["heading_only_context"] if heading_only else [],
+                )
+
             is_mitigation_query = self._is_employment_mitigation_query(original_query, query_understanding)
             if is_mitigation_query:
                 mitigation_support = self._evaluate_employment_mitigation_support(
@@ -1048,6 +1073,156 @@ class AnswerabilityAssessor:
             r"\bdefault\s+notice\b",
         )
         return any(re.search(pattern, lowered) for pattern in patterns)
+
+    def _is_policy_issue_spotting_query(
+        self,
+        query: str,
+        query_understanding: QueryUnderstandingResult,
+    ) -> bool:
+        if any(note == "legal_question_family:policy_issue_spotting" for note in (query_understanding.routing_notes or [])):
+            return True
+        lowered = self._canonical_phrase(query)
+        if any(token in lowered for token in ("reimbursement", "reimbursements", "expense", "expenses", "salary", "payroll", "pay stub")) and not any(
+            token in lowered for token in ("policy", "policies", "dispute", "claim", "legal issue", "legal issues", "clause", "clauses")
+        ):
+            return False
+        patterns = (
+            r"\bwhat\s+polic(?:y|ies)\s+(?:are|is)\s+relevant\b",
+            r"\bwhat\s+legal\s+issues?\s+(?:are|is)\s+raised\b",
+            r"\bwhat\s+(?:are|is)\s+the\s+key\s+issues?\b",
+            r"\bnature\s+of\s+the\s+claim\b",
+            r"\bwhat\s+is\s+the\s+nature\s+of\s+the\s+claim\b",
+            r"\bclauses?\s+or\s+polic(?:y|ies)\s+relat(?:e|ed)\s+to\s+(?:this|the)\s+dispute\b",
+        )
+        if any(re.search(pattern, lowered) for pattern in patterns):
+            return True
+        return (
+            any(token in lowered for token in ("policy", "policies", "handbook", "issue", "issues", "dispute", "claim"))
+            and any(token in lowered for token in ("relevant", "raised", "key", "nature", "related", "relate", "at issue"))
+        )
+
+    def _policy_issue_target(self, lowered_query: str) -> str:
+        if "nature of the claim" in lowered_query:
+            return "nature_of_claim"
+        if "key issues" in lowered_query:
+            return "key_issues"
+        if "legal issues" in lowered_query or ("issues" in lowered_query and "raised" in lowered_query):
+            return "legal_issues"
+        if "relevant policies" in lowered_query or ("policies" in lowered_query and "relevant" in lowered_query):
+            return "relevant_policies"
+        if "clause" in lowered_query and ("dispute" in lowered_query or "policy" in lowered_query):
+            return "dispute_clause_or_policy"
+        return "general_policy_issue"
+
+    def _evaluate_policy_issue_spotting_support(
+        self,
+        *,
+        query: str,
+        substantive: Sequence[Mapping[str, str]],
+    ) -> dict[str, object]:
+        lowered_query = self._canonical_phrase(query)
+        target = self._policy_issue_target(lowered_query)
+        if not substantive:
+            return {"supported": False, "signals": [], "missing": ["policy_or_issue_spotting_responsive_evidence"]}
+
+        rows: list[str] = []
+        for item in substantive:
+            text = self._canonical_phrase(f"{item.get('heading', '')} {item.get('text', '')}")
+            if text:
+                rows.append(text)
+
+        policy_markers = ("policy", "policies", "handbook", "workplace policy", "code of conduct", "procedure", "protocol")
+        clause_markers = ("clause", "clauses", "section", "article", "provision", "term")
+        legal_reference_markers = ("statute", "act", "regulation", "esa", "employment standards act", "human rights code")
+        issue_markers = (
+            "issue",
+            "issues",
+            "dispute",
+            "allegation",
+            "alleged",
+            "violation",
+            "breach",
+            "non compliance",
+            "wrongful dismissal",
+            "constructive dismissal",
+            "retaliation",
+            "discrimination",
+        )
+        claim_markers = ("claim", "cause of action", "damages", "relief", "seeks", "asserts")
+        rights_obligation_markers = ("right", "rights", "obligation", "obligations", "duty", "duties", "entitlement")
+
+        def has_pair(
+            primary_markers: Sequence[str],
+            responsive_markers: Sequence[str],
+            alternate_responsive: Sequence[str] = (),
+        ) -> bool:
+            for text in rows:
+                if not any(marker in text for marker in primary_markers):
+                    continue
+                if any(marker in text for marker in responsive_markers):
+                    return True
+                if alternate_responsive and any(marker in text for marker in alternate_responsive):
+                    return True
+            return False
+
+        if target == "relevant_policies":
+            supported = has_pair(policy_markers, issue_markers, claim_markers) or has_pair(
+                legal_reference_markers,
+                issue_markers,
+                rights_obligation_markers,
+            )
+            if supported:
+                return {"supported": True, "signals": ["policy_issue_relevant_policy_evidence_detected"], "missing": []}
+            return {"supported": False, "signals": [], "missing": ["policy_handbook_or_statutory_issue_responsive_evidence"]}
+
+        if target == "legal_issues":
+            supported = has_pair(issue_markers, claim_markers, rights_obligation_markers) or has_pair(
+                legal_reference_markers,
+                issue_markers,
+                claim_markers,
+            )
+            if supported:
+                return {"supported": True, "signals": ["policy_issue_legal_issue_framing_evidence_detected"], "missing": []}
+            return {"supported": False, "signals": [], "missing": ["issue_framing_or_statutory_violation_evidence"]}
+
+        if target == "dispute_clause_or_policy":
+            supported = has_pair(clause_markers, issue_markers, claim_markers) or has_pair(
+                policy_markers,
+                issue_markers,
+                claim_markers,
+            )
+            if supported:
+                return {"supported": True, "signals": ["policy_issue_dispute_clause_or_policy_evidence_detected"], "missing": []}
+            return {"supported": False, "signals": [], "missing": ["clause_or_policy_language_linked_to_dispute_evidence"]}
+
+        if target == "nature_of_claim":
+            supported = has_pair(claim_markers, issue_markers, legal_reference_markers) or has_pair(
+                ("wrongful dismissal", "constructive dismissal", "harassment", "retaliation", "discrimination"),
+                claim_markers,
+                issue_markers,
+            )
+            if supported:
+                return {"supported": True, "signals": ["policy_issue_nature_of_claim_evidence_detected"], "missing": []}
+            return {"supported": False, "signals": [], "missing": ["claim_framing_or_alleged_violation_evidence"]}
+
+        if target == "key_issues":
+            supported = has_pair(issue_markers, claim_markers, rights_obligation_markers) or has_pair(
+                issue_markers,
+                legal_reference_markers,
+                ("procedural status", "status"),
+            )
+            if supported:
+                return {"supported": True, "signals": ["policy_issue_key_issues_evidence_detected"], "missing": []}
+            return {"supported": False, "signals": [], "missing": ["key_issue_summary_or_dispute_theme_evidence"]}
+
+        supported = (
+            has_pair(policy_markers, issue_markers, claim_markers)
+            or has_pair(clause_markers, issue_markers, claim_markers)
+            or has_pair(legal_reference_markers, issue_markers, claim_markers)
+        )
+        if supported:
+            return {"supported": True, "signals": ["policy_issue_general_responsive_evidence_detected"], "missing": []}
+        return {"supported": False, "signals": [], "missing": ["policy_or_issue_spotting_responsive_evidence"]}
 
     def _procedural_target(self, lowered_query: str) -> str:
         if any(token in lowered_query for token in ("what letters", "what emails", "communications were sent", "correspondence")):
@@ -2144,6 +2319,12 @@ def _combine_coverage_and_strength(
 
     if any(
         note == "legal_question_family:financial_entitlement"
+        for note in (query_understanding.routing_notes or [])
+    ):
+        return "sufficient", True, not expectation_blocks_answer, False, None
+
+    if any(
+        note == "legal_question_family:policy_issue_spotting"
         for note in (query_understanding.routing_notes or [])
     ):
         return "sufficient", True, not expectation_blocks_answer, False, None
