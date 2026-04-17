@@ -188,6 +188,14 @@ def test_party_question_recognized_as_legal_party_role_query() -> None:
     assert result.should_rewrite is True
 
 
+def test_agreement_with_verification_is_recognized_as_party_role_entity_query() -> None:
+    result = understand_query("is this agreement with Acme Corp?")
+
+    assert result.question_type == "extractive_fact_query"
+    assert result.answerability_expectation == "fact_extraction"
+    assert "legal_question_family:party_role_entity" in result.routing_notes
+
+
 def test_non_party_clause_lookup_behavior_remains_unchanged() -> None:
     result = understand_query("what does the document say about confidentiality?")
 

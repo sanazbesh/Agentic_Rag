@@ -397,6 +397,8 @@ class QueryTransformationService:
         re.compile(r"\bwho\s+are\s+the\s+parties\b", flags=re.IGNORECASE),
         re.compile(r"\bwhich\s+company\s+is\s+this\s+agreement\s+for\b", flags=re.IGNORECASE),
         re.compile(r"\bis\s+this\s+agreement\s+between\b", flags=re.IGNORECASE),
+        re.compile(r"\bis\s+(?:this|the)\s+agreement\s+with\b", flags=re.IGNORECASE),
+        re.compile(r"\bis\s+(?:this|the)\s+agreement\s+for\b", flags=re.IGNORECASE),
     )
     _MATTER_METADATA_QUERY_PATTERNS: tuple[re.Pattern[str], ...] = (
         re.compile(r"\bwhat\s+is\s+the\s+file\s+number\b", flags=re.IGNORECASE),

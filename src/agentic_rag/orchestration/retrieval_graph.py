@@ -873,6 +873,27 @@ class RetrievalGraphNodes:
         unresolved_references: list[str] = []
         resolution_notes = list(decision.routing_notes)
         resolved_query = query
+        lowered_query = query.lower()
+        selected_doc_ids: list[str] = []
+        for item in updated.get("selected_documents", []):
+            if isinstance(item, Mapping):
+                for key in ("id", "document_id"):
+                    value = item.get(key)
+                    if isinstance(value, str) and value and value not in selected_doc_ids:
+                        selected_doc_ids.append(value)
+            elif hasattr(item, "id"):
+                value = getattr(item, "id")
+                if isinstance(value, str) and value and value not in selected_doc_ids:
+                    selected_doc_ids.append(value)
+            elif hasattr(item, "document_id"):
+                value = getattr(item, "document_id")
+                if isinstance(value, str) and value and value not in selected_doc_ids:
+                    selected_doc_ids.append(value)
+
+        is_party_verification_followup = bool(
+            re.search(r"\bis\s+(?:this|the)\s+agreement\s+between\b", lowered_query)
+            or re.search(r"\bis\s+(?:this|the)\s+agreement\s+(?:with|for)\b", lowered_query)
+        )
 
         if decision.is_context_dependent:
             if decision.refers_to_prior_document_scope and len(candidate_doc_ids) > 1:
@@ -883,8 +904,13 @@ class RetrievalGraphNodes:
                     used_context = True
                     resolution_notes.append("resolved_document_scope_from_prior_turn")
             elif decision.refers_to_prior_document_scope and not candidate_doc_ids:
-                unresolved_references.append("document_reference:missing_prior_scope")
-                resolution_notes.append("unable_to_resolve_document_scope")
+                if is_party_verification_followup and len(selected_doc_ids) == 1:
+                    used_context = True
+                    candidate_doc_ids = list(selected_doc_ids)
+                    resolution_notes.append("resolved_document_scope_from_selected_document_for_party_verification")
+                else:
+                    unresolved_references.append("document_reference:missing_prior_scope")
+                    resolution_notes.append("unable_to_resolve_document_scope")
 
             if decision.refers_to_prior_clause_or_topic and topic_hints and decision.use_conversation_context:
                 used_context = True

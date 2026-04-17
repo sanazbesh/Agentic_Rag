@@ -985,7 +985,10 @@ def test_successful_employer_role_resolution_counts_as_fact_support() -> None:
     context = [
         _parent(
             "p1",
-            "This Employment Agreement is made by and between Acme Corp and Jane Smith.",
+            (
+                "This Employment Agreement is made by and between Acme Corp and Jane Smith. "
+                "The introductory recital identifies the two contracting parties for all obligations in this agreement."
+            ),
             heading="Introduction",
         )
     ]
@@ -1003,7 +1006,10 @@ def test_successful_employee_role_resolution_counts_as_fact_support() -> None:
     context = [
         _parent(
             "p1",
-            "This Employment Agreement is made by and between Acme Corp and Jane Smith.",
+            (
+                "This Employment Agreement is made by and between Acme Corp and Jane Smith. "
+                "The introductory recital identifies the two contracting parties for all obligations in this agreement."
+            ),
             heading="Introduction",
         )
     ]
@@ -1048,6 +1054,63 @@ def test_agreement_between_x_and_y_uses_extracted_party_set_when_supported_in_an
 
     assert result.sufficient_context is True
     assert "agreement_between_pair_confirmed_from_extracted_parties" in result.evidence_notes
+
+
+def test_agreement_between_query_uses_extracted_party_set_as_fact_support() -> None:
+    query = "is this agreement with acme corp?"
+    understanding = understand_query(query)
+    context = [
+        _parent(
+            "p1",
+            "This Employment Agreement is made by and between Acme Corp and Jane Smith.",
+            heading="Introduction",
+        )
+    ]
+
+    result = assess_answerability(query, understanding, context)
+
+    assert result.sufficient_context is True
+    assert result.should_answer is True
+    assert "agreement_between_pair_confirmed_from_extracted_parties" in result.evidence_notes
+
+
+def test_agreement_between_query_fails_safely_when_party_set_is_mismatched() -> None:
+    query = "is this agreement between acme corp and john roe?"
+    understanding = understand_query(query)
+    context = [
+        _parent(
+            "p1",
+            "This Employment Agreement is made by and between Acme Corp and Jane Smith.",
+            heading="Introduction",
+        )
+    ]
+
+    result = assess_answerability(query, understanding, context)
+
+    assert result.sufficient_context is False
+    assert result.should_answer is False
+    assert result.insufficiency_reason == "fact_not_found"
+
+
+def test_agreement_between_query_fails_safely_when_party_set_is_ambiguous_or_incomplete() -> None:
+    query = "is this agreement between acme corp and jane smith?"
+    understanding = understand_query(query)
+    context = [
+        _parent(
+            "p1",
+            (
+                "This Employment Agreement is made between the Company and the Employee. "
+                "The introductory paragraph uses role labels but does not resolve named parties."
+            ),
+            heading="Introduction",
+        )
+    ]
+
+    result = assess_answerability(query, understanding, context)
+
+    assert result.sufficient_context is False
+    assert result.should_answer is False
+    assert result.insufficiency_reason == "fact_not_found"
 
 
 def test_ambiguous_or_missing_role_resolution_still_fails_safely_in_answerability() -> None:

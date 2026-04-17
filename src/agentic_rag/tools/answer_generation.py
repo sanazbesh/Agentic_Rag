@@ -257,12 +257,12 @@ class LegalAnswerSynthesizer:
                 source_line=source_line,
             )
 
-        between_match = re.search(r"\bis\s+this\s+agreement\s+between\s+(.+?)\s+and\s+(.+?)\??$", lowered_query)
-        if between_match:
-            requested_a = self._normalize_party_text(between_match.group(1))
-            requested_b = self._normalize_party_text(between_match.group(2))
+        verification_targets = self._extract_party_verification_targets(lowered_query)
+        if verification_targets is not None:
+            if len(role_assignment.parties) < 2:
+                return self._insufficient_party_role_with_citation(citation, source_line)
             extracted = {self._normalize_party_text(party) for party in role_assignment.parties}
-            both_match = requested_a in extracted and requested_b in extracted
+            both_match = all(target in extracted for target in verification_targets)
             direct = (
                 "Yes, the agreement-introduction evidence identifies those two parties."
                 if both_match
@@ -357,8 +357,23 @@ class LegalAnswerSynthesizer:
             r"\bwho\s+are\s+the\s+parties\b",
             r"\bwhich\s+company\s+is\s+this\s+agreement\s+for\b",
             r"\bis\s+this\s+agreement\s+between\b",
+            r"\bis\s+(?:this|the)\s+agreement\s+with\b",
+            r"\bis\s+(?:this|the)\s+agreement\s+for\b",
         )
         return any(re.search(pattern, lowered_query) for pattern in patterns)
+
+    def _extract_party_verification_targets(self, lowered_query: str) -> tuple[str, ...] | None:
+        between_match = re.search(r"\bis\s+(?:this|the)\s+agreement\s+between\s+(.+?)\s+and\s+(.+?)\??$", lowered_query)
+        if between_match:
+            return (
+                self._normalize_party_text(between_match.group(1)),
+                self._normalize_party_text(between_match.group(2)),
+            )
+
+        single_party_match = re.search(r"\bis\s+(?:this|the)\s+agreement\s+(?:with|for)\s+(.+?)\??$", lowered_query)
+        if single_party_match:
+            return (self._normalize_party_text(single_party_match.group(1)),)
+        return None
 
     def _metadata_target(self, lowered_query: str) -> str | None:
         patterns: tuple[tuple[str, tuple[str, ...]], ...] = (

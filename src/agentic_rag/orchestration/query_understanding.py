@@ -189,6 +189,10 @@ def _is_party_role_entity_query(normalized_query: str) -> bool:
 
     if lowered.startswith("is this agreement between") or lowered.startswith("is the agreement between"):
         return True
+    if lowered.startswith("is this agreement with") or lowered.startswith("is the agreement with"):
+        return True
+    if lowered.startswith("is this agreement for") or lowered.startswith("is the agreement for"):
+        return True
     if "which company is this agreement for" in lowered:
         return True
     return False
