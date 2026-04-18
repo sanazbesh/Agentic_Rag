@@ -1,0 +1,366 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "legal_eval_case.schema.json",
+  "title": "LegalRAGEvalCase",
+  "description": "Schema for one legal RAG evaluation case. Designed for solo-maintained, production-grade offline evals, manual review, and regression tracking.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "family",
+    "query",
+    "selected_document_ids",
+    "expected_answer_type",
+    "expected_outcome",
+    "answerability_expected",
+    "gold_evidence_ids",
+    "evidence_requirement",
+    "safe_failure_expected",
+    "difficulty",
+    "notes"
+  ],
+  "properties": {
+    "version": {
+      "type": "string",
+      "description": "Schema/data version for forward compatibility.",
+      "default": "1.0"
+    },
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[a-z0-9][a-z0-9._-]*$",
+      "description": "Stable unique case ID (slug-like)."
+    },
+    "family": {
+      "type": "string",
+      "description": "Primary legal family used for grouped quality measurement.",
+      "enum": [
+        "party_role_verification",
+        "chronology_date_event",
+        "employment_lifecycle",
+        "matter_document_metadata",
+        "correspondence_litigation_milestones",
+        "employment_mitigation",
+        "financial_entitlement",
+        "policy_issue_spotting"
+      ]
+    },
+    "query": {
+      "type": "string",
+      "minLength": 1,
+      "description": "User-facing query text to evaluate."
+    },
+    "selected_document_ids": {
+      "type": "array",
+      "description": "Document IDs selected/provided to the system for this case. Can be empty when no explicit document scope is selected.",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "selected_document_required": {
+      "type": "boolean",
+      "description": "Whether correct behavior requires respecting selected document scope.",
+      "default": false
+    },
+    "expected_answer_type": {
+      "type": "string",
+      "description": "Expected answer form, separate from correctness outcome.",
+      "enum": [
+        "fact_extraction",
+        "verification",
+        "clause_lookup",
+        "timeline_event_sequence",
+        "list_extraction",
+        "safe_failure_response"
+      ]
+    },
+    "expected_outcome": {
+      "type": "string",
+      "description": "Expected result category for grading/regression analysis.",
+      "enum": [
+        "answered",
+        "answered_with_qualification",
+        "safe_failure_insufficient_evidence",
+        "safe_failure_ambiguous",
+        "safe_failure_out_of_scope"
+      ]
+    },
+    "answerability_expected": {
+      "type": "string",
+      "description": "Whether the question is answerable from provided context and scope.",
+      "enum": [
+        "answerable",
+        "unanswerable"
+      ]
+    },
+    "evidence_requirement": {
+      "type": "string",
+      "description": "Evidence requirement used during grading.",
+      "enum": [
+        "required",
+        "optional",
+        "none"
+      ]
+    },
+    "gold_evidence_ids": {
+      "type": "array",
+      "description": "Evidence unit IDs supporting the expected result. Empty for unanswerable cases where no supporting evidence should exist.",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "gold_parent_chunk_ids": {
+      "type": "array",
+      "description": "Optional parent-chunk IDs for parent-child retrieval setups.",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "gold_citation_refs": {
+      "type": "array",
+      "description": "Optional reviewer-friendly citation pointers to where gold evidence lives.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "document_id",
+          "locator"
+        ],
+        "properties": {
+          "document_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "locator": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Citation locator, e.g., section title, page/paragraph, or clause label."
+          },
+          "excerpt": {
+            "type": "string",
+            "description": "Optional short excerpt for manual review."
+          }
+        }
+      }
+    },
+    "safe_failure_expected": {
+      "type": "boolean",
+      "description": "True when refusing/deferring due to missing/insufficient evidence is the correct behavior."
+    },
+    "follow_up": {
+      "type": "object",
+      "description": "Follow-up metadata for multi-turn evaluation cases.",
+      "additionalProperties": false,
+      "required": [
+        "depends_on_prior_turn",
+        "prior_messages",
+        "resolved_document_scope_ids"
+      ],
+      "properties": {
+        "depends_on_prior_turn": {
+          "type": "boolean",
+          "description": "Whether this query relies on prior conversation context."
+        },
+        "prior_messages": {
+          "type": "array",
+          "description": "Minimal prior-turn context needed to replay the case.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "role",
+              "content"
+            ],
+            "properties": {
+              "role": {
+                "type": "string",
+                "enum": [
+                  "user",
+                  "assistant"
+                ]
+              },
+              "content": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        },
+        "resolved_document_scope_ids": {
+          "type": "array",
+          "description": "Document scope resolved from prior turns; useful when follow-up depends on earlier document selection.",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        }
+      },
+      "default": {
+        "depends_on_prior_turn": false,
+        "prior_messages": [],
+        "resolved_document_scope_ids": []
+      }
+    },
+    "difficulty": {
+      "type": "string",
+      "description": "Approximate case difficulty for analysis slices.",
+      "enum": [
+        "easy",
+        "medium",
+        "hard"
+      ]
+    },
+    "tags": {
+      "type": "array",
+      "description": "Optional short tags for filtering (e.g., clause-level, date-ambiguity).",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "regression_source": {
+      "type": "string",
+      "description": "Optional pointer to bug/regression ticket or commit that motivated this case."
+    },
+    "notes": {
+      "type": "string",
+      "description": "Human-readable review notes explaining intent, expected behavior, or caveats.",
+      "minLength": 1
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "answerability_expected": {
+            "const": "answerable"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "safe_failure_expected": {
+            "const": false
+          },
+          "evidence_requirement": {
+            "enum": [
+              "required",
+              "optional"
+            ]
+          },
+          "expected_outcome": {
+            "enum": [
+              "answered",
+              "answered_with_qualification"
+            ]
+          }
+        },
+        "required": [
+          "gold_evidence_ids"
+        ],
+        "allOf": [
+          {
+            "properties": {
+              "evidence_requirement": {
+                "const": "required"
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "evidence_requirement": {
+                  "const": "required"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "gold_evidence_ids": {
+                  "minItems": 1
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "answerability_expected": {
+            "const": "unanswerable"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "safe_failure_expected": {
+            "const": true
+          },
+          "evidence_requirement": {
+            "const": "none"
+          },
+          "expected_outcome": {
+            "enum": [
+              "safe_failure_insufficient_evidence",
+              "safe_failure_ambiguous",
+              "safe_failure_out_of_scope"
+            ]
+          },
+          "gold_evidence_ids": {
+            "maxItems": 0
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "selected_document_required": {
+            "const": true
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "selected_document_ids": {
+            "minItems": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "follow_up": {
+            "properties": {
+              "depends_on_prior_turn": {
+                "const": true
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "follow_up": {
+            "properties": {
+              "prior_messages": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}
