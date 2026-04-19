@@ -147,6 +147,28 @@ def test_safe_failure_can_classify_overconfident_wrong_answer() -> None:
     assert result.passed is False
 
 
+def test_safe_failure_can_classify_false_insufficient() -> None:
+    case = _base_case()
+    case["answerability_expected"] = "answerable"
+    case["expected_outcome"] = "answered"
+    case["safe_failure_expected"] = False
+
+    result = evaluate_safe_failure_with_llm(
+        eval_case=case,
+        system_output=_insufficient_result(),
+        debug_payload={"answerability_result": {"sufficient_context": True, "should_answer": True}},
+        judge_callable=lambda _: {
+            "label": "false_insufficient",
+            "confidence_band": "medium",
+            "short_reason": "Case was answerable from provided evidence, but system declined.",
+            "supporting_notes": ["Gold evidence eu-1 was available."],
+        },
+    )
+
+    assert result.label == "false_insufficient"
+    assert result.passed is False
+
+
 def test_machine_readable_output_shape_is_stable() -> None:
     result = evaluate_groundedness_with_llm(
         eval_case=_base_case(),
@@ -172,6 +194,19 @@ def test_malformed_judge_output_is_handled_safely() -> None:
         system_output=_insufficient_result(),
         debug_payload={},
         judge_callable=lambda _: "not-json",
+    )
+
+    assert result.label == "malformed_judge_output"
+    assert result.passed is False
+    assert result.metadata["malformed_output_fallback"] is True
+
+
+def test_groundedness_malformed_judge_output_is_handled_safely() -> None:
+    result = evaluate_groundedness_with_llm(
+        eval_case=_base_case(),
+        system_output=_grounded_result(),
+        debug_payload={},
+        judge_callable=lambda _: {"label": "grounded_answer"},
     )
 
     assert result.label == "malformed_judge_output"
