@@ -40,6 +40,7 @@ Hard constraints:
 - Use only provided evaluation case data, model answer payload, citations, and debug metadata.
 - Do NOT use external legal knowledge.
 - Do NOT reward fluent style when safe-failure behavior is wrong.
+- Do NOT infer missing support from style, confidence, or tone.
 - Separate "insufficient but acceptable" from "unsupported but confident".
 
 Label definitions:
