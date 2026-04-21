@@ -38,9 +38,14 @@ def discover_run_files(run_dir: str | Path) -> list[Path]:
 def load_eval_runs(run_files: Sequence[str | Path]) -> list[EvalRun]:
     rows: list[EvalRun] = []
     for order, run_file in enumerate(sorted(Path(item) for item in run_files), start=1):
-        blob = json.loads(run_file.read_text(encoding="utf-8"))
+        try:
+            blob = json.loads(run_file.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+
         if not isinstance(blob, Mapping):
             continue
+
         cases = [dict(case) for case in (blob.get("cases") or []) if isinstance(case, Mapping)]
         generated_at = _parse_timestamp(blob.get("generated_at_utc"))
         run_id = str(blob.get("generated_at_utc") or blob.get("run_id") or run_file.stem)

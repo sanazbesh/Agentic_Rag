@@ -255,3 +255,48 @@ def test_missing_optional_fields_are_handled_gracefully(tmp_path: Path) -> None:
     assert trends[0].false_confident_rate is None
     assert trends[0].citation_correctness_rate is None
     assert trends[0].safe_failure_rate is None
+
+
+def test_loader_skips_malformed_json_and_keeps_valid_siblings(tmp_path: Path) -> None:
+    good = tmp_path / "good.json"
+    bad = tmp_path / "bad.json"
+    good.write_text(json.dumps(_run_blob(generated_at="2026-04-20T00:00:00+00:00", cases=[])), encoding="utf-8")
+    bad.write_text('{"broken": ', encoding="utf-8")
+
+    runs = load_eval_runs(discover_run_files(tmp_path))
+
+    assert len(runs) == 1
+    assert runs[0].run_id == "2026-04-20T00:00:00+00:00"
+
+
+def test_loader_skips_undecodable_json_file_without_crashing(tmp_path: Path) -> None:
+    good = tmp_path / "good.json"
+    undecodable = tmp_path / "bad_encoding.json"
+    good.write_text(json.dumps(_run_blob(generated_at="2026-04-20T00:00:00+00:00", cases=[])), encoding="utf-8")
+    undecodable.write_bytes(b"\xff\xfe\x00\x00")
+
+    runs = load_eval_runs(discover_run_files(tmp_path))
+
+    assert len(runs) == 1
+    assert runs[0].source_path == good
+
+
+def test_loader_returns_empty_for_only_invalid_json_files(tmp_path: Path) -> None:
+    (tmp_path / "broken1.json").write_text("{", encoding="utf-8")
+    (tmp_path / "broken2.json").write_bytes(b"\xff")
+
+    runs = load_eval_runs(discover_run_files(tmp_path))
+
+    assert runs == []
+
+
+def test_loader_skips_non_run_json_artifact_that_fails_shape_validation(tmp_path: Path) -> None:
+    valid = tmp_path / "valid_run.json"
+    invalid_shape = tmp_path / "artifact.json"
+    valid.write_text(json.dumps(_run_blob(generated_at="2026-04-20T00:00:00+00:00", cases=[])), encoding="utf-8")
+    invalid_shape.write_text(json.dumps(["not", "a", "run", "object"]), encoding="utf-8")
+
+    runs = load_eval_runs(discover_run_files(tmp_path))
+
+    assert len(runs) == 1
+    assert runs[0].source_path == valid
