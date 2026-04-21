@@ -2,12 +2,27 @@ from __future__ import annotations
 
 import argparse
 import json
+import importlib.util
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from app import build_real_debug_payload
+
+
+def _ensure_src_path_for_local_runs() -> None:
+    if importlib.util.find_spec("agentic_rag") is not None:
+        return
+
+    src_path = Path(__file__).resolve().parents[2] / "src"
+    if src_path.is_dir():
+        sys.path.insert(0, str(src_path))
+
+
+_ensure_src_path_for_local_runs()
+
+from ui.debug_payload import build_real_debug_payload
 from agentic_rag.versioning import get_version_attribution, normalize_model_version
 from evals.graders.answerability_checks import evaluate_answerability_checks
 from evals.graders.citation_checks import evaluate_citation_checks
