@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass
+import math
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -134,7 +135,7 @@ def build_trace_drilldown(case: Mapping[str, Any]) -> dict[str, Any]:
             retrieval_span.get("outputs_summary", {}).get("selected_document_scope"),
             case.get("selected_document_ids"),
         ),
-        "retrieved_child_count": _pick(retrieval_span.get("outputs_summary", {}).get("retrieved_child_count"), 0),
+        "retrieved_child_count": _pick(retrieval_span.get("outputs_summary", {}).get("retrieved_child_count")),
         "top_child_chunk_ids": _pick_list(retrieval_span.get("outputs_summary", {}).get("top_child_chunk_ids")),
         "retrieval_mode": retrieval_span.get("outputs_summary", {}).get("retrieval_mode"),
         "warnings": _warning_messages(retrieval_span),
@@ -142,7 +143,7 @@ def build_trace_drilldown(case: Mapping[str, Any]) -> dict[str, Any]:
 
     rerank = {
         "input_candidate_count": _pick(rerank_span.get("outputs_summary", {}).get("input_candidate_count"), 0),
-        "output_candidate_count": _pick(rerank_span.get("outputs_summary", {}).get("output_candidate_count"), 0),
+        "output_candidate_count": _pick(rerank_span.get("outputs_summary", {}).get("output_candidate_count")),
         "top_reranked_child_ids": _pick_list(rerank_span.get("outputs_summary", {}).get("top_reranked_child_ids")),
         "ranking_source": rerank_span.get("outputs_summary", {}).get("ranking_source"),
         "warnings": _warning_messages(rerank_span),
@@ -263,14 +264,32 @@ def _build_stage_statuses(
 
     statuses.append(_status_from_span("decomposition", decomposition_span))
 
-    if int(retrieval.get("retrieved_child_count") or 0) <= 0:
+    retrieved_child_count = _safe_count_value(retrieval.get("retrieved_child_count"))
+    if retrieved_child_count is None:
+        statuses.append(
+            StageStatus(
+                stage="retrieval",
+                status="warning",
+                reason="retrieved_child_count not available",
+            )
+        )
+    elif retrieved_child_count <= 0:
         statuses.append(StageStatus(stage="retrieval", status="suspicious", reason="no retrieved evidence"))
     elif retrieval.get("warnings"):
         statuses.append(StageStatus(stage="retrieval", status="warning", reason="retrieval warnings"))
     else:
         statuses.append(StageStatus(stage="retrieval", status="ok"))
 
-    if int(rerank.get("output_candidate_count") or 0) <= 0:
+    output_candidate_count = _safe_count_value(rerank.get("output_candidate_count"))
+    if output_candidate_count is None:
+        statuses.append(
+            StageStatus(
+                stage="rerank",
+                status="warning",
+                reason="output_candidate_count not available",
+            )
+        )
+    elif output_candidate_count <= 0:
         statuses.append(StageStatus(stage="rerank", status="suspicious", reason="no reranked evidence"))
     elif rerank.get("warnings"):
         statuses.append(StageStatus(stage="rerank", status="warning", reason="rerank warnings"))
@@ -364,3 +383,24 @@ def _warning_messages(span: Mapping[str, Any], code_filter: str | None = None) -
         if message:
             messages.append(message)
     return messages
+
+
+def _safe_count_value(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer() or value < 0:
+            return None
+        return int(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped or stripped.lower() in {"n/a", "na", "none", "null"}:
+            return None
+        try:
+            parsed = int(stripped)
+        except ValueError:
+            return None
+        return parsed if parsed >= 0 else None
+    return None

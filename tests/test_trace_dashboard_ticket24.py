@@ -196,6 +196,59 @@ def test_failure_layer_summary_identifies_first_suspicious_stage() -> None:
     assert drilldown["failure_layer"]["stage"] == "retrieval"
 
 
+def test_non_numeric_retrieved_child_count_does_not_crash_and_degrades_to_warning() -> None:
+    case = _case()
+    case["debug_payload"]["trace"]["spans"][2]["outputs_summary"]["retrieved_child_count"] = "n/a"
+    drilldown = build_trace_drilldown(case)
+    retrieval_status = next(row for row in drilldown["stage_statuses"] if row["stage"] == "retrieval")
+    assert retrieval_status["status"] == "warning"
+    assert "not available" in str(retrieval_status.get("reason") or "")
+
+
+def test_non_numeric_output_candidate_count_does_not_crash_and_degrades_to_warning() -> None:
+    case = _case()
+    case["debug_payload"]["trace"]["spans"][3]["outputs_summary"]["output_candidate_count"] = "n/a"
+    drilldown = build_trace_drilldown(case)
+    rerank_status = next(row for row in drilldown["stage_statuses"] if row["stage"] == "rerank")
+    assert rerank_status["status"] == "warning"
+    assert "not available" in str(rerank_status.get("reason") or "")
+
+
+def test_valid_numeric_string_counts_preserve_existing_stage_behavior() -> None:
+    case = _case()
+    case["debug_payload"]["trace"]["spans"][2]["outputs_summary"]["retrieved_child_count"] = "12"
+    case["debug_payload"]["trace"]["spans"][3]["outputs_summary"]["output_candidate_count"] = "5"
+    drilldown = build_trace_drilldown(case)
+    retrieval_status = next(row for row in drilldown["stage_statuses"] if row["stage"] == "retrieval")
+    rerank_status = next(row for row in drilldown["stage_statuses"] if row["stage"] == "rerank")
+    assert retrieval_status["status"] == "ok"
+    assert rerank_status["status"] == "ok"
+
+
+def test_missing_stage_counts_render_without_crashing() -> None:
+    case = _case()
+    del case["debug_payload"]["trace"]["spans"][2]["outputs_summary"]["retrieved_child_count"]
+    del case["debug_payload"]["trace"]["spans"][3]["outputs_summary"]["output_candidate_count"]
+    drilldown = build_trace_drilldown(case)
+    statuses = {row["stage"]: row for row in drilldown["stage_statuses"]}
+    assert statuses["retrieval"]["status"] == "warning"
+    assert statuses["rerank"]["status"] == "warning"
+
+
+def test_one_malformed_record_does_not_break_multi_case_iteration() -> None:
+    good = _case()
+    bad = _case()
+    bad["case_id"] = "case-bad"
+    bad["debug_payload"]["trace"]["spans"][2]["outputs_summary"]["retrieved_child_count"] = "not-a-number"
+    bad["debug_payload"]["trace"]["spans"][3]["outputs_summary"]["output_candidate_count"] = ""
+
+    drilldowns = [build_trace_drilldown(case) for case in [good, bad]]
+    assert [item["case_id"] for item in drilldowns] == ["case-1", "case-bad"]
+    bad_statuses = {row["stage"]: row for row in drilldowns[1]["stage_statuses"]}
+    assert bad_statuses["retrieval"]["status"] == "warning"
+    assert bad_statuses["rerank"]["status"] == "warning"
+
+
 def test_partial_or_malformed_trace_does_not_crash() -> None:
     malformed = {
         "case_id": "broken",
