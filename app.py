@@ -50,6 +50,7 @@ from ui.components import (
 from ui.local_backend import build_local_backend_dependencies
 from ui.session_memory import append_conversation_turn, build_backend_context
 from ui.quality_dashboard import render_quality_dashboard
+from ui.trace_dashboard import render_trace_dashboard
 from ui.debug_payload import build_real_debug_payload
 
 
@@ -162,9 +163,12 @@ def build_real_backend_runners() -> tuple[Callable[..., Any] | None, Callable[..
 
 
 def main() -> None:
-    page = st.sidebar.radio("Dashboard", options=["Inspection", "Quality"], index=0)
+    page = st.sidebar.radio("Dashboard", options=["Inspection", "Quality", "Trace Debug"], index=0)
     if page == "Quality":
         render_quality_dashboard()
+        return
+    if page == "Trace Debug":
+        render_trace_dashboard()
         return
 
     st.title("Legal RAG Inspection Dashboard")
