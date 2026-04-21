@@ -182,7 +182,7 @@ def emit_request_metrics(*, final_answer: Any, state: Mapping[str, Any]) -> Requ
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         total_tokens=total_tokens,
-        model_version=(trace.get("pipeline_version") if isinstance(trace, Mapping) else None),
+        model_version=(trace.get("model_version") if isinstance(trace, Mapping) else None),
         pipeline_mode="local",
         selected_document_count=len(list(state.get("selected_documents", []) or [])),
         decomposition_used=bool(state.get("needs_decomposition", False)),

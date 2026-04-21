@@ -188,6 +188,14 @@ def test_one_request_produces_one_linked_trace_and_stage_spans() -> None:
     assert isinstance(trace["trace_id"], str) and trace["trace_id"]
     assert trace["request_id"]
     assert trace["active_family"] == "party_role_verification"
+    for key in (
+        "retrieval_version",
+        "answerability_version",
+        "generation_version",
+        "prompt_bundle_version",
+        "model_version",
+    ):
+        assert isinstance(trace[key], str) and trace[key]
     stages = [span["stage"] for span in trace["spans"]]
     for required in (
         "query_understanding",

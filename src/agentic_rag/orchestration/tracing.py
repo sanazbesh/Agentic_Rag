@@ -8,6 +8,8 @@ from time import perf_counter
 from typing import Any, Literal
 from uuid import uuid4
 
+from agentic_rag.versioning import get_version_attribution
+
 SpanStatus = Literal["success", "partial", "failed", "skipped"]
 TraceStatus = Literal["success", "partial", "failed"]
 
@@ -47,7 +49,8 @@ def _get_span(trace: dict[str, Any], stage: str) -> dict[str, Any] | None:
     return None
 
 
-def create_trace(*, query: str, selected_document_ids: Sequence[str]) -> dict[str, Any]:
+def create_trace(*, query: str, selected_document_ids: Sequence[str], model_version: str | None = None) -> dict[str, Any]:
+    versions = get_version_attribution(model_version=model_version)
     return {
         "trace_id": f"tr_{uuid4().hex}",
         "request_id": f"req_{uuid4().hex[:8]}",
@@ -59,6 +62,11 @@ def create_trace(*, query: str, selected_document_ids: Sequence[str]) -> dict[st
         "total_latency_ms": None,
         "schema_version": SCHEMA_VERSION,
         "pipeline_version": PIPELINE_VERSION,
+        "retrieval_version": versions["retrieval_version"],
+        "answerability_version": versions["answerability_version"],
+        "generation_version": versions["generation_version"],
+        "prompt_bundle_version": versions["prompt_bundle_version"],
+        "model_version": versions["model_version"],
         "spans": [],
         "_start_perf": perf_counter(),
     }

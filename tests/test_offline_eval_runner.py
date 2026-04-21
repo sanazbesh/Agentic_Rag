@@ -111,6 +111,16 @@ def test_runner_loads_dataset_executes_cases_and_writes_machine_readable_output(
     assert row["debug_payload"]["answerability_result"]["should_answer"] is True
     assert "contract_checks" in row["deterministic_eval_results"]
     assert "groundedness" in row["llm_judge_results"]
+    for key in (
+        "retrieval_version",
+        "answerability_version",
+        "generation_version",
+        "prompt_bundle_version",
+        "model_version",
+    ):
+        assert key in blob["version_attribution"]
+        assert key in row["version_attribution"]
+
 
 
 def test_runner_can_filter_to_one_family(tmp_path: Path) -> None:
@@ -186,3 +196,76 @@ def test_runner_marks_missing_model_graders_as_skipped(tmp_path: Path) -> None:
     assert judges["groundedness"]["status"] == "skipped"
     assert judges["safe_failure"]["status"] == "skipped"
     assert judges["answer_correctness"]["status"] == "skipped"
+
+
+def test_runner_uses_explicit_unknown_model_fallback_when_model_version_is_missing(tmp_path: Path) -> None:
+    dataset = tmp_path / "dataset.jsonl"
+    _write_dataset(dataset, [_case("case-1", "party_role_verification")])
+
+    def missing_model_executor(eval_case: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        _ = eval_case
+        return (
+            {
+                "answer_text": "ok",
+                "grounded": True,
+                "sufficient_context": True,
+                "citations": [],
+                "warnings": [],
+            },
+            {"trace": {"retrieval_version": "retrieval.v1"}},
+            {},
+        )
+
+    result = run_offline_eval(
+        output_path=tmp_path / "out_unknown_model.json",
+        dataset_path=dataset,
+        case_executor=missing_model_executor,
+        run_deterministic_evaluators=False,
+        run_model_graders=False,
+    )
+
+    assert result.case_results[0]["version_attribution"]["model_version"] == "unknown_model_version"
+
+
+def test_version_attribution_enriches_metadata_without_mutating_core_system_result(tmp_path: Path) -> None:
+    dataset = tmp_path / "dataset.jsonl"
+    _write_dataset(dataset, [_case("case-1", "party_role_verification")])
+
+    result = run_offline_eval(
+        output_path=tmp_path / "out_stability.json",
+        dataset_path=dataset,
+        case_executor=_executor,
+        run_deterministic_evaluators=False,
+        run_model_graders=False,
+    )
+
+    system_result = result.case_results[0]["system_result"]
+    assert system_result == {
+        "answer_text": "answer::Who is the employer?",
+        "grounded": True,
+        "sufficient_context": True,
+        "citations": [{"parent_chunk_id": "eu-1", "document_id": "doc-1"}],
+        "warnings": [],
+    }
+
+
+def test_version_attribution_is_stable_across_repeated_offline_eval_runs(tmp_path: Path) -> None:
+    dataset = tmp_path / "dataset.jsonl"
+    _write_dataset(dataset, [_case("case-1", "party_role_verification")])
+
+    first = run_offline_eval(
+        output_path=tmp_path / "out_stable_1.json",
+        dataset_path=dataset,
+        case_executor=_executor,
+        run_deterministic_evaluators=False,
+        run_model_graders=False,
+    )
+    second = run_offline_eval(
+        output_path=tmp_path / "out_stable_2.json",
+        dataset_path=dataset,
+        case_executor=_executor,
+        run_deterministic_evaluators=False,
+        run_model_graders=False,
+    )
+
+    assert first.case_results[0]["version_attribution"] == second.case_results[0]["version_attribution"]
