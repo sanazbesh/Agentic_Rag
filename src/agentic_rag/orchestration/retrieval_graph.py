@@ -20,6 +20,7 @@ except Exception:  # pragma: no cover - fallback for constrained envs
 
 from agentic_rag.orchestration.decomposition_gate import decide_decomposition_need
 from agentic_rag.orchestration.query_understanding import QueryUnderstandingResult, understand_query
+from agentic_rag.orchestration.tracing import begin_span, end_span
 from agentic_rag.retrieval.parent_child import HybridSearchResult, ParentChunkResult, RerankedChunkResult
 from agentic_rag.tools.context_processing import CompressContextResult, CompressedParentChunk
 from agentic_rag.tools.query_intelligence import LegalEntityExtractionResult, QueryRewriteResult
@@ -186,6 +187,7 @@ class RetrievalStageState(TypedDict):
     prior_effective_query: str | None
     prior_final_answer: str | None
     prior_citations: list[Mapping[str, Any]]
+    trace: dict[str, Any] | None
 
 
 class QueryClassifier(Protocol):
@@ -275,6 +277,7 @@ def default_retrieval_state(
         prior_effective_query=None,
         prior_final_answer=None,
         prior_citations=[],
+        trace=None,
     )
 
 
@@ -312,6 +315,15 @@ def _build_merged_candidate(
         ),
         contributing_hits=[hit],
     )
+
+
+def _extract_family_from_routing_notes(notes: Sequence[str]) -> str | None:
+    for note in notes:
+        if isinstance(note, str) and note.startswith("legal_question_family:"):
+            family = note.split(":", 1)[1].strip()
+            if family:
+                return family
+    return None
 
 
 def _merge_two_candidates(
@@ -825,6 +837,14 @@ class RetrievalGraphNodes:
             len(selected_docs),
             selected_ids,
         )
+        trace = updated.get("trace")
+        if isinstance(trace, dict):
+            begin_span(
+                trace,
+                stage="query_understanding",
+                span_name="Query Understanding",
+                inputs_summary={"query": updated["original_query"]},
+            )
         decision = self.dependencies.classify_query_state(
             updated["original_query"],
             conversation_summary=updated["conversation_summary"],
@@ -845,6 +865,22 @@ class RetrievalGraphNodes:
             decision.question_type,
             decision.answerability_expectation,
         )
+        if isinstance(trace, dict):
+            end_span(
+                trace,
+                stage="query_understanding",
+                status="success",
+                outputs_summary={
+                    "normalized_query": decision.normalized_query,
+                    "question_type": decision.question_type,
+                    "answerability_expectation": decision.answerability_expectation,
+                    "legal_question_family": _extract_family_from_routing_notes(decision.routing_notes),
+                    "is_followup": decision.is_followup,
+                    "is_document_scoped": decision.is_document_scoped,
+                    "may_need_decomposition": decision.may_need_decomposition,
+                },
+                warnings=list(decision.warnings),
+            )
         return cast(RetrievalStageState, updated)
 
     def resolve_query_context(self, state: RetrievalStageState) -> RetrievalStageState:
@@ -952,6 +988,27 @@ class RetrievalGraphNodes:
         )
         updated["needs_decomposition"] = needs_decomposition
         updated["decomposition_gate_reasons"] = reasons
+        trace = updated.get("trace")
+        if isinstance(trace, dict):
+            begin_span(
+                trace,
+                stage="decomposition",
+                span_name="Decomposition",
+                inputs_summary={"resolved_query": str(updated.get("resolved_query") or updated.get("original_query") or "")},
+            )
+            if not needs_decomposition:
+                end_span(
+                    trace,
+                    stage="decomposition",
+                    status="success",
+                    outputs_summary={
+                        "needs_decomposition": False,
+                        "decomposition_gate_reasons": list(reasons),
+                        "subquery_count": 0,
+                        "validation_outcome": "not_applicable",
+                        "validation_errors": [],
+                    },
+                )
         logger.info(
             "node_exit name=classify_decomposition_need needs_decomposition=%s reasons=%s",
             needs_decomposition,
@@ -982,9 +1039,23 @@ class RetrievalGraphNodes:
 
         logger.info("node_enter name=validate_decomposition_plan")
         updated = dict(state)
+        trace = updated.get("trace")
         plan = updated.get("decomposition_plan")
         if plan is None:
             updated["decomposition_validation_errors"] = []
+            if isinstance(trace, dict):
+                end_span(
+                    trace,
+                    stage="decomposition",
+                    status="success",
+                    outputs_summary={
+                        "needs_decomposition": bool(updated.get("needs_decomposition", False)),
+                        "decomposition_gate_reasons": list(updated.get("decomposition_gate_reasons", [])),
+                        "subquery_count": 0,
+                        "validation_outcome": "not_applicable",
+                        "validation_errors": [],
+                    },
+                )
             logger.info("node_exit name=validate_decomposition_plan skipped=true")
             return cast(RetrievalStageState, updated)
 
@@ -992,12 +1063,39 @@ class RetrievalGraphNodes:
         updated["decomposition_validation_errors"] = list(errors)
         if errors:
             updated["decomposition_plan"] = None
+            if isinstance(trace, dict):
+                end_span(
+                    trace,
+                    stage="decomposition",
+                    status="partial",
+                    outputs_summary={
+                        "needs_decomposition": bool(updated.get("needs_decomposition", False)),
+                        "decomposition_gate_reasons": list(updated.get("decomposition_gate_reasons", [])),
+                        "subquery_count": len(plan.subqueries),
+                        "validation_outcome": "invalid",
+                        "validation_errors": list(errors),
+                    },
+                    warnings=["decomposition_validation_failed"],
+                )
             logger.info(
                 "node_exit name=validate_decomposition_plan valid=false error_count=%s",
                 len(errors),
             )
             return cast(RetrievalStageState, updated)
 
+        if isinstance(trace, dict):
+            end_span(
+                trace,
+                stage="decomposition",
+                status="success",
+                outputs_summary={
+                    "needs_decomposition": bool(updated.get("needs_decomposition", False)),
+                    "decomposition_gate_reasons": list(updated.get("decomposition_gate_reasons", [])),
+                    "subquery_count": len(plan.subqueries),
+                    "validation_outcome": "valid",
+                    "validation_errors": [],
+                },
+            )
         logger.info("node_exit name=validate_decomposition_plan valid=true")
         return cast(RetrievalStageState, updated)
 
@@ -1098,6 +1196,17 @@ class RetrievalGraphNodes:
     def run_hybrid_search(self, state: RetrievalStageState) -> RetrievalStageState:
         logger.info("node_enter name=run_hybrid_search")
         updated = dict(state)
+        trace = updated.get("trace")
+        if isinstance(trace, dict):
+            begin_span(
+                trace,
+                stage="retrieval",
+                span_name="Retrieval",
+                inputs_summary={
+                    "effective_query": updated.get("effective_query"),
+                    "filters": dict(updated.get("filters") or {}),
+                },
+            )
         try:
             results = self.dependencies.hybrid_search(
                 updated["effective_query"],
@@ -1114,6 +1223,23 @@ class RetrievalGraphNodes:
             updated["warnings"] = [*updated["warnings"], f"hybrid_search_failed:{type(exc).__name__}"]
             updated["child_results"] = []
             updated["root_merged_candidates"] = []
+        if isinstance(trace, dict):
+            retrieval_mode = "decomposed" if updated.get("decomposition_plan") is not None else "single_query"
+            top_ids = [item.child_chunk_id for item in updated["child_results"][:5] if item.child_chunk_id]
+            status: Literal["success", "partial"] = "partial" if "no_child_results" in updated["warnings"] else "success"
+            end_span(
+                trace,
+                stage="retrieval",
+                status=status,
+                outputs_summary={
+                    "effective_query": updated.get("effective_query"),
+                    "selected_document_scope": list(updated.get("last_resolved_document_scope", [])),
+                    "retrieval_mode": retrieval_mode,
+                    "retrieved_child_count": len(updated["child_results"]),
+                    "top_child_chunk_ids": top_ids,
+                },
+                warnings=[warning for warning in updated["warnings"] if warning in {"no_child_results"}],
+            )
         logger.info("node_exit name=run_hybrid_search child_count=%s", len(updated["child_results"]))
         return cast(RetrievalStageState, updated)
 
@@ -1202,9 +1328,31 @@ class RetrievalGraphNodes:
             rerank_input = list(updated["child_results"])
             rerank_query = str(updated.get("effective_query") or "")
 
+        trace = updated.get("trace")
+        if isinstance(trace, dict):
+            begin_span(
+                trace,
+                stage="rerank",
+                span_name="Rerank",
+                parent_stage="retrieval",
+                inputs_summary={"candidate_count": len(rerank_input), "query": rerank_query},
+            )
         if not rerank_input:
             updated["reranked_child_results"] = []
             updated["parent_expansion_child_results"] = []
+            if isinstance(trace, dict):
+                end_span(
+                    trace,
+                    stage="rerank",
+                    status="skipped",
+                    outputs_summary={
+                        "input_candidate_count": 0,
+                        "output_candidate_count": 0,
+                        "top_reranked_child_ids": [],
+                        "ranking_source": "not_applicable",
+                    },
+                    warnings=["rerank_skipped"],
+                )
             logger.info("node_exit name=rerank_results skipped=true")
             return cast(RetrievalStageState, updated)
         try:
@@ -1244,6 +1392,21 @@ class RetrievalGraphNodes:
             updated["parent_expansion_child_results"] = list(updated["reranked_child_results"])
         else:
             updated["parent_expansion_child_results"] = []
+        if isinstance(trace, dict):
+            end_span(
+                trace,
+                stage="rerank",
+                status="success",
+                outputs_summary={
+                    "input_candidate_count": len(rerank_input),
+                    "output_candidate_count": len(updated["reranked_child_results"]),
+                    "top_reranked_child_ids": [
+                        item.child_chunk_id for item in updated["reranked_child_results"][:5] if item.child_chunk_id
+                    ],
+                    "ranking_source": "global_merged_rerank" if use_global_merged_pool else "direct_rerank",
+                },
+                warnings=[warning for warning in updated["warnings"] if warning.startswith("rerank_")],
+            )
         logger.info(
             "node_exit name=rerank_results reranked_count=%s parent_expansion_source=%s",
             len(updated["reranked_child_results"]),
@@ -1254,6 +1417,7 @@ class RetrievalGraphNodes:
     def collect_parent_ids(self, state: RetrievalStageState) -> RetrievalStageState:
         logger.info("node_enter name=collect_parent_ids")
         updated = dict(state)
+        trace = updated.get("trace")
         has_valid_decomposition = updated.get("decomposition_plan") is not None
         has_merged_candidates = bool(updated.get("merged_candidates"))
         has_global_reranked_pool = bool(updated.get("parent_expansion_child_results"))
@@ -1264,6 +1428,14 @@ class RetrievalGraphNodes:
         else:
             parent_source = list(updated["reranked_child_results"])
             source_name = "reranked_child_results"
+        if isinstance(trace, dict):
+            begin_span(
+                trace,
+                stage="parent_expansion",
+                span_name="Parent Expansion",
+                parent_stage="retrieval",
+                inputs_summary={"source": source_name, "candidate_count": len(parent_source)},
+            )
 
         seen: set[str] = set()
         parent_ids: list[str] = []
@@ -1280,12 +1452,31 @@ class RetrievalGraphNodes:
     def fetch_parent_chunks(self, state: RetrievalStageState) -> RetrievalStageState:
         logger.info("node_enter name=fetch_parent_chunks parent_id_count=%s", len(state["parent_ids"]))
         updated = dict(state)
+        trace = updated.get("trace")
         try:
             parents = self.dependencies.retrieve_parent_chunks(updated["parent_ids"])
             updated["parent_chunks"] = list(parents)
         except Exception as exc:  # pragma: no cover
             updated["warnings"] = [*updated["warnings"], f"parent_retrieval_failed:{type(exc).__name__}"]
             updated["parent_chunks"] = []
+        if isinstance(trace, dict):
+            traceability = {
+                item.child_chunk_id: item.parent_chunk_id
+                for item in list(updated.get("parent_expansion_child_results", []))[:20]
+                if item.child_chunk_id and item.parent_chunk_id
+            }
+            end_span(
+                trace,
+                stage="parent_expansion",
+                status="success",
+                outputs_summary={
+                    "collected_parent_ids": list(updated.get("parent_ids", [])),
+                    "fetched_parent_count": len(updated["parent_chunks"]),
+                    "child_parent_traceability": traceability,
+                    "ordering_notes": [],
+                },
+                warnings=[warning for warning in updated["warnings"] if warning.startswith("parent_")],
+            )
         logger.info("node_exit name=fetch_parent_chunks parent_chunk_count=%s", len(updated["parent_chunks"]))
         return cast(RetrievalStageState, updated)
 
