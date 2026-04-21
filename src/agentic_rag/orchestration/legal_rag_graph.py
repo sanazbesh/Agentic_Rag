@@ -26,6 +26,7 @@ from agentic_rag.orchestration.retrieval_graph import (
     build_retrieval_graph,
     default_retrieval_state,
 )
+from agentic_rag.orchestration.tracing import begin_span, create_trace, end_span, finalize_trace
 from agentic_rag.retrieval.parent_child import ParentChunkResult
 from agentic_rag.tools.answer_generation import AnswerCitation, GenerateAnswerResult, generate_answer
 from agentic_rag.tools.answerability import AnswerabilityAssessment, assess_answerability
@@ -93,6 +94,7 @@ class LegalRagState(RetrievalStageState, total=False):
     should_return_insufficient_response: bool
     response_route: str
     subquery_subanswers: list[SubqueryGroundedSubanswer]
+    trace: dict[str, Any] | None
 
 
 class AnswerGenerator(Protocol):
@@ -139,6 +141,16 @@ def default_legal_rag_state(
         active_documents=active_documents,
         selected_documents=selected_documents,
     )
+    selected_doc_ids: list[str] = []
+    for item in selected_documents or []:
+        if isinstance(item, Mapping):
+            doc_id = item.get("id") or item.get("document_id")
+            if isinstance(doc_id, str) and doc_id:
+                selected_doc_ids.append(doc_id)
+        elif hasattr(item, "id"):
+            doc_id = getattr(item, "id")
+            if isinstance(doc_id, str) and doc_id:
+                selected_doc_ids.append(doc_id)
     merged = dict(retrieval_state)
     merged.update(
         {
@@ -156,6 +168,7 @@ def default_legal_rag_state(
             "should_return_insufficient_response": True,
             "response_route": "unresolved",
             "subquery_subanswers": [],
+            "trace": create_trace(query=query, selected_document_ids=selected_doc_ids),
         }
     )
     return cast(LegalRagState, merged)
@@ -192,6 +205,16 @@ def _dedupe_preserve_order(values: Sequence[str]) -> list[str]:
         seen.add(value)
         deduped.append(value)
     return deduped
+
+
+def _extract_family_from_query_classification(query_classification: object) -> str | None:
+    routing_notes = getattr(query_classification, "routing_notes", [])
+    for note in routing_notes or []:
+        if isinstance(note, str) and note.startswith("legal_question_family:"):
+            family = note.split(":", 1)[1].strip()
+            if family:
+                return family
+    return None
 
 
 def _decomposition_coverage_gate_assessment(
@@ -509,6 +532,14 @@ class AnswerStageNodes:
         query = str(updated.get("effective_query") or updated.get("original_query") or "").strip()
         query_understanding = updated.get("query_classification")
         context = list(updated.get("answer_context", []))
+        trace = updated.get("trace")
+        if isinstance(trace, dict):
+            begin_span(
+                trace,
+                stage="answerability",
+                span_name="Answerability",
+                inputs_summary={"query": query, "context_count": len(context)},
+            )
 
         if query_understanding is None:
             warnings.append("answerability_assessment_missing_query_understanding")
@@ -518,6 +549,21 @@ class AnswerStageNodes:
             updated["should_return_partial_response"] = False
             updated["should_return_insufficient_response"] = True
             updated["warnings"] = warnings
+            if isinstance(trace, dict):
+                end_span(
+                    trace,
+                    stage="answerability",
+                    status="skipped",
+                    outputs_summary={
+                        "has_relevant_context": bool(context),
+                        "sufficient_context": False,
+                        "partially_supported": False,
+                        "support_level": "none",
+                        "insufficiency_reason": "missing_query_understanding",
+                        "should_answer": False,
+                    },
+                    warnings=["answerability_assessment_missing_query_understanding"],
+                )
             logger.info("node_exit name=assess_answerability skipped=true reason=missing_query_understanding")
             return cast(LegalRagState, updated)
 
@@ -541,6 +587,21 @@ class AnswerStageNodes:
             updated["should_return_partial_response"] = should_return_partial_response
             updated["should_return_insufficient_response"] = should_return_insufficient_response
             updated["warnings"] = [*warnings, *assessment.warnings]
+            if isinstance(trace, dict):
+                end_span(
+                    trace,
+                    stage="answerability",
+                    status="success",
+                    outputs_summary={
+                        "has_relevant_context": bool(assessment.has_relevant_context),
+                        "sufficient_context": bool(assessment.sufficient_context),
+                        "partially_supported": bool(assessment.partially_supported),
+                        "support_level": str(assessment.support_level),
+                        "insufficiency_reason": assessment.insufficiency_reason,
+                        "should_answer": bool(assessment.should_answer),
+                    },
+                    warnings=list(assessment.warnings),
+                )
             logger.info(
                 "node_exit name=assess_answerability support_level=%s sufficient_context=%s partially_supported=%s should_answer=%s",
                 assessment.support_level,
@@ -555,6 +616,22 @@ class AnswerStageNodes:
             updated["should_return_partial_response"] = False
             updated["should_return_insufficient_response"] = True
             updated["warnings"] = [*warnings, f"answerability_assessment_failed:{type(exc).__name__}"]
+            if isinstance(trace, dict):
+                end_span(
+                    trace,
+                    stage="answerability",
+                    status="failed",
+                    outputs_summary={
+                        "has_relevant_context": bool(context),
+                        "sufficient_context": False,
+                        "partially_supported": False,
+                        "support_level": "none",
+                        "insufficiency_reason": "answerability_assessment_failed",
+                        "should_answer": False,
+                    },
+                    warnings=[f"answerability_assessment_failed:{type(exc).__name__}"],
+                    error={"code": "answerability_assessment_failed", "message": str(exc)},
+                )
             logger.info("node_exit name=assess_answerability success=false reason=%s", type(exc).__name__)
         return cast(LegalRagState, updated)
 
@@ -701,6 +778,14 @@ class AnswerStageNodes:
         warnings = list(updated.get("warnings", []))
         answer_context = list(updated.get("answer_context", []))
         should_generate_answer = bool(updated.get("should_generate_answer", False))
+        trace = updated.get("trace")
+        if isinstance(trace, dict):
+            begin_span(
+                trace,
+                stage="answer_generation",
+                span_name="Answer Generation",
+                inputs_summary={"context_count": len(answer_context), "should_generate_answer": should_generate_answer},
+            )
         synthesized = _synthesize_from_grounded_subanswers(
             decomposition_plan=updated.get("decomposition_plan")
             if isinstance(updated.get("decomposition_plan"), DecompositionPlan)
@@ -720,6 +805,18 @@ class AnswerStageNodes:
             updated["sufficient_context"] = synthesized.sufficient_context
             updated["warnings"] = list(synthesized.warnings)
             updated["response_route"] = "generate_answer"
+            if isinstance(trace, dict):
+                end_span(
+                    trace,
+                    stage="answer_generation",
+                    status="success",
+                    outputs_summary={
+                        "path_taken": "synthesized_from_subanswers",
+                        "citation_count": len(synthesized.citations),
+                        "status": "generated",
+                    },
+                    warnings=list(synthesized.warnings),
+                )
             logger.info(
                 "node_exit name=generate_grounded_answer success=true synthesized_from_subanswers=true citations=%s",
                 len(synthesized.citations),
@@ -740,6 +837,14 @@ class AnswerStageNodes:
             updated["sufficient_context"] = False
             updated["warnings"] = list(fallback.warnings)
             updated["response_route"] = "generate_answer:empty_context"
+            if isinstance(trace, dict):
+                end_span(
+                    trace,
+                    stage="answer_generation",
+                    status="partial",
+                    outputs_summary={"path_taken": "empty_context", "citation_count": 0, "status": "skipped_safe"},
+                    warnings=["insufficient_context:no_retrieved_context"],
+                )
             logger.info("node_exit name=generate_grounded_answer success=true empty_context=true")
             return cast(LegalRagState, updated)
 
@@ -753,6 +858,14 @@ class AnswerStageNodes:
             updated["sufficient_context"] = False
             updated["warnings"] = list(fallback.warnings)
             updated["response_route"] = "fallback_finalizer:routing_violation"
+            if isinstance(trace, dict):
+                end_span(
+                    trace,
+                    stage="answer_generation",
+                    status="failed",
+                    outputs_summary={"path_taken": "routing_violation", "citation_count": 0, "status": "failed_safe"},
+                    warnings=["routing_violation:generate_without_answerability_approval"],
+                )
             logger.info("node_exit name=generate_grounded_answer success=false reason=routing_violation")
             return cast(LegalRagState, updated)
 
@@ -772,6 +885,18 @@ class AnswerStageNodes:
                 updated["sufficient_context"] = False
                 updated["warnings"] = list(fallback.warnings)
                 updated["response_route"] = "fallback_finalizer:generate_answer_returned_insufficient"
+                if isinstance(trace, dict):
+                    end_span(
+                        trace,
+                        stage="answer_generation",
+                        status="partial",
+                        outputs_summary={
+                            "path_taken": "generate_then_fallback_insufficient",
+                            "citation_count": 0,
+                            "status": "failed_safe",
+                        },
+                        warnings=["fallback_after_sufficient_gate:generate_answer_returned_insufficient"],
+                    )
                 logger.info("node_exit name=generate_grounded_answer success=false reason=inconsistent_sufficient_context")
                 return cast(LegalRagState, updated)
             updated["final_answer"] = final
@@ -780,6 +905,18 @@ class AnswerStageNodes:
             updated["sufficient_context"] = final.sufficient_context
             updated["warnings"] = list(final.warnings)
             updated["response_route"] = "generate_answer"
+            if isinstance(trace, dict):
+                end_span(
+                    trace,
+                    stage="answer_generation",
+                    status="success",
+                    outputs_summary={
+                        "path_taken": "generate_answer",
+                        "citation_count": len(final.citations),
+                        "status": "generated",
+                    },
+                    warnings=list(final.warnings),
+                )
             logger.info(
                 "node_exit name=generate_grounded_answer success=true citations=%s grounded=%s sufficient_context=%s",
                 len(final.citations),
@@ -796,6 +933,15 @@ class AnswerStageNodes:
             updated["sufficient_context"] = False
             updated["warnings"] = list(failure.warnings)
             updated["response_route"] = "fallback_finalizer:answer_generation_failed"
+            if isinstance(trace, dict):
+                end_span(
+                    trace,
+                    stage="answer_generation",
+                    status="failed",
+                    outputs_summary={"path_taken": "exception_fallback", "citation_count": 0, "status": "failed_safe"},
+                    warnings=[failure_warning],
+                    error={"code": "answer_generation_failed", "message": str(exc)},
+                )
             logger.info("node_exit name=generate_grounded_answer success=false reason=%s", type(exc).__name__)
             return cast(LegalRagState, updated)
 
@@ -804,6 +950,21 @@ class AnswerStageNodes:
 
         logger.info("node_enter name=build_insufficient_response")
         updated = dict(state)
+        trace = updated.get("trace")
+        if isinstance(trace, dict):
+            begin_span(
+                trace,
+                stage="answer_generation",
+                span_name="Answer Generation",
+                inputs_summary={"context_count": len(list(updated.get("answer_context", []))), "should_generate_answer": False},
+            )
+            end_span(
+                trace,
+                stage="answer_generation",
+                status="skipped",
+                outputs_summary={"path_taken": "answerability_blocked", "citation_count": 0, "status": "skipped"},
+                warnings=["answerability_gate_blocked_generation"],
+            )
         warnings = list(updated.get("warnings", []))
         assessment = updated.get("answerability_result")
         synthesized = _synthesize_from_grounded_subanswers(
@@ -892,6 +1053,14 @@ class AnswerStageNodes:
         logger.info("node_enter name=finalize_response")
         updated = dict(state)
         warnings = list(updated.get("warnings", []))
+        trace = updated.get("trace")
+        if isinstance(trace, dict):
+            begin_span(
+                trace,
+                stage="final_synthesis",
+                span_name="Final Synthesis",
+                inputs_summary={"response_route": updated.get("response_route", "unresolved")},
+            )
         raw_final = updated.get("final_answer")
         try:
             if raw_final is None:
@@ -916,6 +1085,25 @@ class AnswerStageNodes:
         updated["sufficient_context"] = final.sufficient_context
         updated["warnings"] = list(final.warnings)
         updated["final_response_ready"] = True
+        if isinstance(trace, dict):
+            final_status = "answered" if final.sufficient_context else "insufficient_context"
+            if not final.sufficient_context and final.citations:
+                final_status = "partial_answer"
+            end_span(
+                trace,
+                stage="final_synthesis",
+                status="success",
+                outputs_summary={
+                    "final_answer_status": final_status,
+                    "grounded": final.grounded,
+                    "sufficient_context": final.sufficient_context,
+                    "citation_count": len(final.citations),
+                    "warning_count": len(final.warnings),
+                    "synthesis_path": updated.get("response_route", "unresolved"),
+                    "final_output_status": "success",
+                },
+                warnings=list(final.warnings),
+            )
         logger.info(
             "node_exit name=finalize_response ready=true citations=%s grounded=%s sufficient_context=%s response_route=%s",
             len(final.citations),
@@ -1044,6 +1232,10 @@ def run_legal_rag_turn(
     )
     app = build_full_legal_rag_graph(dependencies=dependencies, retrieval_config=retrieval_config)
     final_state = cast(LegalRagState, app.invoke(initial))
+    trace = final_state.get("trace")
+    if isinstance(trace, dict):
+        active_family = _extract_family_from_query_classification(final_state.get("query_classification"))
+        final_state["trace"] = finalize_trace(trace, active_family=active_family)
     final_answer = final_state.get("final_answer")
     if not isinstance(final_answer, FinalAnswerModel):
         return _safe_fallback(warnings=["runner_fallback:missing_or_invalid_final_answer"], message=FAILURE_MESSAGE)
@@ -1071,6 +1263,10 @@ def run_legal_rag_turn_with_state(
     )
     app = build_full_legal_rag_graph(dependencies=dependencies, retrieval_config=retrieval_config)
     final_state = cast(LegalRagState, app.invoke(initial))
+    trace = final_state.get("trace")
+    if isinstance(trace, dict):
+        active_family = _extract_family_from_query_classification(final_state.get("query_classification"))
+        final_state["trace"] = finalize_trace(trace, active_family=active_family)
     final_answer = final_state.get("final_answer")
     if not isinstance(final_answer, FinalAnswerModel):
         fallback = _safe_fallback(warnings=["runner_fallback:missing_or_invalid_final_answer"], message=FAILURE_MESSAGE)
