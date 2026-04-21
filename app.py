@@ -50,6 +50,7 @@ from ui.components import (
 )
 from ui.local_backend import build_local_backend_dependencies
 from ui.session_memory import append_conversation_turn, build_backend_context
+from ui.quality_dashboard import render_quality_dashboard
 
 
 st.set_page_config(page_title="Legal RAG Test UI", layout="wide")
@@ -241,6 +242,11 @@ def build_real_backend_runners() -> tuple[Callable[..., Any] | None, Callable[..
 
 
 def main() -> None:
+    page = st.sidebar.radio("Dashboard", options=["Inspection", "Quality"], index=0)
+    if page == "Quality":
+        render_quality_dashboard()
+        return
+
     st.title("Legal RAG Inspection Dashboard")
     st.caption("Local-first Streamlit UI for testing retrieval, grounding, citations, and debug state.")
 
