@@ -26,6 +26,7 @@ from agentic_rag.orchestration.retrieval_graph import (
     build_retrieval_graph,
     default_retrieval_state,
 )
+from agentic_rag.orchestration.metrics import emit_request_metrics
 from agentic_rag.orchestration.tracing import begin_span, create_trace, end_span, finalize_trace
 from agentic_rag.retrieval.parent_child import ParentChunkResult
 from agentic_rag.tools.answer_generation import AnswerCitation, GenerateAnswerResult, generate_answer
@@ -95,6 +96,7 @@ class LegalRagState(RetrievalStageState, total=False):
     response_route: str
     subquery_subanswers: list[SubqueryGroundedSubanswer]
     trace: dict[str, Any] | None
+    metrics: dict[str, Any] | None
 
 
 class AnswerGenerator(Protocol):
@@ -169,6 +171,7 @@ def default_legal_rag_state(
             "response_route": "unresolved",
             "subquery_subanswers": [],
             "trace": create_trace(query=query, selected_document_ids=selected_doc_ids),
+            "metrics": None,
         }
     )
     return cast(LegalRagState, merged)
@@ -1239,6 +1242,10 @@ def run_legal_rag_turn(
     final_answer = final_state.get("final_answer")
     if not isinstance(final_answer, FinalAnswerModel):
         return _safe_fallback(warnings=["runner_fallback:missing_or_invalid_final_answer"], message=FAILURE_MESSAGE)
+    try:
+        final_state["metrics"] = emit_request_metrics(final_answer=final_answer, state=final_state).model_dump()
+    except Exception:  # pragma: no cover - metrics must never break core answer path
+        final_state["metrics"] = None
     return final_answer
 
 
@@ -1271,5 +1278,13 @@ def run_legal_rag_turn_with_state(
     if not isinstance(final_answer, FinalAnswerModel):
         fallback = _safe_fallback(warnings=["runner_fallback:missing_or_invalid_final_answer"], message=FAILURE_MESSAGE)
         final_state["final_answer"] = fallback
+        try:
+            final_state["metrics"] = emit_request_metrics(final_answer=fallback, state=final_state).model_dump()
+        except Exception:  # pragma: no cover - metrics must never break core answer path
+            final_state["metrics"] = None
         return fallback, final_state
+    try:
+        final_state["metrics"] = emit_request_metrics(final_answer=final_answer, state=final_state).model_dump()
+    except Exception:  # pragma: no cover - metrics must never break core answer path
+        final_state["metrics"] = None
     return final_answer, final_state

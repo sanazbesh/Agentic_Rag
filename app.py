@@ -129,6 +129,7 @@ def build_real_debug_payload(
         "resolved_document_scope": _to_debug_jsonable(latest_state.get("last_resolved_document_scope", [])),
         "resolved_topic_hints": resolved_topics,
         "trace": _to_debug_jsonable(latest_state.get("trace")),
+        "metrics": _to_debug_jsonable(latest_state.get("metrics")),
         "warnings": warnings,
         "recent_messages_used": _to_debug_jsonable(latest_state.get("recent_messages", [])),
     }
