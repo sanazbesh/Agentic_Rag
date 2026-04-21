@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from app import build_real_debug_payload
+from agentic_rag.versioning import get_version_attribution, normalize_model_version
 from evals.graders.answerability_checks import evaluate_answerability_checks
 from evals.graders.citation_checks import evaluate_citation_checks
 from evals.graders.contract_checks import evaluate_contract_checks
@@ -68,6 +69,7 @@ def run_offline_eval(
     case_results: list[dict[str, Any]] = []
     for eval_case in selected_cases:
         case_id = str(eval_case.get("id") or "")
+        case_versions = _resolve_case_versions(debug_payload=None, state_payload=None, final_result=None)
         base = {
             "case_id": case_id,
             "family": str(eval_case.get("family") or "unknown"),
@@ -75,6 +77,7 @@ def run_offline_eval(
             "selected_document_ids": [str(item) for item in list(eval_case.get("selected_document_ids") or [])],
             "runner_status": "ok",
             "error": None,
+            "version_attribution": dict(case_versions),
             "system_result": {},
             "debug_payload": {},
             "deterministic_eval_results": {},
@@ -84,6 +87,11 @@ def run_offline_eval(
             final_result, debug_payload, state_payload = executor(eval_case)
             base["system_result"] = final_result
             base["debug_payload"] = debug_payload
+            base["version_attribution"] = _resolve_case_versions(
+                debug_payload=debug_payload,
+                state_payload=state_payload,
+                final_result=final_result,
+            )
 
             if run_deterministic_evaluators:
                 base["deterministic_eval_results"] = _run_deterministic_evaluators(
@@ -106,6 +114,7 @@ def run_offline_eval(
         case_results.append(base)
 
     summary = _build_summary(case_results=case_results, dataset_files=dataset_files, family_filter=family)
+    run_versions = _resolve_case_versions(debug_payload=None, state_payload=None, final_result=None)
     result_blob = {
         "runner": "offline_eval_runner_v1",
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -118,6 +127,7 @@ def run_offline_eval(
             "run_model_graders": run_model_graders,
         },
         "summary": summary,
+        "version_attribution": dict(run_versions),
         "cases": case_results,
     }
 
@@ -125,6 +135,27 @@ def run_offline_eval(
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(result_blob, ensure_ascii=False, indent=2), encoding="utf-8")
     return OfflineEvalRunResult(output_path=str(output), summary=summary, case_results=case_results)
+
+
+
+def _resolve_case_versions(
+    *,
+    debug_payload: Mapping[str, Any] | None,
+    state_payload: Mapping[str, Any] | None,
+    final_result: Mapping[str, Any] | None,
+) -> dict[str, str]:
+    trace = debug_payload.get("trace") if isinstance(debug_payload, Mapping) else None
+    if not isinstance(trace, Mapping) and isinstance(state_payload, Mapping):
+        candidate = state_payload.get("trace")
+        trace = candidate if isinstance(candidate, Mapping) else None
+
+    model_version: Any = None
+    if isinstance(trace, Mapping):
+        model_version = trace.get("model_version")
+    if model_version is None and isinstance(final_result, Mapping):
+        model_version = final_result.get("model_version")
+
+    return get_version_attribution(model_version=normalize_model_version(model_version))
 
 
 def _resolve_dataset_files(*, dataset_path: str | Path | None, run_all_families: bool, family: str | None) -> list[Path]:
