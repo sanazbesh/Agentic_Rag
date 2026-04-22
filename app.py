@@ -52,6 +52,7 @@ from ui.session_memory import append_conversation_turn, build_backend_context
 from ui.quality_dashboard import render_quality_dashboard
 from ui.trace_dashboard import render_trace_dashboard
 from ui.triage_dashboard import render_triage_dashboard
+from ui.review_queue_dashboard import render_review_queue_dashboard
 from ui.debug_payload import build_real_debug_payload
 
 
@@ -164,7 +165,7 @@ def build_real_backend_runners() -> tuple[Callable[..., Any] | None, Callable[..
 
 
 def main() -> None:
-    page = st.sidebar.radio("Dashboard", options=["Inspection", "Quality", "Trace Debug", "Failure Triage"], index=0)
+    page = st.sidebar.radio("Dashboard", options=["Inspection", "Quality", "Trace Debug", "Failure Triage", "Human Review Queue"], index=0)
     if page == "Quality":
         render_quality_dashboard()
         return
@@ -173,6 +174,9 @@ def main() -> None:
         return
     if page == "Failure Triage":
         render_triage_dashboard()
+        return
+    if page == "Human Review Queue":
+        render_review_queue_dashboard()
         return
 
     st.title("Legal RAG Inspection Dashboard")
