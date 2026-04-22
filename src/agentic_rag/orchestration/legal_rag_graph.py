@@ -10,7 +10,7 @@ import logging
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Literal, Protocol, cast
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 try:  # pragma: no cover - optional runtime dependency
     from pydantic import BaseModel, ConfigDict, Field
@@ -35,6 +35,9 @@ from agentic_rag.tools.answerability import AnswerabilityAssessment, assess_answ
 from agentic_rag.tools.context_processing import CompressedParentChunk
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from agentic_rag.orchestration.online_shadow_grading import OnlineShadowGrader
 
 try:  # pragma: no cover - exercised only when langgraph is installed
     from langgraph.graph import END, START, StateGraph
@@ -1221,6 +1224,7 @@ def run_legal_rag_turn(
     selected_documents: Sequence[Any] | None = None,
     retrieval_config: RetrievalGraphConfig | None = None,
     traffic_sampling_config: TrafficSamplingConfig | Mapping[str, Any] | None = None,
+    online_shadow_grader: "OnlineShadowGrader | None" = None,
 ) -> FinalAnswerModel:
     """Run one full legal RAG graph turn and return only the final typed answer.
 
@@ -1249,7 +1253,9 @@ def run_legal_rag_turn(
     except Exception:  # pragma: no cover - metrics must never break core answer path
         final_state["metrics"] = None
     try:
-        maybe_sample_production_traffic(state=final_state, final_answer=final_answer, config=traffic_sampling_config)
+        sampled_record = maybe_sample_production_traffic(state=final_state, final_answer=final_answer, config=traffic_sampling_config)
+        if sampled_record is not None and online_shadow_grader is not None:
+            online_shadow_grader.schedule_sample(sampled_record)
     except Exception:  # pragma: no cover - sampling must never break core answer path
         pass
     return final_answer
@@ -1265,6 +1271,7 @@ def run_legal_rag_turn_with_state(
     selected_documents: Sequence[Any] | None = None,
     retrieval_config: RetrievalGraphConfig | None = None,
     traffic_sampling_config: TrafficSamplingConfig | Mapping[str, Any] | None = None,
+    online_shadow_grader: "OnlineShadowGrader | None" = None,
 ) -> tuple[FinalAnswerModel, LegalRagState]:
     """Run one legal RAG turn and return both final answer and full state for debug/session memory."""
 
@@ -1290,7 +1297,9 @@ def run_legal_rag_turn_with_state(
         except Exception:  # pragma: no cover - metrics must never break core answer path
             final_state["metrics"] = None
         try:
-            maybe_sample_production_traffic(state=final_state, final_answer=fallback, config=traffic_sampling_config)
+            sampled_record = maybe_sample_production_traffic(state=final_state, final_answer=fallback, config=traffic_sampling_config)
+            if sampled_record is not None and online_shadow_grader is not None:
+                online_shadow_grader.schedule_sample(sampled_record)
         except Exception:  # pragma: no cover - sampling must never break core answer path
             pass
         return fallback, final_state
@@ -1299,7 +1308,9 @@ def run_legal_rag_turn_with_state(
     except Exception:  # pragma: no cover - metrics must never break core answer path
         final_state["metrics"] = None
     try:
-        maybe_sample_production_traffic(state=final_state, final_answer=final_answer, config=traffic_sampling_config)
+        sampled_record = maybe_sample_production_traffic(state=final_state, final_answer=final_answer, config=traffic_sampling_config)
+        if sampled_record is not None and online_shadow_grader is not None:
+            online_shadow_grader.schedule_sample(sampled_record)
     except Exception:  # pragma: no cover - sampling must never break core answer path
         pass
     return final_answer, final_state
