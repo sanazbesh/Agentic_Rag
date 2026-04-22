@@ -28,6 +28,7 @@ from agentic_rag.orchestration.retrieval_graph import (
 )
 from agentic_rag.orchestration.metrics import emit_request_metrics
 from agentic_rag.orchestration.tracing import begin_span, create_trace, end_span, finalize_trace
+from agentic_rag.orchestration.traffic_sampling import TrafficSamplingConfig, maybe_sample_production_traffic
 from agentic_rag.retrieval.parent_child import ParentChunkResult
 from agentic_rag.tools.answer_generation import AnswerCitation, GenerateAnswerResult, generate_answer
 from agentic_rag.tools.answerability import AnswerabilityAssessment, assess_answerability
@@ -1219,6 +1220,7 @@ def run_legal_rag_turn(
     active_documents: Sequence[Any] | None = None,
     selected_documents: Sequence[Any] | None = None,
     retrieval_config: RetrievalGraphConfig | None = None,
+    traffic_sampling_config: TrafficSamplingConfig | Mapping[str, Any] | None = None,
 ) -> FinalAnswerModel:
     """Run one full legal RAG graph turn and return only the final typed answer.
 
@@ -1246,6 +1248,10 @@ def run_legal_rag_turn(
         final_state["metrics"] = emit_request_metrics(final_answer=final_answer, state=final_state).model_dump()
     except Exception:  # pragma: no cover - metrics must never break core answer path
         final_state["metrics"] = None
+    try:
+        maybe_sample_production_traffic(state=final_state, final_answer=final_answer, config=traffic_sampling_config)
+    except Exception:  # pragma: no cover - sampling must never break core answer path
+        pass
     return final_answer
 
 
@@ -1258,6 +1264,7 @@ def run_legal_rag_turn_with_state(
     active_documents: Sequence[Any] | None = None,
     selected_documents: Sequence[Any] | None = None,
     retrieval_config: RetrievalGraphConfig | None = None,
+    traffic_sampling_config: TrafficSamplingConfig | Mapping[str, Any] | None = None,
 ) -> tuple[FinalAnswerModel, LegalRagState]:
     """Run one legal RAG turn and return both final answer and full state for debug/session memory."""
 
@@ -1282,9 +1289,17 @@ def run_legal_rag_turn_with_state(
             final_state["metrics"] = emit_request_metrics(final_answer=fallback, state=final_state).model_dump()
         except Exception:  # pragma: no cover - metrics must never break core answer path
             final_state["metrics"] = None
+        try:
+            maybe_sample_production_traffic(state=final_state, final_answer=fallback, config=traffic_sampling_config)
+        except Exception:  # pragma: no cover - sampling must never break core answer path
+            pass
         return fallback, final_state
     try:
         final_state["metrics"] = emit_request_metrics(final_answer=final_answer, state=final_state).model_dump()
     except Exception:  # pragma: no cover - metrics must never break core answer path
         final_state["metrics"] = None
+    try:
+        maybe_sample_production_traffic(state=final_state, final_answer=final_answer, config=traffic_sampling_config)
+    except Exception:  # pragma: no cover - sampling must never break core answer path
+        pass
     return final_answer, final_state
