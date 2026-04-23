@@ -151,6 +151,7 @@ def run_backend_query(
     recent_messages: list[dict[str, Any]] | None,
     selected_documents: list[dict[str, Any]] | None,
     use_mock_backend: bool,
+    local_llm_settings: Any | None = None,
     real_backend_runner: Callable[..., Any] | None = None,
     real_debug_runner: Callable[..., Any] | None = None,
 ) -> BackendQueryResponse:
@@ -204,6 +205,7 @@ def run_backend_query(
         conversation_summary=conversation_summary,
         recent_messages=recent_messages,
         selected_documents=selected_documents,
+        local_llm_settings=local_llm_settings,
     )
     debug_payload = None
     if real_debug_runner is not None:
@@ -212,6 +214,7 @@ def run_backend_query(
             conversation_summary=conversation_summary,
             recent_messages=recent_messages,
             selected_documents=selected_documents,
+            local_llm_settings=local_llm_settings,
         )
         if isinstance(debug_raw, Mapping):
             debug_payload = dict(debug_raw)

@@ -393,6 +393,7 @@ class QueryTransformationService:
         re.compile(r"\b[A-Z][A-Za-z\s]+\s+Act\b"),
     )
     llm_client: QueryTransformationLLM | None = None
+    llm_provider_label: str = "ollama:unknown"
 
     _PARTY_ROLE_QUERY_PATTERNS: tuple[re.Pattern[str], ...] = (
         re.compile(r"\bwho\s+is\s+the\s+(employer|employee)\b", flags=re.IGNORECASE),
@@ -611,14 +612,14 @@ class QueryTransformationService:
                     original_query=original_query,
                     rewritten_query=llm_result,
                     used_conversation_context=True,
-                    rewrite_notes=f"resolved_reference_with_llm:{_LOCAL_LLM_CONFIG.provider}:{_LOCAL_LLM_CONFIG.model}",
+                    rewrite_notes=f"resolved_reference_with_llm:{self.llm_provider_label}",
                 )
             if not llm_ok:
                 return QueryRewriteResult(
                     original_query=original_query,
                     rewritten_query=normalized_query,
                     used_conversation_context=False,
-                    rewrite_notes=f"llm_failure_fallback_original_query:{_LOCAL_LLM_CONFIG.provider}:{_LOCAL_LLM_CONFIG.model}",
+                    rewrite_notes=f"llm_failure_fallback_original_query:{self.llm_provider_label}",
                 )
 
         referent = self._extract_reference_target(context_blob) if context_blob else None
@@ -628,7 +629,7 @@ class QueryTransformationService:
                 rewritten_query=normalized_query,
                 used_conversation_context=False,
                 rewrite_notes=(
-                    f"deterministic_fallback_no_reference:{_LOCAL_LLM_CONFIG.provider}:{_LOCAL_LLM_CONFIG.model}"
+                    f"deterministic_fallback_no_reference:{self.llm_provider_label}"
                     if self.llm_client is None
                     else "ambiguous_but_no_context_reference_found"
                 ),
@@ -642,7 +643,7 @@ class QueryTransformationService:
             rewritten_query=rewritten,
             used_conversation_context=True,
             rewrite_notes=(
-                f"deterministic_fallback_context_resolution:{_LOCAL_LLM_CONFIG.provider}:{_LOCAL_LLM_CONFIG.model}"
+                f"deterministic_fallback_context_resolution:{self.llm_provider_label}"
                 if self.llm_client is None
                 else "resolved_reference_from_context"
             ),
@@ -688,7 +689,7 @@ class QueryTransformationService:
                     original_query=query,
                     sub_queries=safe_parts,
                     used_conversation_context=False,
-                    decomposition_notes=f"llm_failure_fallback_original_query:{_LOCAL_LLM_CONFIG.provider}:{_LOCAL_LLM_CONFIG.model}",
+                    decomposition_notes=f"llm_failure_fallback_original_query:{self.llm_provider_label}",
                 )
             parts = llm_parts if llm_parts else self._split_into_sub_queries(rewritten_query)
         else:
@@ -700,7 +701,7 @@ class QueryTransformationService:
             original_query=query,
             sub_queries=tuple(parts),
             used_conversation_context=rewrite_result.used_conversation_context,
-            decomposition_notes=(f"llm_multi_issue_query:{_LOCAL_LLM_CONFIG.provider}:{_LOCAL_LLM_CONFIG.model}" if self.llm_client is not None and len(parts) > 1 else "single_query" if len(parts) == 1 else "multi_issue_query"),
+            decomposition_notes=(f"llm_multi_issue_query:{self.llm_provider_label}" if self.llm_client is not None and len(parts) > 1 else "single_query" if len(parts) == 1 else "multi_issue_query"),
         )
 
     def _extract_reference_target(self, context_blob: str) -> str | None:
@@ -841,7 +842,10 @@ def _is_complex_query(query: str) -> bool:
 
 
 _LOCAL_LLM_CONFIG = local_llm_config_from_env()
-_DEFAULT_QUERY_TRANSFORMATION_SERVICE = QueryTransformationService(llm_client=build_local_prompt_llm_from_env())
+_DEFAULT_QUERY_TRANSFORMATION_SERVICE = QueryTransformationService(
+    llm_client=build_local_prompt_llm_from_env(),
+    llm_provider_label=f"{_LOCAL_LLM_CONFIG.provider}:{_LOCAL_LLM_CONFIG.model}",
+)
 _DEFAULT_LEGAL_ENTITY_EXTRACTOR = LegalEntityExtractor()
 
 

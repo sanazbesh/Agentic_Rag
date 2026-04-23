@@ -59,6 +59,10 @@ def build_real_debug_payload(
     if not invoked:
         warnings.append("answerability_result unavailable: assess_answerability not invoked in this execution path")
 
+    scope = dict(scope_meta) if isinstance(scope_meta, dict) else {}
+    local_llm_scope = scope.get("local_llm") if isinstance(scope, dict) else None
+    runtime = _derive_local_llm_runtime(latest_state=latest_state, local_llm_scope=local_llm_scope)
+
     return {
         "meta": {
             "mode": "real",
@@ -66,7 +70,8 @@ def build_real_debug_payload(
             "selected_document_paths": selected_paths,
             "uses_uploaded_documents": any(doc.get("source") == "uploaded" for doc in selected_docs),
         },
-        "scope": dict(scope_meta) if isinstance(scope_meta, dict) else {},
+        "scope": scope,
+        "local_llm_runtime": runtime,
         "query_classification": _to_debug_jsonable(latest_state.get("query_classification")),
         "context_resolution": _to_debug_jsonable(latest_state.get("context_resolution")),
         "decomposition": decomposition,
@@ -79,4 +84,54 @@ def build_real_debug_payload(
         "metrics": _to_debug_jsonable(latest_state.get("metrics")),
         "warnings": warnings,
         "recent_messages_used": _to_debug_jsonable(latest_state.get("recent_messages", [])),
+    }
+
+
+def _derive_local_llm_runtime(*, latest_state: dict[str, Any], local_llm_scope: Any) -> dict[str, Any]:
+    scope = local_llm_scope if isinstance(local_llm_scope, dict) else {}
+    stage_toggles = scope.get("stage_toggles") if isinstance(scope.get("stage_toggles"), dict) else {}
+    warnings = [str(item) for item in list(latest_state.get("warnings", []))]
+    final_answer = latest_state.get("final_answer")
+    final_warnings = []
+    if final_answer is not None:
+        final_warnings = [str(item) for item in list(getattr(final_answer, "warnings", []))]
+
+    used_stages: list[str] = []
+    fallback_stages: list[str] = []
+    if any(item.startswith("rewrite_path:llm:") for item in warnings):
+        used_stages.append("rewrite")
+    if any(item.startswith("rewrite_path:deterministic_fallback:") for item in warnings):
+        fallback_stages.append("rewrite")
+
+    decomposition_plan = latest_state.get("decomposition_plan")
+    planner_notes = [str(item) for item in list(getattr(decomposition_plan, "planner_notes", []))]
+    if any(item.startswith("planner_path:llm:") for item in planner_notes):
+        used_stages.append("decomposition")
+    if any(item.startswith("planner_path:deterministic_fallback:") for item in planner_notes):
+        fallback_stages.append("decomposition")
+
+    if any(item.startswith("answer_synthesis_path:llm:") for item in final_warnings):
+        used_stages.append("synthesis")
+    if any(item.startswith("answer_synthesis_path:deterministic_fallback:") for item in final_warnings):
+        fallback_stages.append("synthesis")
+
+    enabled = bool(scope.get("effective_enabled", False))
+    effective_mode = "ollama_assisted" if used_stages else "deterministic"
+    return {
+        "ui_enabled": bool(scope.get("ui_enabled", False)),
+        "effective_enabled": enabled,
+        "provider": scope.get("provider", "ollama"),
+        "model": scope.get("model", "llama3.1:8b"),
+        "base_url": scope.get("base_url"),
+        "temperature": scope.get("temperature"),
+        "timeout_seconds": scope.get("timeout_seconds"),
+        "stage_toggles": {
+            "rewrite": bool(stage_toggles.get("rewrite", False)),
+            "decomposition": bool(stage_toggles.get("decomposition", False)),
+            "synthesis": bool(stage_toggles.get("synthesis", False)),
+        },
+        "stages_using_ollama": sorted(set(used_stages)),
+        "fallback_stages": sorted(set(fallback_stages)),
+        "ollama_used": bool(used_stages),
+        "effective_mode": effective_mode if enabled else "deterministic",
     }
