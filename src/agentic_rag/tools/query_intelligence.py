@@ -13,6 +13,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from agentic_rag.llm import build_local_prompt_llm_from_env, local_llm_config_from_env
+
 
 logger = logging.getLogger(__name__)
 
@@ -609,14 +611,14 @@ class QueryTransformationService:
                     original_query=original_query,
                     rewritten_query=llm_result,
                     used_conversation_context=True,
-                    rewrite_notes="resolved_reference_with_llm",
+                    rewrite_notes=f"resolved_reference_with_llm:{_LOCAL_LLM_CONFIG.provider}:{_LOCAL_LLM_CONFIG.model}",
                 )
             if not llm_ok:
                 return QueryRewriteResult(
                     original_query=original_query,
                     rewritten_query=normalized_query,
                     used_conversation_context=False,
-                    rewrite_notes="llm_failure_fallback_original_query",
+                    rewrite_notes=f"llm_failure_fallback_original_query:{_LOCAL_LLM_CONFIG.provider}:{_LOCAL_LLM_CONFIG.model}",
                 )
 
         referent = self._extract_reference_target(context_blob) if context_blob else None
@@ -678,7 +680,7 @@ class QueryTransformationService:
                     original_query=query,
                     sub_queries=safe_parts,
                     used_conversation_context=False,
-                    decomposition_notes="llm_failure_fallback_original_query",
+                    decomposition_notes=f"llm_failure_fallback_original_query:{_LOCAL_LLM_CONFIG.provider}:{_LOCAL_LLM_CONFIG.model}",
                 )
             parts = llm_parts if llm_parts else self._split_into_sub_queries(rewritten_query)
         else:
@@ -690,7 +692,7 @@ class QueryTransformationService:
             original_query=query,
             sub_queries=tuple(parts),
             used_conversation_context=rewrite_result.used_conversation_context,
-            decomposition_notes="single_query" if len(parts) == 1 else "multi_issue_query",
+            decomposition_notes=(f"llm_multi_issue_query:{_LOCAL_LLM_CONFIG.provider}:{_LOCAL_LLM_CONFIG.model}" if self.llm_client is not None and len(parts) > 1 else "single_query" if len(parts) == 1 else "multi_issue_query"),
         )
 
     def _extract_reference_target(self, context_blob: str) -> str | None:
@@ -830,7 +832,8 @@ def _is_complex_query(query: str) -> bool:
     return False
 
 
-_DEFAULT_QUERY_TRANSFORMATION_SERVICE = QueryTransformationService()
+_LOCAL_LLM_CONFIG = local_llm_config_from_env()
+_DEFAULT_QUERY_TRANSFORMATION_SERVICE = QueryTransformationService(llm_client=build_local_prompt_llm_from_env())
 _DEFAULT_LEGAL_ENTITY_EXTRACTOR = LegalEntityExtractor()
 
 

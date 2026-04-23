@@ -25,13 +25,23 @@ def normalize_model_version(value: Any, *, fallback: str = UNKNOWN_MODEL_VERSION
     return fallback
 
 
-def get_version_attribution(*, model_version: Any = MODEL_VERSION) -> VersionAttribution:
+def get_version_attribution(
+    *,
+    model_version: Any = MODEL_VERSION,
+    local_llm_provider: Any = None,
+    local_llm_model: Any = None,
+) -> VersionAttribution:
     """Return the canonical version attribution payload for one request/run."""
 
-    return {
+    payload = {
         "retrieval_version": RETRIEVAL_VERSION,
         "answerability_version": ANSWERABILITY_VERSION,
         "generation_version": GENERATION_VERSION,
         "prompt_bundle_version": PROMPT_BUNDLE_VERSION,
         "model_version": normalize_model_version(model_version),
     }
+    provider = normalize_model_version(local_llm_provider, fallback="local_llm_disabled")
+    model = normalize_model_version(local_llm_model, fallback="local_llm_disabled")
+    payload["local_llm_provider"] = provider
+    payload["local_llm_model"] = model
+    return payload

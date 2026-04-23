@@ -138,9 +138,9 @@ def test_safe_fallbacks_on_llm_failure() -> None:
     decompose = service.decompose_query("definition and remedy for unconscionability")
 
     assert rewrite.rewritten_query == "How is that clause enforced?"
-    assert rewrite.rewrite_notes == "llm_failure_fallback_original_query"
+    assert rewrite.rewrite_notes.startswith("llm_failure_fallback_original_query")
     assert decompose.sub_queries == ("definition and remedy for unconscionability",)
-    assert decompose.decomposition_notes == "llm_failure_fallback_original_query"
+    assert decompose.decomposition_notes.startswith("llm_failure_fallback_original_query")
 
 
 def test_extract_legal_entities_contract_clause_query() -> None:

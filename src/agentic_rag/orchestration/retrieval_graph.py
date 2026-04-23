@@ -7,6 +7,7 @@ traceable, testable, and bounded.
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Callable, Mapping, Sequence
 import re
@@ -23,6 +24,7 @@ from agentic_rag.orchestration.query_understanding import QueryUnderstandingResu
 from agentic_rag.orchestration.tracing import begin_span, end_span
 from agentic_rag.retrieval.parent_child import HybridSearchResult, ParentChunkResult, RerankedChunkResult
 from agentic_rag.tools.context_processing import CompressContextResult, CompressedParentChunk
+from agentic_rag.llm import build_local_prompt_llm_from_env, local_llm_config_from_env
 from agentic_rag.tools.query_intelligence import LegalEntityExtractionResult, QueryRewriteResult
 
 logger = logging.getLogger(__name__)
@@ -225,6 +227,7 @@ class RetrievalDependencies:
     retrieve_parent_chunks: Callable[[Sequence[str]], list[ParentChunkResult]]
     compress_context: Callable[[Sequence[ParentChunkResult]], CompressContextResult]
     classify_query_state: QueryClassifier = field(default_factory=lambda: heuristic_query_classifier)
+    plan_decomposition: Callable[..., DecompositionPlan | None] | None = None
 
 
 def default_retrieval_state(
@@ -688,6 +691,18 @@ def _extract_root_entities(root_question: str) -> list[str]:
     return [entity for entity in entities if entity]
 
 
+
+def _copy_plan_with_notes(plan: DecompositionPlan, note: str) -> DecompositionPlan:
+    payload = plan.model_dump() if hasattr(plan, "model_dump") else {
+        "should_decompose": plan.should_decompose,
+        "root_question": plan.root_question,
+        "strategy": plan.strategy,
+        "subqueries": list(plan.subqueries),
+        "planner_notes": list(plan.planner_notes),
+    }
+    payload["planner_notes"] = [*list(plan.planner_notes), note]
+    return DecompositionPlan(**payload)
+
 def validate_decomposition_plan(plan: DecompositionPlan) -> list[str]:
     """Deterministic conservative checks to keep broken plans out of retrieval."""
 
@@ -737,6 +752,76 @@ def validate_decomposition_plan(plan: DecompositionPlan) -> list[str]:
 
     return errors
 
+
+
+
+def llm_assisted_decomposition_plan(
+    *,
+    query: str,
+    needs_decomposition: bool,
+    reasons: Sequence[str],
+    query_classification: QueryRoutingDecision | None,
+    context_resolution: QueryContextResolution | None,
+) -> DecompositionPlan | None:
+    """Attempt local-LLM decomposition planning with deterministic fallback."""
+
+    deterministic = build_decomposition_plan(
+        query=query,
+        needs_decomposition=needs_decomposition,
+        reasons=reasons,
+        query_classification=query_classification,
+        context_resolution=context_resolution,
+    )
+    if deterministic is None:
+        return None
+
+    config = local_llm_config_from_env()
+    client = build_local_prompt_llm_from_env()
+    if client is None:
+        return _copy_plan_with_notes(deterministic, f"planner_path:deterministic_fallback:{config.provider}:{config.model}")
+
+    prompt = (
+        "Plan legal retrieval subqueries for the provided root question. "
+        "Return strict JSON only: {\"strategy\":\"...\",\"subqueries\":[{\"id\":\"sq-1\",\"question\":\"...\",\"purpose\":\"...\",\"required\":true,\"expected_answer_type\":\"cross_reference\",\"dependency_ids\":[]}]}\n"
+        "Keep at most 4 subqueries, preserve scope and negation, and avoid broad/vague phrasing.\n\n"
+        f"QUERY: {query}\n"
+        f"REASONS: {','.join(reasons)}\n"
+    )
+    try:
+        raw = client.complete(prompt)
+        payload = json.loads(raw)
+        raw_subqueries = payload.get("subqueries")
+        if not isinstance(raw_subqueries, list):
+            return _copy_plan_with_notes(_copy_plan_with_notes(deterministic, f"planner_path:deterministic_fallback:{config.provider}:{config.model}"), "planner_llm_invalid_payload")
+        subqueries: list[SubQueryPlan] = []
+        for index, item in enumerate(raw_subqueries[:4], start=1):
+            if not isinstance(item, Mapping):
+                continue
+            subqueries.append(
+                SubQueryPlan(
+                    id=str(item.get("id") or f"sq-{index}"),
+                    question=str(item.get("question") or "").strip(),
+                    purpose=str(item.get("purpose") or "Retrieve evidence for this legal sub-question."),
+                    required=bool(item.get("required", True)),
+                    expected_answer_type=(item.get("expected_answer_type") if item.get("expected_answer_type") in {"definition","entity","date","obligation","exception","comparison","condition","cross_reference"} else "cross_reference"),
+                    dependency_ids=[str(dep) for dep in list(item.get("dependency_ids", [])) if str(dep).strip()],
+                )
+            )
+        if not subqueries:
+            return _copy_plan_with_notes(_copy_plan_with_notes(deterministic, f"planner_path:deterministic_fallback:{config.provider}:{config.model}"), "planner_llm_empty_subqueries")
+
+        strategy_value = str(payload.get("strategy") or deterministic.strategy or "conjunctive")
+        strategy = strategy_value if strategy_value in {"conjunctive","comparison","temporal","exception_chain","cross_clause","definition_plus_application","amendment_vs_base"} else (deterministic.strategy or "conjunctive")
+        llm_plan = DecompositionPlan(
+            should_decompose=True,
+            root_question=deterministic.root_question,
+            strategy=strategy,
+            subqueries=subqueries,
+            planner_notes=[*deterministic.planner_notes, f"planner_path:llm:{config.provider}:{config.model}"],
+        )
+        return llm_plan
+    except Exception:
+        return _copy_plan_with_notes(_copy_plan_with_notes(deterministic, f"planner_path:deterministic_fallback:{config.provider}:{config.model}"), "planner_llm_error_fallback")
 
 class RetrievalGraphNodes:
     """Explicit node implementations for a deterministic retrieval workflow graph."""
@@ -1019,7 +1104,8 @@ class RetrievalGraphNodes:
     def maybe_build_decomposition_plan(self, state: RetrievalStageState) -> RetrievalStageState:
         logger.info("node_enter name=maybe_build_decomposition_plan")
         updated = dict(state)
-        plan = build_decomposition_plan(
+        planner = self.dependencies.plan_decomposition or build_decomposition_plan
+        plan = planner(
             query=str(updated.get("resolved_query") or updated.get("original_query") or ""),
             needs_decomposition=bool(updated.get("needs_decomposition")),
             reasons=list(updated.get("decomposition_gate_reasons") or []),
@@ -1115,6 +1201,10 @@ class RetrievalGraphNodes:
             result = self.dependencies.rewrite_query(original_query, **kwargs)
             updated["rewritten_query"] = result.rewritten_query
             updated["effective_query"] = result.rewritten_query or original_query
+            if isinstance(result.rewrite_notes, str) and result.rewrite_notes.startswith("resolved_reference_with_llm"):
+                updated["warnings"] = [*updated["warnings"], f"rewrite_path:llm:{result.rewrite_notes.split(':', 1)[1]}"]
+            if isinstance(result.rewrite_notes, str) and result.rewrite_notes.startswith("llm_failure_fallback"):
+                updated["warnings"] = [*updated["warnings"], f"rewrite_path:deterministic_fallback:{result.rewrite_notes.split(':', 1)[1]}"]
         except Exception as exc:  # pragma: no cover - defensive fallback
             updated["warnings"] = [*updated["warnings"], f"rewrite_failed:{type(exc).__name__}"]
             updated["rewritten_query"] = None

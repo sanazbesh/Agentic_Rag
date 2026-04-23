@@ -16,6 +16,8 @@ def test_central_version_source_exposes_all_required_identifiers() -> None:
         "generation_version": "generation.v1",
         "prompt_bundle_version": "prompt_bundle.v1",
         "model_version": MODEL_VERSION,
+        "local_llm_provider": "local_llm_disabled",
+        "local_llm_model": "local_llm_disabled",
     }
 
 
