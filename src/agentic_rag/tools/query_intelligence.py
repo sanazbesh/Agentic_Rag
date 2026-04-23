@@ -627,7 +627,11 @@ class QueryTransformationService:
                 original_query=original_query,
                 rewritten_query=normalized_query,
                 used_conversation_context=False,
-                rewrite_notes="ambiguous_but_no_context_reference_found",
+                rewrite_notes=(
+                    f"deterministic_fallback_no_reference:{_LOCAL_LLM_CONFIG.provider}:{_LOCAL_LLM_CONFIG.model}"
+                    if self.llm_client is None
+                    else "ambiguous_but_no_context_reference_found"
+                ),
             )
 
         rewritten = self._replace_ambiguous_reference(normalized_query, referent)
@@ -637,7 +641,11 @@ class QueryTransformationService:
             original_query=original_query,
             rewritten_query=rewritten,
             used_conversation_context=True,
-            rewrite_notes="resolved_reference_from_context",
+            rewrite_notes=(
+                f"deterministic_fallback_context_resolution:{_LOCAL_LLM_CONFIG.provider}:{_LOCAL_LLM_CONFIG.model}"
+                if self.llm_client is None
+                else "resolved_reference_from_context"
+            ),
         )
 
     def decompose_query(

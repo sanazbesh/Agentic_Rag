@@ -703,6 +703,28 @@ def _copy_plan_with_notes(plan: DecompositionPlan, note: str) -> DecompositionPl
     payload["planner_notes"] = [*list(plan.planner_notes), note]
     return DecompositionPlan(**payload)
 
+
+def _extract_llm_path_metadata(notes: Sequence[str]) -> dict[str, str] | None:
+    """Parse `*_path:*` notes to normalized stage metadata."""
+
+    for note in notes:
+        text = str(note or "").strip()
+        if not text:
+            continue
+        for prefix in ("planner_path:llm:", "planner_path:deterministic_fallback:", "resolved_reference_with_llm:", "llm_failure_fallback_original_query:"):
+            if not text.startswith(prefix):
+                continue
+            remainder = text[len(prefix) :]
+            provider, _, model = remainder.partition(":")
+            if not provider:
+                return None
+            path = "llm" if ":llm:" in prefix else "deterministic_fallback"
+            metadata = {"path": path, "provider": provider}
+            if model:
+                metadata["model"] = model
+            return metadata
+    return None
+
 def validate_decomposition_plan(plan: DecompositionPlan) -> list[str]:
     """Deterministic conservative checks to keep broken plans out of retrieval."""
 
@@ -1113,6 +1135,10 @@ class RetrievalGraphNodes:
             context_resolution=updated.get("context_resolution"),
         )
         updated["decomposition_plan"] = plan
+        if plan is not None:
+            llm_metadata = _extract_llm_path_metadata(plan.planner_notes)
+            if llm_metadata is not None:
+                updated["warnings"] = [*updated["warnings"], f"decomposition_path:{llm_metadata['path']}:{llm_metadata['provider']}:{llm_metadata.get('model', '')}".rstrip(":")]
         logger.info(
             "node_exit name=maybe_build_decomposition_plan plan_created=%s subquery_count=%s",
             plan is not None,
@@ -1170,6 +1196,7 @@ class RetrievalGraphNodes:
             return cast(RetrievalStageState, updated)
 
         if isinstance(trace, dict):
+            llm_metadata = _extract_llm_path_metadata(plan.planner_notes)
             end_span(
                 trace,
                 stage="decomposition",
@@ -1180,6 +1207,9 @@ class RetrievalGraphNodes:
                     "subquery_count": len(plan.subqueries),
                     "validation_outcome": "valid",
                     "validation_errors": [],
+                    "planner_path": (llm_metadata or {}).get("path", "deterministic"),
+                    "llm_provider": (llm_metadata or {}).get("provider"),
+                    "llm_model": (llm_metadata or {}).get("model"),
                 },
             )
         logger.info("node_exit name=validate_decomposition_plan valid=true")
@@ -1203,7 +1233,10 @@ class RetrievalGraphNodes:
             updated["effective_query"] = result.rewritten_query or original_query
             if isinstance(result.rewrite_notes, str) and result.rewrite_notes.startswith("resolved_reference_with_llm"):
                 updated["warnings"] = [*updated["warnings"], f"rewrite_path:llm:{result.rewrite_notes.split(':', 1)[1]}"]
-            if isinstance(result.rewrite_notes, str) and result.rewrite_notes.startswith("llm_failure_fallback"):
+            if isinstance(result.rewrite_notes, str) and (
+                result.rewrite_notes.startswith("llm_failure_fallback")
+                or result.rewrite_notes.startswith("deterministic_fallback")
+            ):
                 updated["warnings"] = [*updated["warnings"], f"rewrite_path:deterministic_fallback:{result.rewrite_notes.split(':', 1)[1]}"]
         except Exception as exc:  # pragma: no cover - defensive fallback
             updated["warnings"] = [*updated["warnings"], f"rewrite_failed:{type(exc).__name__}"]

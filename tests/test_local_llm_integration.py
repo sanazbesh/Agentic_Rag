@@ -96,6 +96,15 @@ def test_query_rewrite_uses_provider_when_enabled() -> None:
     assert result.rewrite_notes.startswith("resolved_reference_with_llm")
 
 
+def test_query_rewrite_falls_back_deterministically_when_provider_disabled() -> None:
+    service = QueryTransformationService(llm_client=None)
+
+    result = service.rewrite_query("How is that clause enforced?", conversation_summary="We discussed Section 9.")
+
+    assert result.rewritten_query == "How is Section 9. enforced?"
+    assert result.rewrite_notes.startswith("deterministic_fallback_context_resolution")
+
+
 def test_decomposition_planning_falls_back_when_provider_unavailable(monkeypatch) -> None:
     import agentic_rag.orchestration.retrieval_graph as rg
 
@@ -145,6 +154,28 @@ def test_decomposition_planning_uses_provider_when_enabled(monkeypatch) -> None:
     assert plan is not None
     assert len(plan.subqueries) == 2
     assert any(note.startswith("planner_path:llm") for note in plan.planner_notes)
+
+
+def test_decomposition_planning_attaches_provider_model_metadata(monkeypatch) -> None:
+    import agentic_rag.orchestration.retrieval_graph as rg
+
+    monkeypatch.setattr(rg, "build_local_prompt_llm_from_env", lambda: None)
+    monkeypatch.setattr(
+        rg,
+        "local_llm_config_from_env",
+        lambda: LocalLLMConfig(enabled=True, provider="ollama", model="llama3.1:8b"),
+    )
+
+    plan = llm_assisted_decomposition_plan(
+        query="Compare indemnity and liability clauses.",
+        needs_decomposition=True,
+        reasons=["comparison_query"],
+        query_classification=_decision(),
+        context_resolution=None,
+    )
+
+    assert plan is not None
+    assert "planner_path:deterministic_fallback:ollama:llama3.1:8b" in plan.planner_notes
 
 
 def test_final_synthesis_uses_provider_with_deterministic_citations() -> None:
