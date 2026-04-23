@@ -116,22 +116,25 @@ def _derive_local_llm_runtime(*, latest_state: dict[str, Any], local_llm_scope: 
         fallback_stages.append("synthesis")
 
     enabled = bool(scope.get("effective_enabled", False))
-    effective_mode = "ollama_assisted" if used_stages else "deterministic"
+    effective_mode = "llama_cpp_assisted" if used_stages else "deterministic"
     return {
         "ui_enabled": bool(scope.get("ui_enabled", False)),
         "effective_enabled": enabled,
-        "provider": scope.get("provider", "ollama"),
-        "model": scope.get("model", "llama3.1:8b"),
-        "base_url": scope.get("base_url"),
+        "provider": scope.get("provider", "llama_cpp"),
+        "model_path": scope.get("model_path", ""),
+        "n_ctx": scope.get("n_ctx"),
         "temperature": scope.get("temperature"),
         "timeout_seconds": scope.get("timeout_seconds"),
+        "max_tokens": scope.get("max_tokens"),
+        "n_gpu_layers": scope.get("n_gpu_layers"),
+        "threads": scope.get("threads"),
         "stage_toggles": {
             "rewrite": bool(stage_toggles.get("rewrite", False)),
             "decomposition": bool(stage_toggles.get("decomposition", False)),
             "synthesis": bool(stage_toggles.get("synthesis", False)),
         },
-        "stages_using_ollama": sorted(set(used_stages)),
+        "stages_using_local_llm": sorted(set(used_stages)),
         "fallback_stages": sorted(set(fallback_stages)),
-        "ollama_used": bool(used_stages),
+        "local_llm_used": bool(used_stages),
         "effective_mode": effective_mode if enabled else "deterministic",
     }

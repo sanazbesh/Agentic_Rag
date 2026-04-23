@@ -393,7 +393,7 @@ class QueryTransformationService:
         re.compile(r"\b[A-Z][A-Za-z\s]+\s+Act\b"),
     )
     llm_client: QueryTransformationLLM | None = None
-    llm_provider_label: str = "ollama:unknown"
+    llm_provider_label: str = "llama_cpp:unknown"
 
     _PARTY_ROLE_QUERY_PATTERNS: tuple[re.Pattern[str], ...] = (
         re.compile(r"\bwho\s+is\s+the\s+(employer|employee)\b", flags=re.IGNORECASE),
@@ -844,7 +844,7 @@ def _is_complex_query(query: str) -> bool:
 _LOCAL_LLM_CONFIG = local_llm_config_from_env()
 _DEFAULT_QUERY_TRANSFORMATION_SERVICE = QueryTransformationService(
     llm_client=build_local_prompt_llm_from_env(),
-    llm_provider_label=f"{_LOCAL_LLM_CONFIG.provider}:{_LOCAL_LLM_CONFIG.model}",
+    llm_provider_label=f"{_LOCAL_LLM_CONFIG.provider}:{_LOCAL_LLM_CONFIG.model_path or 'unset_model_path'}",
 )
 _DEFAULT_LEGAL_ENTITY_EXTRACTOR = LegalEntityExtractor()
 
