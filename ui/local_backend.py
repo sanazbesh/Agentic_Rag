@@ -13,7 +13,7 @@ from typing import Any
 from agentic_rag.chunking import MarkdownParentChildChunker
 from agentic_rag.ingestion import MarkdownDocumentIngestor, PDFDocumentIngestor
 from agentic_rag.orchestration.legal_rag_graph import LegalRagDependencies
-from agentic_rag.orchestration.retrieval_graph import RetrievalDependencies
+from agentic_rag.orchestration.retrieval_graph import RetrievalDependencies, llm_assisted_decomposition_plan
 from agentic_rag.retrieval import (
     ChildChunkSearcher,
     ChunkReranker,
@@ -103,6 +103,7 @@ def build_local_backend_dependencies(selected_documents: list[dict[str, Any]] | 
         rerank_chunks=retrieval_tools.rerank_chunks,
         retrieve_parent_chunks=retrieval_tools.retrieve_parent_chunks,
         compress_context=compress_context,
+        plan_decomposition=llm_assisted_decomposition_plan,
     )
 
     scope_meta = {

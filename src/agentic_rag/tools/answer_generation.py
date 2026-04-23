@@ -12,8 +12,9 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, Protocol
 
+from agentic_rag.llm import PromptLLMClient, build_local_prompt_llm_from_env, local_llm_config_from_env
 from agentic_rag.tools.evidence_units import EvidenceUnit, build_evidence_units
 
 @dataclass(slots=True, frozen=True)
@@ -41,6 +42,11 @@ class GenerateAnswerResult:
     citations: list[AnswerCitation]
     warnings: list[str]
 
+
+
+
+class AnswerDraftingLLM(Protocol):
+    def complete(self, prompt: str, *, system_prompt: str | None = None) -> str: ...
 
 @dataclass(slots=True)
 class _ChronologyEvent:
@@ -74,6 +80,8 @@ class LegalAnswerSynthesizer:
         "notwithstanding",
         "only if",
     )
+    llm_client: AnswerDraftingLLM | None = None
+    llm_provider_label: str = "deterministic"
 
     def generate(self, context: Sequence[object], query: str) -> GenerateAnswerResult:
         """Generate a grounded legal answer from retrieved context only."""
@@ -172,9 +180,24 @@ class LegalAnswerSynthesizer:
                 + ("\n".join(caveats) if caveats else "- None identified within the retrieved context.")
             )
 
+            llm_warning: str | None = None
+            drafted = self._draft_grounded_answer_with_llm(
+                query=normalized_query,
+                supporting_lines=supporting_lines,
+                caveats=caveats,
+                fallback_answer=answer_text,
+            )
+            if drafted is not None:
+                answer_text = drafted
+                llm_warning = f"answer_synthesis_path:llm:{self.llm_provider_label}"
+            elif self.llm_client is not None:
+                llm_warning = f"answer_synthesis_path:deterministic_fallback:{self.llm_provider_label}"
+
             if not citations:
                 grounded = False
 
+            if llm_warning is not None:
+                warnings.append(llm_warning)
             return GenerateAnswerResult(
                 answer_text=answer_text,
                 grounded=grounded,
@@ -184,6 +207,37 @@ class LegalAnswerSynthesizer:
             )
         except Exception as exc:  # pragma: no cover - exercised in explicit fallback test
             return self._failure_response(str(exc))
+
+    def _draft_grounded_answer_with_llm(
+        self,
+        *,
+        query: str,
+        supporting_lines: Sequence[str],
+        caveats: Sequence[str],
+        fallback_answer: str,
+    ) -> str | None:
+        if self.llm_client is None or not supporting_lines:
+            return None
+        prompt = (
+            "Draft a concise legal answer using ONLY the provided evidence bullets. "
+            "Do not add new facts. Keep caveats explicit. Return plain text only.\n\n"
+            f"QUESTION:\n{query}\n\n"
+            "EVIDENCE BULLETS:\n"
+            + "\n".join(supporting_lines)
+            + "\n\nCAVEATS:\n"
+            + ("\n".join(caveats) if caveats else "- None")
+        )
+        try:
+            drafted = self.llm_client.complete(
+                prompt,
+                system_prompt="You are a grounded legal drafting assistant. Use evidence only.",
+            )
+            cleaned = str(drafted or "").strip()
+            if not cleaned:
+                return None
+            return cleaned
+        except Exception:
+            return None
 
     def _generate_party_role_answer(
         self,
@@ -1563,7 +1617,11 @@ class LegalAnswerSynthesizer:
         )
 
 
-_DEFAULT_ANSWER_SYNTHESIZER = LegalAnswerSynthesizer()
+_LOCAL_LLM = local_llm_config_from_env()
+_DEFAULT_ANSWER_SYNTHESIZER = LegalAnswerSynthesizer(
+    llm_client=build_local_prompt_llm_from_env(),
+    llm_provider_label=f"{_LOCAL_LLM.provider}:{_LOCAL_LLM.model}",
+)
 
 
 @dataclass(slots=True)
