@@ -1,7 +1,7 @@
 from .local_provider import (
     ChatProvider,
+    LlamaCppChatProvider,
     LocalLLMConfig,
-    OllamaChatProvider,
     PromptLLMClient,
     build_local_prompt_llm,
     build_local_prompt_llm_from_env,
@@ -10,8 +10,8 @@ from .local_provider import (
 
 __all__ = [
     "ChatProvider",
+    "LlamaCppChatProvider",
     "LocalLLMConfig",
-    "OllamaChatProvider",
     "PromptLLMClient",
     "build_local_prompt_llm",
     "build_local_prompt_llm_from_env",

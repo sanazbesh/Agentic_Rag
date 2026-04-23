@@ -66,24 +66,35 @@ def test_local_llm_config_loads_from_env() -> None:
     cfg = local_llm_config_from_env(
         {
             "AGENTIC_RAG_LOCAL_LLM_ENABLED": "true",
-            "AGENTIC_RAG_LOCAL_LLM_PROVIDER": "ollama",
-            "AGENTIC_RAG_LOCAL_LLM_MODEL": "llama3.1:8b-instruct-q4_0",
-            "AGENTIC_RAG_LOCAL_LLM_BASE_URL": "http://localhost:11434",
+            "AGENTIC_RAG_LOCAL_LLM_PROVIDER": "llama_cpp",
+            "AGENTIC_RAG_LOCAL_LLM_MODEL_PATH": "/models/llama3.1-8b-instruct-q4_0.gguf",
+            "AGENTIC_RAG_LOCAL_LLM_N_CTX": "8192",
             "AGENTIC_RAG_LOCAL_LLM_TEMPERATURE": "0.2",
             "AGENTIC_RAG_LOCAL_LLM_TIMEOUT_SECONDS": "12",
+            "AGENTIC_RAG_LOCAL_LLM_MAX_TOKENS": "384",
+            "AGENTIC_RAG_LOCAL_LLM_N_GPU_LAYERS": "24",
+            "AGENTIC_RAG_LOCAL_LLM_THREADS": "8",
         }
     )
 
     assert cfg.enabled is True
-    assert cfg.provider == "ollama"
-    assert cfg.model == "llama3.1:8b-instruct-q4_0"
-    assert cfg.base_url == "http://localhost:11434"
+    assert cfg.provider == "llama_cpp"
+    assert cfg.model_path.endswith("llama3.1-8b-instruct-q4_0.gguf")
+    assert cfg.n_ctx == 8192
     assert cfg.temperature == 0.2
     assert cfg.timeout_seconds == 12
+    assert cfg.max_tokens == 384
+    assert cfg.n_gpu_layers == 24
+    assert cfg.threads == 8
 
 
 def test_build_local_prompt_llm_returns_none_when_disabled() -> None:
     client = build_local_prompt_llm(LocalLLMConfig(enabled=False))
+    assert client is None
+
+
+def test_build_local_prompt_llm_returns_none_for_missing_model_path() -> None:
+    client = build_local_prompt_llm(LocalLLMConfig(enabled=True, provider="llama_cpp", model_path="/missing/model.gguf"))
     assert client is None
 
 
@@ -112,7 +123,7 @@ def test_decomposition_planning_falls_back_when_provider_unavailable(monkeypatch
     monkeypatch.setattr(
         rg,
         "local_llm_config_from_env",
-        lambda: LocalLLMConfig(enabled=True, provider="ollama", model="mistral:7b"),
+        lambda: LocalLLMConfig(enabled=True, provider="llama_cpp", model_path="/models/mistral.gguf"),
     )
 
     plan = llm_assisted_decomposition_plan(
@@ -140,7 +151,7 @@ def test_decomposition_planning_uses_provider_when_enabled(monkeypatch) -> None:
     monkeypatch.setattr(
         rg,
         "local_llm_config_from_env",
-        lambda: LocalLLMConfig(enabled=True, provider="ollama", model="llama3.1:8b"),
+        lambda: LocalLLMConfig(enabled=True, provider="llama_cpp", model_path="/models/llama3.1.gguf"),
     )
 
     plan = llm_assisted_decomposition_plan(
@@ -163,7 +174,7 @@ def test_decomposition_planning_attaches_provider_model_metadata(monkeypatch) ->
     monkeypatch.setattr(
         rg,
         "local_llm_config_from_env",
-        lambda: LocalLLMConfig(enabled=True, provider="ollama", model="llama3.1:8b"),
+        lambda: LocalLLMConfig(enabled=True, provider="llama_cpp", model_path="/models/llama3.1.gguf"),
     )
 
     plan = llm_assisted_decomposition_plan(
@@ -175,13 +186,13 @@ def test_decomposition_planning_attaches_provider_model_metadata(monkeypatch) ->
     )
 
     assert plan is not None
-    assert "planner_path:deterministic_fallback:ollama:llama3.1:8b" in plan.planner_notes
+    assert "planner_path:deterministic_fallback:llama_cpp:/models/llama3.1.gguf" in plan.planner_notes
 
 
 def test_final_synthesis_uses_provider_with_deterministic_citations() -> None:
     synth = LegalAnswerSynthesizer(
         llm_client=_FakePromptClient("Grounded draft from provided evidence only."),
-        llm_provider_label="ollama:llama3.1:8b",
+        llm_provider_label="llama_cpp:/models/llama3.1.gguf",
     )
 
     result = synth.generate([_parent()], "What law governs the agreement?")
@@ -194,7 +205,7 @@ def test_final_synthesis_uses_provider_with_deterministic_citations() -> None:
 def test_final_synthesis_has_deterministic_fallback_when_provider_fails() -> None:
     synth = LegalAnswerSynthesizer(
         llm_client=_FakePromptClient("", should_raise=True),
-        llm_provider_label="ollama:llama3.1:8b",
+        llm_provider_label="llama_cpp:/models/llama3.1.gguf",
     )
 
     result = synth.generate([_parent()], "What law governs the agreement?")

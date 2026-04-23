@@ -70,11 +70,14 @@ def initialize_session_state() -> None:
         "latest_debug_payload": None,
         "last_run": None,
         "local_llm_enabled": False,
-        "local_llm_provider": "ollama",
-        "local_llm_model": "llama3.1:8b",
-        "local_llm_base_url": "http://127.0.0.1:11434",
+        "local_llm_provider": "llama_cpp",
+        "local_llm_model_path": "",
+        "local_llm_n_ctx": 4096,
         "local_llm_temperature": 0.0,
         "local_llm_timeout_seconds": 8.0,
+        "local_llm_max_tokens": 512,
+        "local_llm_n_gpu_layers": 0,
+        "local_llm_threads": 0,
         "local_llm_stage_rewrite": True,
         "local_llm_stage_decomposition": True,
         "local_llm_stage_synthesis": True,
@@ -182,21 +185,23 @@ def render_sidebar(
     )
     st.session_state.local_llm_enabled = enable_local_llm
 
-    st.sidebar.text_input("Provider", value="ollama", disabled=True)
-    local_llm_model = st.sidebar.text_input(
-        "Ollama model",
-        value=st.session_state.local_llm_model,
+    st.sidebar.text_input("Provider", value="llama.cpp (llama-cpp-python)", disabled=True)
+    local_llm_model_path = st.sidebar.text_input(
+        "GGUF model path",
+        value=st.session_state.local_llm_model_path,
         disabled=llm_controls_disabled,
     )
-    local_llm_base_url = st.sidebar.text_input(
-        "Ollama base URL",
-        value=st.session_state.local_llm_base_url,
-        disabled=llm_controls_disabled,
-    )
-    st.session_state.local_llm_model = local_llm_model
-    st.session_state.local_llm_base_url = local_llm_base_url
+    st.session_state.local_llm_model_path = local_llm_model_path
 
     with st.sidebar.expander("Advanced local LLM settings", expanded=False):
+        local_llm_n_ctx = st.number_input(
+            "Context window (n_ctx)",
+            min_value=128,
+            max_value=32768,
+            value=int(st.session_state.local_llm_n_ctx),
+            step=128,
+            disabled=llm_controls_disabled,
+        )
         local_llm_temperature = st.number_input(
             "Temperature",
             min_value=0.0,
@@ -211,6 +216,30 @@ def render_sidebar(
             max_value=120.0,
             value=float(st.session_state.local_llm_timeout_seconds),
             step=0.5,
+            disabled=llm_controls_disabled,
+        )
+        local_llm_max_tokens = st.number_input(
+            "Max tokens",
+            min_value=32,
+            max_value=4096,
+            value=int(st.session_state.local_llm_max_tokens),
+            step=32,
+            disabled=llm_controls_disabled,
+        )
+        local_llm_n_gpu_layers = st.number_input(
+            "n_gpu_layers",
+            min_value=0,
+            max_value=200,
+            value=int(st.session_state.local_llm_n_gpu_layers),
+            step=1,
+            disabled=llm_controls_disabled,
+        )
+        local_llm_threads = st.number_input(
+            "Threads (0 = auto)",
+            min_value=0,
+            max_value=128,
+            value=int(st.session_state.local_llm_threads),
+            step=1,
             disabled=llm_controls_disabled,
         )
         use_llm_rewrite = st.toggle(
@@ -230,17 +259,24 @@ def render_sidebar(
         )
     st.session_state.local_llm_temperature = float(local_llm_temperature)
     st.session_state.local_llm_timeout_seconds = float(local_llm_timeout_seconds)
+    st.session_state.local_llm_n_ctx = int(local_llm_n_ctx)
+    st.session_state.local_llm_max_tokens = int(local_llm_max_tokens)
+    st.session_state.local_llm_n_gpu_layers = int(local_llm_n_gpu_layers)
+    st.session_state.local_llm_threads = int(local_llm_threads)
     st.session_state.local_llm_stage_rewrite = use_llm_rewrite
     st.session_state.local_llm_stage_decomposition = use_llm_decomposition
     st.session_state.local_llm_stage_synthesis = use_llm_synthesis
 
     local_llm_settings = effective_local_llm_settings(
         enable_local_llm=enable_local_llm,
-        provider="ollama",
-        model=local_llm_model,
-        base_url=local_llm_base_url,
+        provider="llama_cpp",
+        model_path=local_llm_model_path,
         temperature=float(local_llm_temperature),
         timeout_seconds=float(local_llm_timeout_seconds),
+        n_ctx=int(local_llm_n_ctx),
+        max_tokens=int(local_llm_max_tokens),
+        n_gpu_layers=int(local_llm_n_gpu_layers),
+        threads=None if int(local_llm_threads) <= 0 else int(local_llm_threads),
         use_rewrite=use_llm_rewrite,
         use_decomposition=use_llm_decomposition,
         use_synthesis=use_llm_synthesis,
@@ -323,10 +359,10 @@ def render_runtime_mode_status(*, use_mock_backend: bool, debug_payload: dict[st
         st.caption("Runtime mode: Deterministic mode.")
         return
     mode = str(llm_runtime.get("effective_mode") or "deterministic").strip().lower()
-    stages = [stage for stage in list(llm_runtime.get("stages_using_ollama", [])) if isinstance(stage, str)]
-    if mode == "ollama_assisted":
+    stages = [stage for stage in list(llm_runtime.get("stages_using_local_llm", [])) if isinstance(stage, str)]
+    if mode == "llama_cpp_assisted":
         stage_label = ", ".join(stages) if stages else "(none)"
-        st.success(f"Runtime mode: Ollama-assisted mode. Stages using Ollama: {stage_label}.")
+        st.success(f"Runtime mode: llama.cpp-assisted mode. Stages using llama.cpp: {stage_label}.")
     else:
         st.caption("Runtime mode: Deterministic mode.")
 

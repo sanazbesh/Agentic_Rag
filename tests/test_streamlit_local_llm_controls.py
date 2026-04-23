@@ -9,26 +9,27 @@ from ui.local_backend import effective_local_llm_settings
 def test_local_llm_session_defaults_persist_existing_values(monkeypatch) -> None:
     session_state: dict[str, Any] = {
         "local_llm_enabled": True,
-        "local_llm_model": "mistral:7b",
-        "local_llm_base_url": "http://localhost:9999",
+        "local_llm_model_path": "/models/mistral.gguf",
     }
     monkeypatch.setattr(components.st, "session_state", session_state, raising=False)
 
     components.initialize_session_state()
 
     assert session_state["local_llm_enabled"] is True
-    assert session_state["local_llm_model"] == "mistral:7b"
-    assert session_state["local_llm_base_url"] == "http://localhost:9999"
+    assert session_state["local_llm_model_path"] == "/models/mistral.gguf"
 
 
-def test_effective_runtime_settings_switch_between_deterministic_and_ollama() -> None:
+def test_effective_runtime_settings_switch_between_deterministic_and_llama_cpp() -> None:
     deterministic = effective_local_llm_settings(
         enable_local_llm=False,
-        provider="ollama",
-        model="llama3.1:8b",
-        base_url="http://localhost:11434",
+        provider="llama_cpp",
+        model_path="/models/llama.gguf",
         temperature=0.0,
         timeout_seconds=8.0,
+        n_ctx=4096,
+        max_tokens=512,
+        n_gpu_layers=0,
+        threads=None,
         use_rewrite=True,
         use_decomposition=True,
         use_synthesis=True,
@@ -36,11 +37,14 @@ def test_effective_runtime_settings_switch_between_deterministic_and_ollama() ->
     )
     assisted = effective_local_llm_settings(
         enable_local_llm=True,
-        provider="ollama",
-        model="llama3.1:8b",
-        base_url="http://localhost:11434",
+        provider="llama_cpp",
+        model_path="/models/llama.gguf",
         temperature=0.2,
         timeout_seconds=12.0,
+        n_ctx=8192,
+        max_tokens=256,
+        n_gpu_layers=20,
+        threads=4,
         use_rewrite=True,
         use_decomposition=False,
         use_synthesis=True,
@@ -64,10 +68,10 @@ def test_runtime_status_reflects_effective_backend_mode(monkeypatch) -> None:
         use_mock_backend=False,
         debug_payload={
             "local_llm_runtime": {
-                "effective_mode": "ollama_assisted",
-                "stages_using_ollama": ["rewrite", "synthesis"],
+                "effective_mode": "llama_cpp_assisted",
+                "stages_using_local_llm": ["rewrite", "synthesis"],
             }
         },
     )
 
-    assert any(kind == "success" and "Ollama-assisted" in message for kind, message in calls)
+    assert any(kind == "success" and "llama.cpp-assisted" in message for kind, message in calls)

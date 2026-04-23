@@ -74,11 +74,14 @@ def test_local_backend_hybrid_filter_supports_selected_document_ids(tmp_path: Pa
 def test_effective_local_llm_settings_respects_mock_mode() -> None:
     settings = effective_local_llm_settings(
         enable_local_llm=True,
-        provider="ollama",
-        model="llama3.1:8b",
-        base_url="http://localhost:11434",
+        provider="llama_cpp",
+        model_path="/models/llama.gguf",
         temperature=0.1,
         timeout_seconds=9.0,
+        n_ctx=4096,
+        max_tokens=512,
+        n_gpu_layers=0,
+        threads=None,
         use_rewrite=True,
         use_decomposition=True,
         use_synthesis=True,
@@ -101,8 +104,8 @@ def test_local_llm_stage_toggles_only_apply_to_eligible_stages(tmp_path: Path) -
     settings = LocalLLMRuntimeSettings(
         ui_enabled=True,
         enabled=True,
-        provider="ollama",
-        model="llama3.1:8b",
+        provider="llama_cpp",
+        model_path="/models/llama.gguf",
         stages=LocalLLMStageToggles(rewrite=False, decomposition=False, synthesis=False),
     )
     build = build_local_backend_dependencies([descriptor], local_llm_settings=settings)
@@ -120,8 +123,8 @@ def test_local_llm_stage_toggles_only_apply_to_eligible_stages(tmp_path: Path) -
     assert not any(item.startswith("answer_synthesis_path:llm:") for item in final_warnings)
 
 
-def test_ollama_unavailability_falls_back_without_crash(tmp_path: Path, monkeypatch) -> None:
-    from agentic_rag.llm.local_provider import OllamaChatProvider
+def test_llama_cpp_unavailability_falls_back_without_crash(tmp_path: Path, monkeypatch) -> None:
+    from agentic_rag.llm.local_provider import LlamaCppChatProvider
 
     doc_path = tmp_path / "msa.md"
     _write_text_file(
@@ -131,14 +134,15 @@ def test_ollama_unavailability_falls_back_without_crash(tmp_path: Path, monkeypa
     descriptor = {"id": "uploaded:msa.md", "name": "msa.md", "path": str(doc_path), "type": "md", "source": "uploaded"}
 
     def _boom(*args, **kwargs):  # type: ignore[no-untyped-def]
-        raise RuntimeError("ollama_down")
+        raise RuntimeError("llama_cpp_down")
 
-    monkeypatch.setattr(OllamaChatProvider, "chat", _boom)
+    monkeypatch.setattr(LlamaCppChatProvider, "chat", _boom)
+    monkeypatch.setattr("pathlib.Path.is_file", lambda _: True)
     settings = LocalLLMRuntimeSettings(
         ui_enabled=True,
         enabled=True,
-        provider="ollama",
-        model="llama3.1:8b",
+        provider="llama_cpp",
+        model_path="/models/llama.gguf",
         stages=LocalLLMStageToggles(rewrite=True, decomposition=True, synthesis=True),
     )
     build = build_local_backend_dependencies([descriptor], local_llm_settings=settings)
@@ -161,11 +165,14 @@ def test_debug_payload_includes_local_llm_runtime_metadata(tmp_path: Path) -> No
 
     settings = effective_local_llm_settings(
         enable_local_llm=True,
-        provider="ollama",
-        model="llama3.1:8b",
-        base_url="http://localhost:11434",
+        provider="llama_cpp",
+        model_path="/models/llama.gguf",
         temperature=0.0,
         timeout_seconds=8.0,
+        n_ctx=4096,
+        max_tokens=512,
+        n_gpu_layers=0,
+        threads=None,
         use_rewrite=True,
         use_decomposition=True,
         use_synthesis=True,
@@ -179,6 +186,40 @@ def test_debug_payload_includes_local_llm_runtime_metadata(tmp_path: Path) -> No
     )
     payload = build_real_debug_payload(latest_state=state, selected_documents=[descriptor], scope_meta=build.scope_meta)
     runtime = payload["local_llm_runtime"]
-    assert runtime["provider"] == "ollama"
-    assert runtime["model"] == "llama3.1:8b"
+    assert runtime["provider"] == "llama_cpp"
+    assert runtime["model_path"] == "/models/llama.gguf"
     assert runtime["stage_toggles"]["rewrite"] is True
+
+
+def test_invalid_model_path_uses_deterministic_fallback(tmp_path: Path) -> None:
+    doc_path = tmp_path / "msa.md"
+    _write_text_file(doc_path, "# MSA\n\n## Term\nTerm is one year.\n")
+    descriptor = {"id": "uploaded:msa.md", "name": "msa.md", "path": str(doc_path), "type": "md", "source": "uploaded"}
+
+    settings = effective_local_llm_settings(
+        enable_local_llm=True,
+        provider="llama_cpp",
+        model_path="/does/not/exist/model.gguf",
+        temperature=0.0,
+        timeout_seconds=8.0,
+        n_ctx=4096,
+        max_tokens=512,
+        n_gpu_layers=0,
+        threads=None,
+        use_rewrite=True,
+        use_decomposition=True,
+        use_synthesis=True,
+        mock_backend_active=False,
+    )
+    build = build_local_backend_dependencies([descriptor], local_llm_settings=settings)
+    _, state = run_legal_rag_turn_with_state(
+        query="What is the term?",
+        dependencies=build.dependencies,
+        selected_documents=[descriptor],
+    )
+
+    runtime = build_real_debug_payload(latest_state=state, selected_documents=[descriptor], scope_meta=build.scope_meta)[
+        "local_llm_runtime"
+    ]
+    assert runtime["effective_enabled"] is True
+    assert runtime["stages_using_local_llm"] == []

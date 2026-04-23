@@ -799,8 +799,9 @@ def llm_assisted_decomposition_plan(
 
     config = local_llm_config_from_env()
     client = build_local_prompt_llm_from_env()
+    provider_model = f"{config.provider}:{config.model_path or 'unset_model_path'}"
     if client is None:
-        return _copy_plan_with_notes(deterministic, f"planner_path:deterministic_fallback:{config.provider}:{config.model}")
+        return _copy_plan_with_notes(deterministic, f"planner_path:deterministic_fallback:{provider_model}")
 
     prompt = (
         "Plan legal retrieval subqueries for the provided root question. "
@@ -814,7 +815,7 @@ def llm_assisted_decomposition_plan(
         payload = json.loads(raw)
         raw_subqueries = payload.get("subqueries")
         if not isinstance(raw_subqueries, list):
-            return _copy_plan_with_notes(_copy_plan_with_notes(deterministic, f"planner_path:deterministic_fallback:{config.provider}:{config.model}"), "planner_llm_invalid_payload")
+            return _copy_plan_with_notes(_copy_plan_with_notes(deterministic, f"planner_path:deterministic_fallback:{provider_model}"), "planner_llm_invalid_payload")
         subqueries: list[SubQueryPlan] = []
         for index, item in enumerate(raw_subqueries[:4], start=1):
             if not isinstance(item, Mapping):
@@ -830,7 +831,7 @@ def llm_assisted_decomposition_plan(
                 )
             )
         if not subqueries:
-            return _copy_plan_with_notes(_copy_plan_with_notes(deterministic, f"planner_path:deterministic_fallback:{config.provider}:{config.model}"), "planner_llm_empty_subqueries")
+            return _copy_plan_with_notes(_copy_plan_with_notes(deterministic, f"planner_path:deterministic_fallback:{provider_model}"), "planner_llm_empty_subqueries")
 
         strategy_value = str(payload.get("strategy") or deterministic.strategy or "conjunctive")
         strategy = strategy_value if strategy_value in {"conjunctive","comparison","temporal","exception_chain","cross_clause","definition_plus_application","amendment_vs_base"} else (deterministic.strategy or "conjunctive")
@@ -839,11 +840,11 @@ def llm_assisted_decomposition_plan(
             root_question=deterministic.root_question,
             strategy=strategy,
             subqueries=subqueries,
-            planner_notes=[*deterministic.planner_notes, f"planner_path:llm:{config.provider}:{config.model}"],
+            planner_notes=[*deterministic.planner_notes, f"planner_path:llm:{provider_model}"],
         )
         return llm_plan
     except Exception:
-        return _copy_plan_with_notes(_copy_plan_with_notes(deterministic, f"planner_path:deterministic_fallback:{config.provider}:{config.model}"), "planner_llm_error_fallback")
+        return _copy_plan_with_notes(_copy_plan_with_notes(deterministic, f"planner_path:deterministic_fallback:{provider_model}"), "planner_llm_error_fallback")
 
 class RetrievalGraphNodes:
     """Explicit node implementations for a deterministic retrieval workflow graph."""

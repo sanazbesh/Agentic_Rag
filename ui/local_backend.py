@@ -48,11 +48,14 @@ class LocalLLMStageToggles:
 class LocalLLMRuntimeSettings:
     ui_enabled: bool = False
     enabled: bool = False
-    provider: str = "ollama"
-    model: str = "llama3.1:8b"
-    base_url: str = "http://127.0.0.1:11434"
+    provider: str = "llama_cpp"
+    model_path: str = ""
+    n_ctx: int = 4096
     temperature: float = 0.0
     timeout_seconds: float = 8.0
+    max_tokens: int = 512
+    n_gpu_layers: int = 0
+    threads: int | None = None
     stages: LocalLLMStageToggles = LocalLLMStageToggles()
     mock_backend_active: bool = False
 
@@ -65,10 +68,13 @@ class LocalLLMRuntimeSettings:
         return LocalLLMConfig(
             enabled=self.enabled,
             provider=self.provider,
-            model=self.model,
-            base_url=self.base_url,
+            model_path=self.model_path,
+            n_ctx=self.n_ctx,
             temperature=self.temperature,
             timeout_seconds=self.timeout_seconds,
+            max_tokens=self.max_tokens,
+            n_gpu_layers=self.n_gpu_layers,
+            threads=self.threads,
         )
 
 
@@ -76,26 +82,31 @@ def effective_local_llm_settings(
     *,
     enable_local_llm: bool,
     provider: str,
-    model: str,
-    base_url: str,
+    model_path: str,
     temperature: float,
     timeout_seconds: float,
+    n_ctx: int,
+    max_tokens: int,
+    n_gpu_layers: int,
+    threads: int | None,
     use_rewrite: bool,
     use_decomposition: bool,
     use_synthesis: bool,
     mock_backend_active: bool,
 ) -> LocalLLMRuntimeSettings:
-    provider_name = (provider or "ollama").strip().lower() or "ollama"
-    safe_model = (model or "llama3.1:8b").strip() or "llama3.1:8b"
-    safe_base_url = (base_url or "http://127.0.0.1:11434").strip() or "http://127.0.0.1:11434"
+    provider_name = (provider or "llama_cpp").strip().lower() or "llama_cpp"
+    safe_model_path = (model_path or "").strip()
     return LocalLLMRuntimeSettings(
         ui_enabled=bool(enable_local_llm),
         enabled=bool(enable_local_llm) and not mock_backend_active,
         provider=provider_name,
-        model=safe_model,
-        base_url=safe_base_url,
+        model_path=safe_model_path,
+        n_ctx=max(128, int(n_ctx)),
         temperature=float(temperature),
         timeout_seconds=max(0.5, float(timeout_seconds)),
+        max_tokens=max(32, int(max_tokens)),
+        n_gpu_layers=max(0, int(n_gpu_layers)),
+        threads=None if threads is None else max(1, int(threads)),
         stages=LocalLLMStageToggles(
             rewrite=bool(use_rewrite),
             decomposition=bool(use_decomposition),
@@ -173,7 +184,7 @@ def build_local_backend_dependencies(
         return filtered
 
     llm_settings = local_llm_settings or LocalLLMRuntimeSettings()
-    provider_label = f"{llm_settings.provider}:{llm_settings.model}"
+    provider_label = f"{llm_settings.provider}:{llm_settings.model_path or 'unset_model_path'}"
     llm_client = build_local_prompt_llm(llm_settings.as_local_llm_config()) if llm_settings.enabled else None
 
     rewrite_service = QueryTransformationService(
@@ -211,10 +222,13 @@ def build_local_backend_dependencies(
             "ui_enabled": llm_settings.ui_enabled,
             "effective_enabled": llm_settings.enabled,
             "provider": llm_settings.provider,
-            "model": llm_settings.model,
-            "base_url": llm_settings.base_url,
+            "model_path": llm_settings.model_path,
+            "n_ctx": llm_settings.n_ctx,
             "temperature": llm_settings.temperature,
             "timeout_seconds": llm_settings.timeout_seconds,
+            "max_tokens": llm_settings.max_tokens,
+            "n_gpu_layers": llm_settings.n_gpu_layers,
+            "threads": llm_settings.threads,
             "stage_toggles": {
                 "rewrite": llm_settings.stages.rewrite,
                 "decomposition": llm_settings.stages.decomposition,
@@ -250,10 +264,13 @@ def _temporary_local_llm_env(settings: LocalLLMRuntimeSettings):
     env_updates = {
         "AGENTIC_RAG_LOCAL_LLM_ENABLED": "true" if settings.enabled else "false",
         "AGENTIC_RAG_LOCAL_LLM_PROVIDER": settings.provider,
-        "AGENTIC_RAG_LOCAL_LLM_MODEL": settings.model,
-        "AGENTIC_RAG_LOCAL_LLM_BASE_URL": settings.base_url,
+        "AGENTIC_RAG_LOCAL_LLM_MODEL_PATH": settings.model_path,
+        "AGENTIC_RAG_LOCAL_LLM_N_CTX": str(settings.n_ctx),
         "AGENTIC_RAG_LOCAL_LLM_TEMPERATURE": str(settings.temperature),
         "AGENTIC_RAG_LOCAL_LLM_TIMEOUT_SECONDS": str(settings.timeout_seconds),
+        "AGENTIC_RAG_LOCAL_LLM_MAX_TOKENS": str(settings.max_tokens),
+        "AGENTIC_RAG_LOCAL_LLM_N_GPU_LAYERS": str(settings.n_gpu_layers),
+        "AGENTIC_RAG_LOCAL_LLM_THREADS": "" if settings.threads is None else str(settings.threads),
     }
     prior = {key: os.environ.get(key) for key in env_updates}
     os.environ.update(env_updates)

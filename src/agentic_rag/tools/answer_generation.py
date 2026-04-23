@@ -1620,7 +1620,7 @@ class LegalAnswerSynthesizer:
 _LOCAL_LLM = local_llm_config_from_env()
 _DEFAULT_ANSWER_SYNTHESIZER = LegalAnswerSynthesizer(
     llm_client=build_local_prompt_llm_from_env(),
-    llm_provider_label=f"{_LOCAL_LLM.provider}:{_LOCAL_LLM.model}",
+    llm_provider_label=f"{_LOCAL_LLM.provider}:{_LOCAL_LLM.model_path or 'unset_model_path'}",
 )
 
 
