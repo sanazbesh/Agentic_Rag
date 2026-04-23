@@ -7,9 +7,12 @@ so users can run non-mock retrieval + grounded answering without external servic
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 from typing import Any
+from contextlib import contextmanager
 
+from agentic_rag.llm import LocalLLMConfig, build_local_prompt_llm
 from agentic_rag.chunking import MarkdownParentChildChunker
 from agentic_rag.ingestion import MarkdownDocumentIngestor, PDFDocumentIngestor
 from agentic_rag.orchestration.legal_rag_graph import LegalRagDependencies
@@ -24,7 +27,8 @@ from agentic_rag.retrieval import (
     ParentChildRetrievalTools,
     ParentChunkStore,
 )
-from agentic_rag.tools import compress_context, extract_legal_entities, rewrite_query
+from agentic_rag.tools import LegalAnswerSynthesizer, compress_context, extract_legal_entities
+from agentic_rag.tools.query_intelligence import QueryTransformationService
 
 
 @dataclass(slots=True)
@@ -33,7 +37,79 @@ class LocalBackendBuildResult:
     scope_meta: dict[str, Any]
 
 
-def build_local_backend_dependencies(selected_documents: list[dict[str, Any]] | None) -> LocalBackendBuildResult:
+@dataclass(slots=True, frozen=True)
+class LocalLLMStageToggles:
+    rewrite: bool = True
+    decomposition: bool = True
+    synthesis: bool = True
+
+
+@dataclass(slots=True, frozen=True)
+class LocalLLMRuntimeSettings:
+    ui_enabled: bool = False
+    enabled: bool = False
+    provider: str = "ollama"
+    model: str = "llama3.1:8b"
+    base_url: str = "http://127.0.0.1:11434"
+    temperature: float = 0.0
+    timeout_seconds: float = 8.0
+    stages: LocalLLMStageToggles = LocalLLMStageToggles()
+    mock_backend_active: bool = False
+
+    def is_stage_enabled(self, stage: str) -> bool:
+        if not self.enabled:
+            return False
+        return bool(getattr(self.stages, stage, False))
+
+    def as_local_llm_config(self) -> LocalLLMConfig:
+        return LocalLLMConfig(
+            enabled=self.enabled,
+            provider=self.provider,
+            model=self.model,
+            base_url=self.base_url,
+            temperature=self.temperature,
+            timeout_seconds=self.timeout_seconds,
+        )
+
+
+def effective_local_llm_settings(
+    *,
+    enable_local_llm: bool,
+    provider: str,
+    model: str,
+    base_url: str,
+    temperature: float,
+    timeout_seconds: float,
+    use_rewrite: bool,
+    use_decomposition: bool,
+    use_synthesis: bool,
+    mock_backend_active: bool,
+) -> LocalLLMRuntimeSettings:
+    provider_name = (provider or "ollama").strip().lower() or "ollama"
+    safe_model = (model or "llama3.1:8b").strip() or "llama3.1:8b"
+    safe_base_url = (base_url or "http://127.0.0.1:11434").strip() or "http://127.0.0.1:11434"
+    return LocalLLMRuntimeSettings(
+        ui_enabled=bool(enable_local_llm),
+        enabled=bool(enable_local_llm) and not mock_backend_active,
+        provider=provider_name,
+        model=safe_model,
+        base_url=safe_base_url,
+        temperature=float(temperature),
+        timeout_seconds=max(0.5, float(timeout_seconds)),
+        stages=LocalLLMStageToggles(
+            rewrite=bool(use_rewrite),
+            decomposition=bool(use_decomposition),
+            synthesis=bool(use_synthesis),
+        ),
+        mock_backend_active=mock_backend_active,
+    )
+
+
+def build_local_backend_dependencies(
+    selected_documents: list[dict[str, Any]] | None,
+    *,
+    local_llm_settings: LocalLLMRuntimeSettings | None = None,
+) -> LocalBackendBuildResult:
     """Build LegalRagDependencies from selected local documents.
 
     Supported file types: `.md`, `.txt`, `.pdf`.
@@ -96,14 +172,32 @@ def build_local_backend_dependencies(selected_documents: list[dict[str, Any]] | 
                 filtered.append(result)
         return filtered
 
+    llm_settings = local_llm_settings or LocalLLMRuntimeSettings()
+    provider_label = f"{llm_settings.provider}:{llm_settings.model}"
+    llm_client = build_local_prompt_llm(llm_settings.as_local_llm_config()) if llm_settings.enabled else None
+
+    rewrite_service = QueryTransformationService(
+        llm_client=llm_client if llm_settings.is_stage_enabled("rewrite") else None,
+        llm_provider_label=provider_label,
+    )
+    if llm_settings.is_stage_enabled("decomposition"):
+        decomposition_planner = _build_stage_scoped_decomposition_planner(llm_settings)
+    else:
+        decomposition_planner = _deterministic_decomposition_plan
+
+    answer_synthesizer = LegalAnswerSynthesizer(
+        llm_client=llm_client if llm_settings.is_stage_enabled("synthesis") else None,
+        llm_provider_label=provider_label,
+    )
+
     retrieval_dependencies = RetrievalDependencies(
-        rewrite_query=rewrite_query,
+        rewrite_query=rewrite_service.rewrite_query,
         extract_legal_entities=extract_legal_entities,
         hybrid_search=_hybrid_search,
         rerank_chunks=retrieval_tools.rerank_chunks,
         retrieve_parent_chunks=retrieval_tools.retrieve_parent_chunks,
         compress_context=compress_context,
-        plan_decomposition=llm_assisted_decomposition_plan,
+        plan_decomposition=decomposition_planner,
     )
 
     scope_meta = {
@@ -113,8 +207,64 @@ def build_local_backend_dependencies(selected_documents: list[dict[str, Any]] | 
         "parent_chunk_count": len(parent_lookup),
         "child_chunk_count": len(child_records),
         "warnings": warnings,
+        "local_llm": {
+            "ui_enabled": llm_settings.ui_enabled,
+            "effective_enabled": llm_settings.enabled,
+            "provider": llm_settings.provider,
+            "model": llm_settings.model,
+            "base_url": llm_settings.base_url,
+            "temperature": llm_settings.temperature,
+            "timeout_seconds": llm_settings.timeout_seconds,
+            "stage_toggles": {
+                "rewrite": llm_settings.stages.rewrite,
+                "decomposition": llm_settings.stages.decomposition,
+                "synthesis": llm_settings.stages.synthesis,
+            },
+        },
     }
-    return LocalBackendBuildResult(dependencies=LegalRagDependencies(retrieval=retrieval_dependencies), scope_meta=scope_meta)
+    return LocalBackendBuildResult(
+        dependencies=LegalRagDependencies(
+            retrieval=retrieval_dependencies,
+            generate_grounded_answer=answer_synthesizer.generate,
+        ),
+        scope_meta=scope_meta,
+    )
+
+
+def _deterministic_decomposition_plan(**kwargs: Any) -> Any:
+    import agentic_rag.orchestration.retrieval_graph as retrieval_graph
+
+    return retrieval_graph.build_decomposition_plan(**kwargs)
+
+
+def _build_stage_scoped_decomposition_planner(settings: LocalLLMRuntimeSettings):
+    def _planner(**kwargs: Any) -> Any:
+        with _temporary_local_llm_env(settings):
+            return llm_assisted_decomposition_plan(**kwargs)
+
+    return _planner
+
+
+@contextmanager
+def _temporary_local_llm_env(settings: LocalLLMRuntimeSettings):
+    env_updates = {
+        "AGENTIC_RAG_LOCAL_LLM_ENABLED": "true" if settings.enabled else "false",
+        "AGENTIC_RAG_LOCAL_LLM_PROVIDER": settings.provider,
+        "AGENTIC_RAG_LOCAL_LLM_MODEL": settings.model,
+        "AGENTIC_RAG_LOCAL_LLM_BASE_URL": settings.base_url,
+        "AGENTIC_RAG_LOCAL_LLM_TEMPERATURE": str(settings.temperature),
+        "AGENTIC_RAG_LOCAL_LLM_TIMEOUT_SECONDS": str(settings.timeout_seconds),
+    }
+    prior = {key: os.environ.get(key) for key in env_updates}
+    os.environ.update(env_updates)
+    try:
+        yield
+    finally:
+        for key, value in prior.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def _load_documents(selected_documents: list[dict[str, Any]]) -> tuple[list[Any], list[str]]:

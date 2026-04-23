@@ -9,10 +9,12 @@ from typing import Any
 import streamlit as st
 
 from ui.backend_adapter import BackendAdapterError, get_available_documents, parse_recent_messages
+from ui.local_backend import effective_local_llm_settings
 from ui.upload_manager import ALLOWED_EXTENSIONS, remove_uploaded_document, save_uploaded_files
 
 DEBUG_SECTIONS = [
     ("adapter_meta", "Adapter Meta"),
+    ("local_llm_runtime", "Local LLM Runtime"),
     ("query_classification", "Query Classification"),
     ("context_resolution", "Conversation Resolution"),
     ("decomposition", "Decomposition Gate"),
@@ -67,6 +69,15 @@ def initialize_session_state() -> None:
         "latest_result": None,
         "latest_debug_payload": None,
         "last_run": None,
+        "local_llm_enabled": False,
+        "local_llm_provider": "ollama",
+        "local_llm_model": "llama3.1:8b",
+        "local_llm_base_url": "http://127.0.0.1:11434",
+        "local_llm_temperature": 0.0,
+        "local_llm_timeout_seconds": 8.0,
+        "local_llm_stage_rewrite": True,
+        "local_llm_stage_decomposition": True,
+        "local_llm_stage_synthesis": True,
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -159,6 +170,84 @@ def render_sidebar(
 
     st.session_state.use_mock_backend = use_mock_backend
 
+    st.sidebar.subheader("Local LLM Controls")
+    llm_controls_disabled = use_mock_backend
+    if llm_controls_disabled:
+        st.sidebar.caption("Mock backend is active; local LLM settings are ignored for this run.")
+
+    enable_local_llm = st.sidebar.toggle(
+        "Enable local LLM",
+        value=st.session_state.local_llm_enabled,
+        disabled=llm_controls_disabled,
+    )
+    st.session_state.local_llm_enabled = enable_local_llm
+
+    st.sidebar.text_input("Provider", value="ollama", disabled=True)
+    local_llm_model = st.sidebar.text_input(
+        "Ollama model",
+        value=st.session_state.local_llm_model,
+        disabled=llm_controls_disabled,
+    )
+    local_llm_base_url = st.sidebar.text_input(
+        "Ollama base URL",
+        value=st.session_state.local_llm_base_url,
+        disabled=llm_controls_disabled,
+    )
+    st.session_state.local_llm_model = local_llm_model
+    st.session_state.local_llm_base_url = local_llm_base_url
+
+    with st.sidebar.expander("Advanced local LLM settings", expanded=False):
+        local_llm_temperature = st.number_input(
+            "Temperature",
+            min_value=0.0,
+            max_value=2.0,
+            value=float(st.session_state.local_llm_temperature),
+            step=0.1,
+            disabled=llm_controls_disabled,
+        )
+        local_llm_timeout_seconds = st.number_input(
+            "Timeout (seconds)",
+            min_value=0.5,
+            max_value=120.0,
+            value=float(st.session_state.local_llm_timeout_seconds),
+            step=0.5,
+            disabled=llm_controls_disabled,
+        )
+        use_llm_rewrite = st.toggle(
+            "Use local LLM for rewrite",
+            value=st.session_state.local_llm_stage_rewrite,
+            disabled=llm_controls_disabled,
+        )
+        use_llm_decomposition = st.toggle(
+            "Use local LLM for decomposition",
+            value=st.session_state.local_llm_stage_decomposition,
+            disabled=llm_controls_disabled,
+        )
+        use_llm_synthesis = st.toggle(
+            "Use local LLM for final synthesis",
+            value=st.session_state.local_llm_stage_synthesis,
+            disabled=llm_controls_disabled,
+        )
+    st.session_state.local_llm_temperature = float(local_llm_temperature)
+    st.session_state.local_llm_timeout_seconds = float(local_llm_timeout_seconds)
+    st.session_state.local_llm_stage_rewrite = use_llm_rewrite
+    st.session_state.local_llm_stage_decomposition = use_llm_decomposition
+    st.session_state.local_llm_stage_synthesis = use_llm_synthesis
+
+    local_llm_settings = effective_local_llm_settings(
+        enable_local_llm=enable_local_llm,
+        provider="ollama",
+        model=local_llm_model,
+        base_url=local_llm_base_url,
+        temperature=float(local_llm_temperature),
+        timeout_seconds=float(local_llm_timeout_seconds),
+        use_rewrite=use_llm_rewrite,
+        use_decomposition=use_llm_decomposition,
+        use_synthesis=use_llm_synthesis,
+        mock_backend_active=use_mock_backend,
+    )
+    st.session_state.local_llm_effective_settings = local_llm_settings
+
     _render_upload_controls()
 
     available_documents = get_available_documents(
@@ -220,7 +309,26 @@ def render_sidebar(
         "use_mock_backend": use_mock_backend,
         "selected_documents": selected_documents,
         "show_debug": show_debug,
+        "local_llm_settings": local_llm_settings,
     }
+
+
+def render_runtime_mode_status(*, use_mock_backend: bool, debug_payload: dict[str, Any] | None) -> None:
+    payload = debug_payload or {}
+    llm_runtime = payload.get("local_llm_runtime") if isinstance(payload, dict) else None
+    if use_mock_backend:
+        st.info("Runtime mode: Mock backend active — local LLM ignored.")
+        return
+    if not isinstance(llm_runtime, dict):
+        st.caption("Runtime mode: Deterministic mode.")
+        return
+    mode = str(llm_runtime.get("effective_mode") or "deterministic").strip().lower()
+    stages = [stage for stage in list(llm_runtime.get("stages_using_ollama", [])) if isinstance(stage, str)]
+    if mode == "ollama_assisted":
+        stage_label = ", ".join(stages) if stages else "(none)"
+        st.success(f"Runtime mode: Ollama-assisted mode. Stages using Ollama: {stage_label}.")
+    else:
+        st.caption("Runtime mode: Deterministic mode.")
 
 
 def render_query_input() -> dict[str, Any]:
