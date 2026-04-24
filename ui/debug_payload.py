@@ -102,6 +102,14 @@ def _derive_local_llm_runtime(*, latest_state: dict[str, Any], local_llm_scope: 
         used_stages.append("rewrite")
     if any(item.startswith("rewrite_path:deterministic_fallback:") for item in warnings):
         fallback_stages.append("rewrite")
+    rewrite_failure_reason = next(
+        (item.split(":", 1)[1] for item in warnings if item.startswith("rewrite_failure_reason:")),
+        None,
+    )
+    rewrite_provider_error = next(
+        (item.split(":", 1)[1] for item in warnings if item.startswith("rewrite_provider_error:")),
+        None,
+    )
 
     decomposition_plan = latest_state.get("decomposition_plan")
     planner_notes = [str(item) for item in list(getattr(decomposition_plan, "planner_notes", []))]
@@ -126,6 +134,9 @@ def _derive_local_llm_runtime(*, latest_state: dict[str, Any], local_llm_scope: 
     rewrite_used_local_llm = "rewrite" in used_stages
     rewrite_fallback_reason: str | None = None
     rewrite_attempted = False
+    rewritten_query = str(latest_state.get("rewritten_query") or "")
+    original_query = str(latest_state.get("resolved_query") or latest_state.get("original_query") or "")
+    rewrite_result_type = "failed"
 
     if rewrite_applicable:
         if mock_backend_active:
@@ -139,11 +150,15 @@ def _derive_local_llm_runtime(*, latest_state: dict[str, Any], local_llm_scope: 
         else:
             rewrite_attempted = True
             if "rewrite" in fallback_stages:
-                rewrite_fallback_reason = "inference_failed"
+                rewrite_fallback_reason = rewrite_failure_reason or "fallback_used"
+            elif rewrite_used_local_llm:
+                rewrite_result_type = "no_change" if rewritten_query == original_query else "rewritten"
     elif not rewrite_toggle_enabled:
         rewrite_fallback_reason = "disabled_by_toggle"
+        rewrite_result_type = "failed"
     else:
         rewrite_fallback_reason = "rewrite_not_requested"
+        rewrite_result_type = "failed"
 
     def _stage_status(stage: str) -> tuple[str, str | None, bool]:
         toggle_enabled = bool(stage_toggles.get(stage, False))
@@ -165,7 +180,7 @@ def _derive_local_llm_runtime(*, latest_state: dict[str, Any], local_llm_scope: 
             if provider_init_status != "ready":
                 return "skipped", "provider_not_ready", False
             if stage in fallback_stages:
-                return "fallback", "inference_failed", True
+                return "fallback", rewrite_failure_reason or "fallback_used", True
             return "fallback", "fallback_used", True
 
         if stage == "decomposition":
@@ -237,4 +252,6 @@ def _derive_local_llm_runtime(*, latest_state: dict[str, Any], local_llm_scope: 
         "rewrite_attempted": rewrite_attempted,
         "rewrite_used_local_llm": rewrite_used_local_llm,
         "rewrite_fallback_reason": rewrite_fallback_reason,
+        "rewrite_result_type": rewrite_result_type,
+        "rewrite_provider_error": rewrite_provider_error,
     }

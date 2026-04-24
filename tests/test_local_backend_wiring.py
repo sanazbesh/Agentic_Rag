@@ -34,6 +34,23 @@ class _FailingRewritePromptClient:
         raise RuntimeError("rewrite_boom")
 
 
+class _TimeoutRewritePromptClient:
+    def complete(self, prompt: str, *, system_prompt: str | None = None) -> str:
+        raise TimeoutError("rewrite timeout")
+
+
+class _MalformedRewritePromptClient:
+    def complete(self, prompt: str, *, system_prompt: str | None = None) -> str:
+        return "not-json"
+
+
+class _NoOpRewritePromptClient:
+    def complete(self, prompt: str, *, system_prompt: str | None = None) -> str:
+        if "Return strict JSON" in str(prompt) and "\"rewritten_query\"" in str(prompt):
+            return '{"rewritten_query":"who is the hiring company here?"}'
+        return '{"strategy":"single","subqueries":[]}'
+
+
 def _forced_rewrite_decision() -> QueryUnderstandingResult:
     return QueryUnderstandingResult(
         original_query="who is the hiring company here?",
@@ -454,8 +471,114 @@ def test_rewrite_failure_reports_explicit_reason(tmp_path: Path, monkeypatch: An
     ]
     assert runtime["rewrite_attempted"] is True
     assert runtime["per_stage_local_llm_status"]["rewrite"] == "fallback"
-    assert runtime["per_stage_fallback_reason"]["rewrite"] == "inference_failed"
-    assert runtime["rewrite_fallback_reason"] == "inference_failed"
+    assert runtime["per_stage_fallback_reason"]["rewrite"] == "provider_runtime_error"
+    assert runtime["rewrite_fallback_reason"] == "provider_runtime_error"
+    assert runtime["rewrite_result_type"] == "failed"
+    assert runtime["rewrite_provider_error"] is not None
+
+
+def test_rewrite_failure_reasons_distinguish_timeout_and_malformed(tmp_path: Path, monkeypatch: Any) -> None:
+    doc_path = tmp_path / "msa.md"
+    _write_text_file(doc_path, "# MSA\n\n## Parties\nAcme Corp employs Jane Roe.\n")
+    descriptor = {"id": "uploaded:msa.md", "name": "msa.md", "path": str(doc_path), "type": "md", "source": "uploaded"}
+    monkeypatch.setattr("pathlib.Path.is_file", lambda _path: True)
+
+    settings = effective_local_llm_settings(
+        enable_local_llm=True,
+        provider="llama_cpp",
+        model_path="/models/llama.gguf",
+        temperature=0.0,
+        timeout_seconds=8.0,
+        n_ctx=4096,
+        max_tokens=512,
+        n_gpu_layers=0,
+        threads=None,
+        use_rewrite=True,
+        use_decomposition=True,
+        use_synthesis=True,
+        mock_backend_active=False,
+    )
+
+    monkeypatch.setattr(
+        "ui.local_backend.build_local_prompt_llm_with_diagnostics",
+        lambda *_args, **_kwargs: (
+            _TimeoutRewritePromptClient(),
+            {"local_llm_attempted": True, "provider_init_status": "ready", "provider_init_error": None, "provider_init_reason": None},
+        ),
+    )
+    timeout_build = build_local_backend_dependencies([descriptor], local_llm_settings=settings)
+    timeout_build.dependencies.retrieval.classify_query_state = lambda *_args, **_kwargs: _forced_rewrite_decision()
+    _, timeout_state = run_legal_rag_turn_with_state(
+        query="who is the hiring company here?",
+        dependencies=timeout_build.dependencies,
+        selected_documents=[descriptor],
+    )
+    timeout_runtime = build_real_debug_payload(
+        latest_state=timeout_state, selected_documents=[descriptor], scope_meta=timeout_build.scope_meta
+    )["local_llm_runtime"]
+    assert timeout_runtime["rewrite_fallback_reason"] == "timeout"
+
+    monkeypatch.setattr(
+        "ui.local_backend.build_local_prompt_llm_with_diagnostics",
+        lambda *_args, **_kwargs: (
+            _MalformedRewritePromptClient(),
+            {"local_llm_attempted": True, "provider_init_status": "ready", "provider_init_error": None, "provider_init_reason": None},
+        ),
+    )
+    malformed_build = build_local_backend_dependencies([descriptor], local_llm_settings=settings)
+    malformed_build.dependencies.retrieval.classify_query_state = lambda *_args, **_kwargs: _forced_rewrite_decision()
+    _, malformed_state = run_legal_rag_turn_with_state(
+        query="who is the hiring company here?",
+        dependencies=malformed_build.dependencies,
+        selected_documents=[descriptor],
+    )
+    malformed_runtime = build_real_debug_payload(
+        latest_state=malformed_state, selected_documents=[descriptor], scope_meta=malformed_build.scope_meta
+    )["local_llm_runtime"]
+    assert malformed_runtime["rewrite_fallback_reason"] == "malformed_response"
+
+
+def test_rewrite_noop_is_not_reported_as_fallback(tmp_path: Path, monkeypatch: Any) -> None:
+    doc_path = tmp_path / "msa.md"
+    _write_text_file(doc_path, "# MSA\n\n## Parties\nAcme Corp employs Jane Roe.\n")
+    descriptor = {"id": "uploaded:msa.md", "name": "msa.md", "path": str(doc_path), "type": "md", "source": "uploaded"}
+    monkeypatch.setattr("pathlib.Path.is_file", lambda _path: True)
+    monkeypatch.setattr(
+        "ui.local_backend.build_local_prompt_llm_with_diagnostics",
+        lambda *_args, **_kwargs: (
+            _NoOpRewritePromptClient(),
+            {"local_llm_attempted": True, "provider_init_status": "ready", "provider_init_error": None, "provider_init_reason": None},
+        ),
+    )
+    settings = effective_local_llm_settings(
+        enable_local_llm=True,
+        provider="llama_cpp",
+        model_path="/models/llama.gguf",
+        temperature=0.0,
+        timeout_seconds=8.0,
+        n_ctx=4096,
+        max_tokens=512,
+        n_gpu_layers=0,
+        threads=None,
+        use_rewrite=True,
+        use_decomposition=True,
+        use_synthesis=True,
+        mock_backend_active=False,
+    )
+    build = build_local_backend_dependencies([descriptor], local_llm_settings=settings)
+    build.dependencies.retrieval.classify_query_state = lambda *_args, **_kwargs: _forced_rewrite_decision()
+    _, state = run_legal_rag_turn_with_state(
+        query="who is the hiring company here?",
+        dependencies=build.dependencies,
+        selected_documents=[descriptor],
+    )
+    runtime = build_real_debug_payload(latest_state=state, selected_documents=[descriptor], scope_meta=build.scope_meta)[
+        "local_llm_runtime"
+    ]
+    assert runtime["rewrite_used_local_llm"] is True
+    assert runtime["rewrite_result_type"] == "no_change"
+    assert runtime["per_stage_local_llm_status"]["rewrite"] == "used"
+    assert "rewrite" in runtime["stages_using_local_llm"]
 
 
 def test_rewrite_provider_not_ready_reports_explicit_reason(tmp_path: Path) -> None:
