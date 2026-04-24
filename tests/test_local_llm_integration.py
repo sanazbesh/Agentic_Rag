@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from agentic_rag.llm import LocalLLMConfig, build_local_prompt_llm, local_llm_config_from_env
+from agentic_rag.llm import LocalLLMConfig, build_local_prompt_llm, local_llm_config_from_env, run_rewrite_provider_smoke_test
 from agentic_rag.orchestration.retrieval_graph import llm_assisted_decomposition_plan
 from agentic_rag.orchestration.query_understanding import QueryUnderstandingResult
 from agentic_rag.retrieval import ParentChunkResult
@@ -213,3 +213,43 @@ def test_final_synthesis_has_deterministic_fallback_when_provider_fails() -> Non
     assert result.sufficient_context is True
     assert result.citations
     assert any(warning.startswith("answer_synthesis_path:deterministic_fallback") for warning in result.warnings)
+
+
+def test_rewrite_provider_smoke_test_distinguishes_exception_empty_and_usable(monkeypatch) -> None:
+    cfg = LocalLLMConfig(enabled=True, provider="llama_cpp", model_path="/models/llama.gguf")
+
+    class _RaisesClient:
+        def complete(self, prompt: str, *, system_prompt: str | None = None) -> str:
+            raise RuntimeError("provider_call_failed")
+
+    monkeypatch.setattr(
+        "agentic_rag.llm.local_provider.build_local_prompt_llm_with_diagnostics",
+        lambda _cfg: (_RaisesClient(), {"provider_init_status": "ready"}),
+    )
+    failed = run_rewrite_provider_smoke_test(cfg)
+    assert failed.provider_call_attempted is True
+    assert failed.provider_call_succeeded is False
+    assert failed.rewrite_provider_error == "RuntimeError:provider_call_failed"
+
+    monkeypatch.setattr(
+        "agentic_rag.llm.local_provider.build_local_prompt_llm_with_diagnostics",
+        lambda _cfg: (_FakePromptClient("   "), {"provider_init_status": "ready"}),
+    )
+    empty = run_rewrite_provider_smoke_test(cfg)
+    assert empty.provider_call_attempted is True
+    assert empty.provider_call_succeeded is True
+    assert empty.raw_response_present is False
+    assert empty.usable_output is False
+    assert empty.rewrite_provider_error == "empty_response"
+
+    monkeypatch.setattr(
+        "agentic_rag.llm.local_provider.build_local_prompt_llm_with_diagnostics",
+        lambda _cfg: (_FakePromptClient('{"rewritten_query":"who is the hiring company?"}'), {"provider_init_status": "ready"}),
+    )
+    usable = run_rewrite_provider_smoke_test(cfg)
+    assert usable.provider_call_attempted is True
+    assert usable.provider_call_succeeded is True
+    assert usable.raw_response_present is True
+    assert usable.raw_response_text_length is not None and usable.raw_response_text_length > 0
+    assert usable.usable_output is True
+    assert usable.rewrite_provider_error is None

@@ -40,6 +40,7 @@ class QueryRewriteResult:
     rewritten_query: str
     used_conversation_context: bool
     rewrite_notes: str = ""
+    rewrite_call_outcome: dict[str, Any] | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -65,6 +66,7 @@ class _LLMRewriteOutcome:
     rewritten_query: str | None = None
     failure_reason: str | None = None
     provider_error: str | None = None
+    call_outcome: dict[str, Any] | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -619,6 +621,7 @@ class QueryTransformationService:
                     rewritten_query=llm_outcome.rewritten_query,
                     used_conversation_context=bool(context_blob),
                     rewrite_notes=f"resolved_reference_with_llm:{self.llm_provider_label}:{rewrite_state}",
+                    rewrite_call_outcome=llm_outcome.call_outcome,
                 )
             if not llm_outcome.ok:
                 provider_error_suffix = (
@@ -632,6 +635,7 @@ class QueryTransformationService:
                         f"llm_failure_fallback_original_query:{self.llm_provider_label}:"
                         f"reason={llm_outcome.failure_reason or 'inference_failed'}{provider_error_suffix}"
                     ),
+                    rewrite_call_outcome=llm_outcome.call_outcome,
                 )
 
         if not needs_context:
@@ -757,10 +761,23 @@ class QueryTransformationService:
             raw = self.llm_client.complete(prompt)  # type: ignore[union-attr]
         except Exception as exc:
             logger.exception("LLM rewrite failed; using heuristic/safe fallback.")
+            failure_reason = self._classify_llm_exception(exc)
             return _LLMRewriteOutcome(
                 ok=False,
-                failure_reason=self._classify_llm_exception(exc),
+                failure_reason=failure_reason,
                 provider_error=f"{type(exc).__name__}:{exc}",
+                call_outcome={
+                    "provider_call_attempted": True,
+                    "provider_call_succeeded": False,
+                    "raw_response_present": False,
+                    "raw_response_text_length": None,
+                    "normalized_rewrite_present": False,
+                    "normalized_rewrite_text_length": None,
+                    "rewrite_result_type": "failed",
+                    "rewrite_failure_stage": "provider_call",
+                    "rewrite_fallback_reason": failure_reason,
+                    "rewrite_provider_error": f"{type(exc).__name__}:{exc}",
+                },
             )
 
         if not isinstance(raw, str) or not raw.strip():
@@ -768,7 +785,20 @@ class QueryTransformationService:
                 ok=False,
                 failure_reason="empty_response",
                 provider_error="empty_response:provider_returned_blank",
+                call_outcome={
+                    "provider_call_attempted": True,
+                    "provider_call_succeeded": True,
+                    "raw_response_present": False,
+                    "raw_response_text_length": len(raw) if isinstance(raw, str) else None,
+                    "normalized_rewrite_present": False,
+                    "normalized_rewrite_text_length": None,
+                    "rewrite_result_type": "failed",
+                    "rewrite_failure_stage": "provider_call",
+                    "rewrite_fallback_reason": "empty_response",
+                    "rewrite_provider_error": "empty_response:provider_returned_blank",
+                },
             )
+        raw_stripped = raw.strip()
 
         parse_ok, parsed, parse_error = _parse_json_object_response(raw)
         if not parse_ok:
@@ -776,6 +806,18 @@ class QueryTransformationService:
                 ok=False,
                 failure_reason="malformed_response",
                 provider_error=parse_error or "malformed_response:json_parse_failed",
+                call_outcome={
+                    "provider_call_attempted": True,
+                    "provider_call_succeeded": True,
+                    "raw_response_present": True,
+                    "raw_response_text_length": len(raw_stripped),
+                    "normalized_rewrite_present": False,
+                    "normalized_rewrite_text_length": None,
+                    "rewrite_result_type": "failed",
+                    "rewrite_failure_stage": "response_parse",
+                    "rewrite_fallback_reason": "malformed_response",
+                    "rewrite_provider_error": parse_error or "malformed_response:json_parse_failed",
+                },
             )
 
         if not isinstance(parsed, Mapping):
@@ -783,12 +825,36 @@ class QueryTransformationService:
                 ok=False,
                 failure_reason="malformed_response",
                 provider_error=f"malformed_response:top_level_type={type(parsed).__name__}",
+                call_outcome={
+                    "provider_call_attempted": True,
+                    "provider_call_succeeded": True,
+                    "raw_response_present": True,
+                    "raw_response_text_length": len(raw_stripped),
+                    "normalized_rewrite_present": False,
+                    "normalized_rewrite_text_length": None,
+                    "rewrite_result_type": "failed",
+                    "rewrite_failure_stage": "response_parse",
+                    "rewrite_fallback_reason": "malformed_response",
+                    "rewrite_provider_error": f"malformed_response:top_level_type={type(parsed).__name__}",
+                },
             )
         if "rewritten_query" not in parsed:
             return _LLMRewriteOutcome(
                 ok=False,
                 failure_reason="validation_failed",
                 provider_error="validation_failed:missing_rewritten_query",
+                call_outcome={
+                    "provider_call_attempted": True,
+                    "provider_call_succeeded": True,
+                    "raw_response_present": True,
+                    "raw_response_text_length": len(raw_stripped),
+                    "normalized_rewrite_present": False,
+                    "normalized_rewrite_text_length": None,
+                    "rewrite_result_type": "failed",
+                    "rewrite_failure_stage": "response_validation",
+                    "rewrite_fallback_reason": "validation_failed",
+                    "rewrite_provider_error": "validation_failed:missing_rewritten_query",
+                },
             )
         rewritten_raw = parsed.get("rewritten_query")
         if rewritten_raw is None:
@@ -796,12 +862,36 @@ class QueryTransformationService:
                 ok=False,
                 failure_reason="empty_response",
                 provider_error="empty_response:rewritten_query_null",
+                call_outcome={
+                    "provider_call_attempted": True,
+                    "provider_call_succeeded": True,
+                    "raw_response_present": True,
+                    "raw_response_text_length": len(raw_stripped),
+                    "normalized_rewrite_present": False,
+                    "normalized_rewrite_text_length": None,
+                    "rewrite_result_type": "failed",
+                    "rewrite_failure_stage": "response_validation",
+                    "rewrite_fallback_reason": "empty_response",
+                    "rewrite_provider_error": "empty_response:rewritten_query_null",
+                },
             )
         if not isinstance(rewritten_raw, str):
             return _LLMRewriteOutcome(
                 ok=False,
                 failure_reason="validation_failed",
                 provider_error=f"validation_failed:rewritten_query_type={type(rewritten_raw).__name__}",
+                call_outcome={
+                    "provider_call_attempted": True,
+                    "provider_call_succeeded": True,
+                    "raw_response_present": True,
+                    "raw_response_text_length": len(raw_stripped),
+                    "normalized_rewrite_present": False,
+                    "normalized_rewrite_text_length": None,
+                    "rewrite_result_type": "failed",
+                    "rewrite_failure_stage": "response_validation",
+                    "rewrite_fallback_reason": "validation_failed",
+                    "rewrite_provider_error": f"validation_failed:rewritten_query_type={type(rewritten_raw).__name__}",
+                },
             )
         rewritten = rewritten_raw.strip()
         if not rewritten:
@@ -809,8 +899,36 @@ class QueryTransformationService:
                 ok=False,
                 failure_reason="empty_response",
                 provider_error="empty_response:rewritten_query_blank",
+                call_outcome={
+                    "provider_call_attempted": True,
+                    "provider_call_succeeded": True,
+                    "raw_response_present": True,
+                    "raw_response_text_length": len(raw_stripped),
+                    "normalized_rewrite_present": False,
+                    "normalized_rewrite_text_length": None,
+                    "rewrite_result_type": "failed",
+                    "rewrite_failure_stage": "normalization",
+                    "rewrite_fallback_reason": "empty_response",
+                    "rewrite_provider_error": "empty_response:rewritten_query_blank",
+                },
             )
-        return _LLMRewriteOutcome(ok=True, rewritten_query=rewritten)
+        rewrite_result_type = "no_change" if rewritten == query else "rewritten"
+        return _LLMRewriteOutcome(
+            ok=True,
+            rewritten_query=rewritten,
+            call_outcome={
+                "provider_call_attempted": True,
+                "provider_call_succeeded": True,
+                "raw_response_present": True,
+                "raw_response_text_length": len(raw_stripped),
+                "normalized_rewrite_present": True,
+                "normalized_rewrite_text_length": len(rewritten),
+                "rewrite_result_type": rewrite_result_type,
+                "rewrite_failure_stage": None,
+                "rewrite_fallback_reason": None,
+                "rewrite_provider_error": None,
+            },
+        )
 
     def _classify_llm_exception(self, exc: Exception) -> str:
         message = str(exc).lower()
