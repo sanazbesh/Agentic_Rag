@@ -116,6 +116,65 @@ def _derive_local_llm_runtime(*, latest_state: dict[str, Any], local_llm_scope: 
         fallback_stages.append("synthesis")
 
     enabled = bool(scope.get("effective_enabled", False))
+    provider_init_reason = scope.get("provider_init_reason")
+    provider_init_status = scope.get("provider_init_status", "not_attempted")
+
+    def _stage_status(stage: str) -> tuple[str, str | None, bool]:
+        toggle_enabled = bool(stage_toggles.get(stage, False))
+        used = stage in used_stages
+        if used:
+            return "used", None, True
+        if not toggle_enabled:
+            return "skipped", "disabled_by_toggle", False
+
+        if stage == "rewrite":
+            reached = bool(latest_state.get("should_rewrite", False))
+            if not reached:
+                return "skipped", "stage_not_reached", False
+            if not enabled:
+                return "fallback", "fallback_used", True
+            if provider_init_status != "ready":
+                return "fallback", str(provider_init_reason or "provider_init_failed"), True
+            if stage in fallback_stages:
+                return "fallback", "inference_failed", True
+            return "skipped", "stage_not_applicable", False
+
+        if stage == "decomposition":
+            reached = bool(latest_state.get("needs_decomposition", False))
+            if not reached:
+                return "skipped", "stage_not_applicable", False
+            if not enabled:
+                return "fallback", "fallback_used", True
+            if provider_init_status != "ready":
+                return "fallback", str(provider_init_reason or "provider_init_failed"), True
+            if stage in fallback_stages:
+                return "fallback", "inference_failed", True
+            return "skipped", "stage_not_reached", False
+
+        reached = bool(latest_state.get("should_generate_answer", False))
+        if not reached:
+            if bool(latest_state.get("should_return_insufficient_response", False)):
+                return "blocked", "upstream_blocked", False
+            return "skipped", "stage_not_reached", False
+        if not enabled:
+            return "fallback", "fallback_used", True
+        if provider_init_status != "ready":
+            return "fallback", str(provider_init_reason or "provider_init_failed"), True
+        if stage in fallback_stages:
+            return "fallback", "inference_failed", True
+        return "skipped", "stage_not_applicable", False
+
+    per_stage_status: dict[str, str] = {}
+    per_stage_reason: dict[str, str] = {}
+    attempted_stages: list[str] = []
+    for stage_name in ("rewrite", "decomposition", "synthesis"):
+        status, reason, attempted = _stage_status(stage_name)
+        per_stage_status[stage_name] = status
+        if reason is not None:
+            per_stage_reason[stage_name] = reason
+        if attempted:
+            attempted_stages.append(stage_name)
+
     effective_mode = "llama_cpp_assisted" if used_stages else "deterministic"
     return {
         "ui_enabled": bool(scope.get("ui_enabled", False)),
@@ -133,8 +192,15 @@ def _derive_local_llm_runtime(*, latest_state: dict[str, Any], local_llm_scope: 
             "decomposition": bool(stage_toggles.get("decomposition", False)),
             "synthesis": bool(stage_toggles.get("synthesis", False)),
         },
+        "local_llm_attempted": bool(scope.get("local_llm_attempted", False)),
+        "provider_init_status": provider_init_status,
+        "provider_init_error": scope.get("provider_init_error"),
+        "provider_init_reason": provider_init_reason,
         "stages_using_local_llm": sorted(set(used_stages)),
         "fallback_stages": sorted(set(fallback_stages)),
+        "stages_attempted_local_llm": sorted(set(attempted_stages)),
+        "per_stage_local_llm_status": per_stage_status,
+        "per_stage_fallback_reason": per_stage_reason,
         "local_llm_used": bool(used_stages),
         "effective_mode": effective_mode if enabled else "deterministic",
     }

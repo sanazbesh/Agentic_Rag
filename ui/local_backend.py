@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 from contextlib import contextmanager
 
-from agentic_rag.llm import LocalLLMConfig, build_local_prompt_llm
+from agentic_rag.llm import LocalLLMConfig, build_local_prompt_llm_with_diagnostics
 from agentic_rag.chunking import MarkdownParentChildChunker
 from agentic_rag.ingestion import MarkdownDocumentIngestor, PDFDocumentIngestor
 from agentic_rag.orchestration.legal_rag_graph import LegalRagDependencies
@@ -185,7 +185,15 @@ def build_local_backend_dependencies(
 
     llm_settings = local_llm_settings or LocalLLMRuntimeSettings()
     provider_label = f"{llm_settings.provider}:{llm_settings.model_path or 'unset_model_path'}"
-    llm_client = build_local_prompt_llm(llm_settings.as_local_llm_config()) if llm_settings.enabled else None
+    if llm_settings.enabled:
+        llm_client, llm_diagnostics = build_local_prompt_llm_with_diagnostics(llm_settings.as_local_llm_config())
+    else:
+        llm_client, llm_diagnostics = None, {
+            "local_llm_attempted": False,
+            "provider_init_status": "disabled",
+            "provider_init_error": None,
+            "provider_init_reason": None,
+        }
 
     rewrite_service = QueryTransformationService(
         llm_client=llm_client if llm_settings.is_stage_enabled("rewrite") else None,
@@ -234,6 +242,10 @@ def build_local_backend_dependencies(
                 "decomposition": llm_settings.stages.decomposition,
                 "synthesis": llm_settings.stages.synthesis,
             },
+            "local_llm_attempted": bool(llm_diagnostics.get("local_llm_attempted", False)),
+            "provider_init_status": str(llm_diagnostics.get("provider_init_status", "not_attempted")),
+            "provider_init_error": llm_diagnostics.get("provider_init_error"),
+            "provider_init_reason": llm_diagnostics.get("provider_init_reason"),
         },
     }
     return LocalBackendBuildResult(

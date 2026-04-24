@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from agentic_rag.orchestration.legal_rag_graph import run_legal_rag_turn, run_legal_rag_turn_with_state
 from ui.debug_payload import build_real_debug_payload
@@ -11,6 +12,20 @@ from ui.local_backend import build_local_backend_dependencies
 def _write_text_file(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
+
+
+class _StubPromptClient:
+    def complete(self, prompt: str, *, system_prompt: str | None = None) -> str:
+        prompt_text = str(prompt)
+        if "Return strict JSON" in prompt_text and "\"rewritten_query\"" in prompt_text:
+            return '{"rewritten_query":"How is Section 9 enforced?"}'
+        if "\"strategy\"" in prompt_text and "\"subqueries\"" in prompt_text:
+            return (
+                '{"strategy":"comparison","subqueries":['
+                '{"id":"sq-1","question":"Find indemnity clause.","purpose":"Indemnity evidence.","required":true,"expected_answer_type":"cross_reference","dependency_ids":[]}'
+                "]}"
+            )
+        return "Grounded draft from evidence."
 
 
 def test_local_backend_builds_from_uploaded_markdown(tmp_path: Path) -> None:
@@ -223,3 +238,89 @@ def test_invalid_model_path_uses_deterministic_fallback(tmp_path: Path) -> None:
     ]
     assert runtime["effective_enabled"] is True
     assert runtime["stages_using_local_llm"] == []
+    assert runtime["provider_init_reason"] == "invalid_model_path"
+    assert runtime["per_stage_fallback_reason"]["synthesis"] in {"invalid_model_path", "upstream_blocked"}
+
+
+def test_runtime_metadata_marks_rewrite_as_local_llm_used(tmp_path: Path, monkeypatch: Any) -> None:
+    doc_path = tmp_path / "msa.md"
+    _write_text_file(doc_path, "# MSA\n\n## Term\nTerm is one year.\n")
+    descriptor = {"id": "uploaded:msa.md", "name": "msa.md", "path": str(doc_path), "type": "md", "source": "uploaded"}
+
+    monkeypatch.setattr(
+        "ui.local_backend.build_local_prompt_llm_with_diagnostics",
+        lambda *_args, **_kwargs: (
+            _StubPromptClient(),
+            {
+                "local_llm_attempted": True,
+                "provider_init_status": "ready",
+                "provider_init_error": None,
+                "provider_init_reason": None,
+            },
+        ),
+    )
+    monkeypatch.setattr("pathlib.Path.is_file", lambda _path: True)
+
+    settings = effective_local_llm_settings(
+        enable_local_llm=True,
+        provider="llama_cpp",
+        model_path="/models/llama.gguf",
+        temperature=0.0,
+        timeout_seconds=8.0,
+        n_ctx=4096,
+        max_tokens=512,
+        n_gpu_layers=0,
+        threads=None,
+        use_rewrite=True,
+        use_decomposition=True,
+        use_synthesis=True,
+        mock_backend_active=False,
+    )
+    build = build_local_backend_dependencies([descriptor], local_llm_settings=settings)
+    _, state = run_legal_rag_turn_with_state(
+        query="How is that clause enforced?",
+        conversation_summary="We discussed Section 9.",
+        dependencies=build.dependencies,
+        selected_documents=[descriptor],
+    )
+    runtime = build_real_debug_payload(latest_state=state, selected_documents=[descriptor], scope_meta=build.scope_meta)[
+        "local_llm_runtime"
+    ]
+    assert runtime["local_llm_used"] is True
+    assert runtime["effective_mode"] == "llama_cpp_assisted"
+    assert "rewrite" in runtime["stages_using_local_llm"]
+
+
+
+
+def test_stage_toggle_disabled_and_upstream_blocked_reasons_are_explicit(tmp_path: Path) -> None:
+    doc_path = tmp_path / "msa.md"
+    _write_text_file(doc_path, "# MSA\n\n## Term\nTerm is one year.\n")
+    descriptor = {"id": "uploaded:msa.md", "name": "msa.md", "path": str(doc_path), "type": "md", "source": "uploaded"}
+
+    settings = effective_local_llm_settings(
+        enable_local_llm=True,
+        provider="llama_cpp",
+        model_path="/does/not/exist/model.gguf",
+        temperature=0.0,
+        timeout_seconds=8.0,
+        n_ctx=4096,
+        max_tokens=512,
+        n_gpu_layers=0,
+        threads=None,
+        use_rewrite=False,
+        use_decomposition=True,
+        use_synthesis=True,
+        mock_backend_active=False,
+    )
+    build = build_local_backend_dependencies([descriptor], local_llm_settings=settings)
+    _, state = run_legal_rag_turn_with_state(
+        query="What is severability under this contract?",
+        dependencies=build.dependencies,
+        selected_documents=[descriptor],
+    )
+    runtime = build_real_debug_payload(latest_state=state, selected_documents=[descriptor], scope_meta=build.scope_meta)[
+        "local_llm_runtime"
+    ]
+    assert runtime["per_stage_fallback_reason"]["rewrite"] == "disabled_by_toggle"
+    assert runtime["per_stage_fallback_reason"]["synthesis"] in {"upstream_blocked", "invalid_model_path"}
