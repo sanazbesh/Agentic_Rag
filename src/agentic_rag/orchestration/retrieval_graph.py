@@ -1263,8 +1263,26 @@ class RetrievalGraphNodes:
                     if provider_error:
                         updated["warnings"] = [*updated["warnings"], f"rewrite_provider_error:{provider_error}"]
         except Exception as exc:  # pragma: no cover - defensive fallback
-            updated["warnings"] = [*updated["warnings"], f"rewrite_failed:{type(exc).__name__}"]
+            message = str(exc).lower()
+            if isinstance(exc, TimeoutError) or "timeout" in message or "timed out" in message:
+                failure_reason = "timeout"
+            elif isinstance(exc, RuntimeError):
+                failure_reason = "provider_runtime_error"
+            else:
+                failure_reason = "inference_failed"
+            provider_error = f"{type(exc).__name__}:{exc}"
+            updated["warnings"] = [
+                *updated["warnings"],
+                f"rewrite_failed:{type(exc).__name__}",
+                f"rewrite_path:deterministic_fallback:exception:{failure_reason}",
+                f"rewrite_failure_reason:{failure_reason}",
+                f"rewrite_provider_error:{provider_error}",
+            ]
             updated["rewritten_query"] = None
+            updated["rewrite_notes"] = (
+                "llm_failure_fallback_original_query:"
+                f"exception:reason={failure_reason}:error={provider_error}"
+            )
             updated["effective_query"] = original_query
         logger.info(
             "node_exit name=rewrite_query_if_needed rewritten=%s effective_query_length=%s",
