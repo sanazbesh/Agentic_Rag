@@ -552,6 +552,7 @@ class QueryTransformationService:
         query: str,
         conversation_summary: str | None = None,
         recent_messages: Sequence[Any] | None = None,
+        force_llm_rewrite_attempt: bool = False,
     ) -> QueryRewriteResult:
         """Return one retrieval-optimized query string with optional context use."""
 
@@ -596,22 +597,15 @@ class QueryTransformationService:
 
         context_blob = _build_context_blob(conversation_summary, recent_messages)
         needs_context = bool(self._AMBIGUOUS_REFERENCE_PATTERN.search(normalized_query))
+        llm_attempt_eligible = bool(self.llm_client is not None and (needs_context or force_llm_rewrite_attempt))
 
-        if not needs_context:
-            return QueryRewriteResult(
-                original_query=original_query,
-                rewritten_query=normalized_query,
-                used_conversation_context=False,
-                rewrite_notes="query_already_clear",
-            )
-
-        if self.llm_client is not None and context_blob:
-            llm_ok, llm_result = self._llm_rewrite_query(normalized_query, context_blob)
+        if llm_attempt_eligible:
+            llm_ok, llm_result = self._llm_rewrite_query(normalized_query, context_blob or None)
             if llm_ok and llm_result is not None:
                 return QueryRewriteResult(
                     original_query=original_query,
                     rewritten_query=llm_result,
-                    used_conversation_context=True,
+                    used_conversation_context=bool(context_blob),
                     rewrite_notes=f"resolved_reference_with_llm:{self.llm_provider_label}",
                 )
             if not llm_ok:
@@ -621,6 +615,14 @@ class QueryTransformationService:
                     used_conversation_context=False,
                     rewrite_notes=f"llm_failure_fallback_original_query:{self.llm_provider_label}",
                 )
+
+        if not needs_context:
+            return QueryRewriteResult(
+                original_query=original_query,
+                rewritten_query=normalized_query,
+                used_conversation_context=False,
+                rewrite_notes="query_already_clear",
+            )
 
         referent = self._extract_reference_target(context_blob) if context_blob else None
         if not referent:
@@ -724,12 +726,14 @@ class QueryTransformationService:
             rewritten = re.sub(pattern, referent, rewritten, flags=re.IGNORECASE)
         return rewritten
 
-    def _llm_rewrite_query(self, query: str, context_blob: str) -> tuple[bool, str | None]:
+    def _llm_rewrite_query(self, query: str, context_blob: str | None) -> tuple[bool, str | None]:
+        context_section = context_blob or "(none)"
         prompt = (
-            "Rewrite the legal retrieval query by resolving ambiguous references only from context. "
+            "Rewrite the legal retrieval query to maximize retrieval precision while preserving legal meaning. "
+            "Resolve ambiguous references from context when available. "
             "Preserve jurisdiction, dates, parties, and legal scope. "
             "Return strict JSON: {\"rewritten_query\": \"...\"}.\n\n"
-            f"CONTEXT:\n{context_blob}\n\nQUERY:\n{query}"
+            f"CONTEXT:\n{context_section}\n\nQUERY:\n{query}"
         )
         try:
             raw = self.llm_client.complete(prompt)  # type: ignore[union-attr]

@@ -116,8 +116,34 @@ def _derive_local_llm_runtime(*, latest_state: dict[str, Any], local_llm_scope: 
         fallback_stages.append("synthesis")
 
     enabled = bool(scope.get("effective_enabled", False))
+    ui_enabled = bool(scope.get("ui_enabled", False))
+    mock_backend_active = bool(scope.get("mock_backend_active", False))
     provider_init_reason = scope.get("provider_init_reason")
     provider_init_status = scope.get("provider_init_status", "not_attempted")
+    rewrite_requested = bool(latest_state.get("should_rewrite", False))
+    rewrite_toggle_enabled = bool(stage_toggles.get("rewrite", False))
+    rewrite_applicable = bool(rewrite_requested and rewrite_toggle_enabled)
+    rewrite_used_local_llm = "rewrite" in used_stages
+    rewrite_fallback_reason: str | None = None
+    rewrite_attempted = False
+
+    if rewrite_applicable:
+        if mock_backend_active:
+            rewrite_fallback_reason = "mock_backend_active"
+        elif not ui_enabled:
+            rewrite_fallback_reason = "local_llm_disabled"
+        elif not enabled:
+            rewrite_fallback_reason = "local_llm_disabled"
+        elif provider_init_status != "ready":
+            rewrite_fallback_reason = "provider_not_ready"
+        else:
+            rewrite_attempted = True
+            if "rewrite" in fallback_stages:
+                rewrite_fallback_reason = "inference_failed"
+    elif not rewrite_toggle_enabled:
+        rewrite_fallback_reason = "disabled_by_toggle"
+    else:
+        rewrite_fallback_reason = "rewrite_not_requested"
 
     def _stage_status(stage: str) -> tuple[str, str | None, bool]:
         toggle_enabled = bool(stage_toggles.get(stage, False))
@@ -128,16 +154,19 @@ def _derive_local_llm_runtime(*, latest_state: dict[str, Any], local_llm_scope: 
             return "skipped", "disabled_by_toggle", False
 
         if stage == "rewrite":
-            reached = bool(latest_state.get("should_rewrite", False))
-            if not reached:
-                return "skipped", "stage_not_reached", False
+            if not rewrite_requested:
+                return "skipped", "rewrite_not_requested", False
+            if mock_backend_active:
+                return "skipped", "mock_backend_active", False
+            if not ui_enabled:
+                return "skipped", "local_llm_disabled", False
             if not enabled:
-                return "fallback", "fallback_used", True
+                return "skipped", "local_llm_disabled", False
             if provider_init_status != "ready":
-                return "fallback", str(provider_init_reason or "provider_init_failed"), True
+                return "skipped", "provider_not_ready", False
             if stage in fallback_stages:
                 return "fallback", "inference_failed", True
-            return "skipped", "stage_not_applicable", False
+            return "fallback", "fallback_used", True
 
         if stage == "decomposition":
             reached = bool(latest_state.get("needs_decomposition", False))
@@ -203,4 +232,9 @@ def _derive_local_llm_runtime(*, latest_state: dict[str, Any], local_llm_scope: 
         "per_stage_fallback_reason": per_stage_reason,
         "local_llm_used": bool(used_stages),
         "effective_mode": effective_mode if enabled else "deterministic",
+        "rewrite_requested": rewrite_requested,
+        "rewrite_applicable": rewrite_applicable,
+        "rewrite_attempted": rewrite_attempted,
+        "rewrite_used_local_llm": rewrite_used_local_llm,
+        "rewrite_fallback_reason": rewrite_fallback_reason,
     }
