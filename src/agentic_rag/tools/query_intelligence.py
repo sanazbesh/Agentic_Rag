@@ -764,42 +764,61 @@ class QueryTransformationService:
             )
 
         if not isinstance(raw, str) or not raw.strip():
-            return _LLMRewriteOutcome(ok=False, failure_reason="empty_response")
+            return _LLMRewriteOutcome(
+                ok=False,
+                failure_reason="empty_response",
+                provider_error="empty_response:provider_returned_blank",
+            )
 
-        try:
-            parsed = json.loads(raw)
-        except JSONDecodeError as exc:
+        parse_ok, parsed, parse_error = _parse_json_object_response(raw)
+        if not parse_ok:
             return _LLMRewriteOutcome(
                 ok=False,
                 failure_reason="malformed_response",
-                provider_error=f"{type(exc).__name__}:{exc}",
-            )
-        except Exception as exc:
-            return _LLMRewriteOutcome(
-                ok=False,
-                failure_reason="provider_runtime_error",
-                provider_error=f"{type(exc).__name__}:{exc}",
+                provider_error=parse_error or "malformed_response:json_parse_failed",
             )
 
         if not isinstance(parsed, Mapping):
-            return _LLMRewriteOutcome(ok=False, failure_reason="malformed_response")
+            return _LLMRewriteOutcome(
+                ok=False,
+                failure_reason="malformed_response",
+                provider_error=f"malformed_response:top_level_type={type(parsed).__name__}",
+            )
         if "rewritten_query" not in parsed:
-            return _LLMRewriteOutcome(ok=False, failure_reason="validation_failed")
+            return _LLMRewriteOutcome(
+                ok=False,
+                failure_reason="validation_failed",
+                provider_error="validation_failed:missing_rewritten_query",
+            )
         rewritten_raw = parsed.get("rewritten_query")
         if rewritten_raw is None:
-            return _LLMRewriteOutcome(ok=False, failure_reason="empty_response")
+            return _LLMRewriteOutcome(
+                ok=False,
+                failure_reason="empty_response",
+                provider_error="empty_response:rewritten_query_null",
+            )
         if not isinstance(rewritten_raw, str):
-            return _LLMRewriteOutcome(ok=False, failure_reason="validation_failed")
+            return _LLMRewriteOutcome(
+                ok=False,
+                failure_reason="validation_failed",
+                provider_error=f"validation_failed:rewritten_query_type={type(rewritten_raw).__name__}",
+            )
         rewritten = rewritten_raw.strip()
         if not rewritten:
-            return _LLMRewriteOutcome(ok=False, failure_reason="empty_response")
+            return _LLMRewriteOutcome(
+                ok=False,
+                failure_reason="empty_response",
+                provider_error="empty_response:rewritten_query_blank",
+            )
         return _LLMRewriteOutcome(ok=True, rewritten_query=rewritten)
 
     def _classify_llm_exception(self, exc: Exception) -> str:
         message = str(exc).lower()
         if isinstance(exc, TimeoutError) or "timeout" in message or "timed out" in message:
             return "timeout"
-        if "generation_failed" in message:
+        if "model_load_failed" in message or "generation_failed" in message:
+            return "model_execution_failed"
+        if "inference_failed" in message:
             return "inference_failed"
         if isinstance(exc, RuntimeError):
             return "provider_runtime_error"
@@ -867,6 +886,33 @@ def _build_context_blob(conversation_summary: str | None, recent_messages: Seque
         if text:
             message_texts.append(text)
     return "\n".join([summary_text, *message_texts]).strip()
+
+
+def _strip_markdown_json_fence(raw: str) -> str:
+    candidate = raw.strip()
+    if not candidate.startswith("```"):
+        return candidate
+    fence_match = re.match(r"^```(?:json)?\s*(.*?)\s*```$", candidate, flags=re.DOTALL | re.IGNORECASE)
+    if fence_match is None:
+        return candidate
+    return fence_match.group(1).strip()
+
+
+def _parse_json_object_response(raw: str) -> tuple[bool, Any | None, str | None]:
+    candidate = _strip_markdown_json_fence(raw)
+    try:
+        return True, json.loads(candidate), None
+    except JSONDecodeError as exc:
+        object_match = re.search(r"\{[\s\S]*\}", candidate)
+        if object_match is not None:
+            object_candidate = object_match.group(0).strip()
+            try:
+                return True, json.loads(object_candidate), None
+            except JSONDecodeError as nested_exc:
+                return False, None, f"{type(nested_exc).__name__}:{nested_exc}"
+        return False, None, f"{type(exc).__name__}:{exc}"
+    except Exception as exc:  # pragma: no cover - defensive guard
+        return False, None, f"{type(exc).__name__}:{exc}"
 
 
 def _is_rule_exception_pattern(part: str) -> bool:
