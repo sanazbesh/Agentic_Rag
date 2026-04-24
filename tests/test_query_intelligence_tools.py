@@ -143,6 +143,22 @@ def test_safe_fallbacks_on_llm_failure() -> None:
     assert decompose.decomposition_notes.startswith("llm_failure_fallback_original_query")
 
 
+def test_force_llm_rewrite_attempt_bypasses_pre_llm_expansion_guards() -> None:
+    llm = _FakeLLM('{"rewritten_query":"Who is the hiring company named in the agreement?"}')
+    service = QueryTransformationService(llm_client=llm)
+
+    result = service.rewrite_query(
+        "Who is the hiring company?",
+        force_llm_rewrite_attempt=True,
+    )
+
+    assert llm.calls == 1
+    assert result.rewrite_call_outcome is not None
+    assert result.rewrite_call_outcome.get("provider_call_attempted") is True
+    assert result.rewrite_call_outcome.get("provider_call_succeeded") is True
+    assert result.rewrite_call_outcome.get("rewrite_result_type") == "rewritten"
+
+
 def test_extract_legal_entities_contract_clause_query() -> None:
     result = extract_legal_entities("Review NDA confidentiality clause obligations within 30 days.")
 
