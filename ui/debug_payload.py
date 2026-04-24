@@ -176,22 +176,58 @@ def _derive_local_llm_runtime(*, latest_state: dict[str, Any], local_llm_scope: 
         elif provider_init_status != "ready":
             rewrite_fallback_reason = "provider_not_ready"
         else:
-            rewrite_attempted = True
+            rewrite_attempted = bool(provider_call_attempted)
             if "rewrite" in fallback_stages:
+                rewrite_attempted = True
                 rewrite_fallback_reason = rewrite_failure_reason or "fallback_used"
             elif rewrite_used_local_llm:
+                rewrite_attempted = True
                 rewrite_result_type = "no_change" if rewritten_query == original_query else "rewritten"
                 rewrite_failure_stage = None
                 provider_call_attempted = True if not provider_call_attempted else provider_call_attempted
                 provider_call_succeeded = True if not provider_call_succeeded else provider_call_succeeded
                 raw_response_present = True if not raw_response_present else raw_response_present
                 normalized_rewrite_present = True if not normalized_rewrite_present else normalized_rewrite_present
+            elif rewrite_result_type == "failed" or rewrite_failure_reason or rewrite_provider_error:
+                rewrite_attempted = True
+                if rewrite_failure_stage is None:
+                    rewrite_failure_stage = "provider_call" if provider_call_attempted else "stage_guard"
+                if rewrite_fallback_reason is None:
+                    rewrite_fallback_reason = rewrite_failure_reason or (
+                        "provider_runtime_error" if provider_call_attempted else "pre_call_guard"
+                    )
+            else:
+                rewrite_attempted = True
+                rewrite_result_type = "failed"
+                rewrite_failure_stage = "stage_guard"
+                rewrite_fallback_reason = "pre_call_guard"
+                if rewrite_provider_error is None and rewrite_failure_reason:
+                    rewrite_provider_error = rewrite_failure_reason
     elif not rewrite_toggle_enabled:
         rewrite_fallback_reason = "disabled_by_toggle"
         rewrite_result_type = "failed"
     else:
         rewrite_fallback_reason = "rewrite_not_requested"
         rewrite_result_type = "failed"
+
+    if rewrite_result_type in {"rewritten", "no_change"}:
+        rewrite_failure_stage = None
+        rewrite_fallback_reason = None
+        rewrite_provider_error = None
+    elif rewrite_result_type == "failed":
+        if provider_call_attempted and not provider_call_succeeded and rewrite_failure_stage is None:
+            rewrite_failure_stage = "provider_call"
+        if not provider_call_attempted and rewrite_failure_stage is None and rewrite_attempted:
+            rewrite_failure_stage = "stage_guard"
+        if rewrite_fallback_reason is None and rewrite_failure_stage is not None:
+            if rewrite_failure_stage in {"stage_guard", "provider_not_ready", "prompt_build", "pre_call_validation", "missing_client", "config_invalid"}:
+                rewrite_fallback_reason = "pre_call_guard"
+            elif rewrite_failure_stage == "provider_call":
+                rewrite_fallback_reason = "provider_runtime_error"
+            else:
+                rewrite_fallback_reason = "inference_failed"
+        if rewrite_fallback_reason is None and rewrite_provider_error is None:
+            rewrite_fallback_reason = "inference_failed"
 
     def _stage_status(stage: str) -> tuple[str, str | None, bool]:
         toggle_enabled = bool(stage_toggles.get(stage, False))
@@ -214,7 +250,7 @@ def _derive_local_llm_runtime(*, latest_state: dict[str, Any], local_llm_scope: 
                 return "skipped", "provider_not_ready", False
             if stage in fallback_stages:
                 return "fallback", rewrite_fallback_reason or rewrite_failure_reason or "fallback_used", True
-            if provider_call_attempted and not rewrite_used_local_llm:
+            if rewrite_attempted and not rewrite_used_local_llm:
                 return "fallback", rewrite_fallback_reason or rewrite_failure_reason or "fallback_used", True
             return "fallback", "fallback_used", True
 

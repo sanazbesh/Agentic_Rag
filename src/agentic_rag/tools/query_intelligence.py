@@ -579,28 +579,30 @@ class QueryTransformationService:
                 rewrite_notes="empty_input",
             )
 
-        if self._is_party_role_entity_query(normalized_query):
+        prefer_llm_rewrite = bool(force_llm_rewrite_attempt and self.llm_client is not None)
+
+        if not prefer_llm_rewrite and self._is_party_role_entity_query(normalized_query):
             return QueryRewriteResult(
                 original_query=original_query,
                 rewritten_query=self._expand_party_role_query(normalized_query),
                 used_conversation_context=False,
                 rewrite_notes="party_role_entity_query_expansion",
             )
-        if self._is_matter_metadata_query(normalized_query):
+        if not prefer_llm_rewrite and self._is_matter_metadata_query(normalized_query):
             return QueryRewriteResult(
                 original_query=original_query,
                 rewritten_query=self._expand_matter_metadata_query(normalized_query),
                 used_conversation_context=False,
                 rewrite_notes="matter_document_metadata_query_expansion",
             )
-        if self._is_employment_lifecycle_query(normalized_query):
+        if not prefer_llm_rewrite and self._is_employment_lifecycle_query(normalized_query):
             return QueryRewriteResult(
                 original_query=original_query,
                 rewritten_query=self._expand_employment_lifecycle_query(normalized_query),
                 used_conversation_context=False,
                 rewrite_notes="employment_contract_lifecycle_query_expansion",
             )
-        if self._is_employment_mitigation_query(normalized_query):
+        if not prefer_llm_rewrite and self._is_employment_mitigation_query(normalized_query):
             return QueryRewriteResult(
                 original_query=original_query,
                 rewritten_query=self._expand_employment_mitigation_query(normalized_query),

@@ -833,3 +833,73 @@ def test_rewrite_mock_backend_reports_explicit_reason() -> None:
     assert runtime["rewrite_attempted"] is False
     assert runtime["per_stage_fallback_reason"]["rewrite"] == "mock_backend_active"
     assert runtime["rewrite_fallback_reason"] == "mock_backend_active"
+
+
+def test_rewrite_failed_pre_call_records_specific_stage_when_provider_call_not_attempted() -> None:
+    runtime = build_real_debug_payload(
+        latest_state={
+            "warnings": [],
+            "should_rewrite": True,
+            "resolved_query": "who are the parties?",
+            "original_query": "who are the parties?",
+            "rewrite_call_outcome": {},
+        },
+        scope_meta={
+            "local_llm": {
+                "ui_enabled": True,
+                "effective_enabled": True,
+                "mock_backend_active": False,
+                "provider_init_status": "ready",
+                "provider_init_reason": None,
+                "stage_toggles": {"rewrite": True, "decomposition": True, "synthesis": True},
+            }
+        },
+    )["local_llm_runtime"]
+
+    assert runtime["rewrite_requested"] is True
+    assert runtime["rewrite_applicable"] is True
+    assert runtime["rewrite_attempted"] is True
+    assert runtime["rewrite_result_type"] == "failed"
+    assert runtime["provider_call_attempted"] is False
+    assert runtime["rewrite_failure_stage"] == "stage_guard"
+    assert runtime["rewrite_fallback_reason"] == "pre_call_guard"
+    assert runtime["rewrite_provider_error"] is None
+    assert runtime["per_stage_fallback_reason"]["rewrite"] != "fallback_used"
+
+
+def test_rewrite_failed_provider_call_defaults_failure_stage_when_missing() -> None:
+    runtime = build_real_debug_payload(
+        latest_state={
+            "warnings": [],
+            "should_rewrite": True,
+            "resolved_query": "who are the parties?",
+            "original_query": "who are the parties?",
+            "rewrite_call_outcome": {
+                "provider_call_attempted": True,
+                "provider_call_succeeded": False,
+                "raw_response_present": False,
+                "normalized_rewrite_present": False,
+                "rewrite_result_type": "failed",
+                "rewrite_failure_stage": None,
+                "rewrite_fallback_reason": None,
+                "rewrite_provider_error": None,
+            },
+        },
+        scope_meta={
+            "local_llm": {
+                "ui_enabled": True,
+                "effective_enabled": True,
+                "mock_backend_active": False,
+                "provider_init_status": "ready",
+                "provider_init_reason": None,
+                "stage_toggles": {"rewrite": True, "decomposition": True, "synthesis": True},
+            }
+        },
+    )["local_llm_runtime"]
+
+    assert runtime["rewrite_attempted"] is True
+    assert runtime["provider_call_attempted"] is True
+    assert runtime["provider_call_succeeded"] is False
+    assert runtime["rewrite_result_type"] == "failed"
+    assert runtime["rewrite_failure_stage"] == "provider_call"
+    assert runtime["rewrite_fallback_reason"] == "provider_runtime_error"
