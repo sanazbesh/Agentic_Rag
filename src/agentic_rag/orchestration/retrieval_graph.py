@@ -154,6 +154,7 @@ class RetrievalStageState(TypedDict):
     use_conversation_context: bool
 
     rewritten_query: str | None
+    rewrite_notes: str | None
     resolved_query: str
     effective_query: str
     query_classification: QueryRoutingDecision | None
@@ -249,6 +250,7 @@ def default_retrieval_state(
         selected_documents=list(selected_documents or []),
         use_conversation_context=False,
         rewritten_query=None,
+        rewrite_notes=None,
         resolved_query=normalized_query,
         effective_query=normalized_query,
         query_classification=None,
@@ -1229,8 +1231,10 @@ class RetrievalGraphNodes:
             if updated["use_conversation_context"]:
                 kwargs["conversation_summary"] = updated["conversation_summary"]
                 kwargs["recent_messages"] = updated["recent_messages"]
+            kwargs["force_llm_rewrite_attempt"] = True
             result = self.dependencies.rewrite_query(original_query, **kwargs)
             updated["rewritten_query"] = result.rewritten_query
+            updated["rewrite_notes"] = result.rewrite_notes
             updated["effective_query"] = result.rewritten_query or original_query
             if isinstance(result.rewrite_notes, str) and result.rewrite_notes.startswith("resolved_reference_with_llm"):
                 updated["warnings"] = [*updated["warnings"], f"rewrite_path:llm:{result.rewrite_notes.split(':', 1)[1]}"]

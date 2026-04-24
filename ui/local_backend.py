@@ -229,6 +229,7 @@ def build_local_backend_dependencies(
         "local_llm": {
             "ui_enabled": llm_settings.ui_enabled,
             "effective_enabled": llm_settings.enabled,
+            "mock_backend_active": llm_settings.mock_backend_active,
             "provider": llm_settings.provider,
             "model_path": llm_settings.model_path,
             "n_ctx": llm_settings.n_ctx,
