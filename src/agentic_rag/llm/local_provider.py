@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from importlib.util import find_spec
 from dataclasses import dataclass
+import json
 from pathlib import Path
 from typing import Protocol
 
@@ -136,6 +137,87 @@ class PromptLLMClient:
             temperature=self.config.temperature,
             timeout_seconds=self.config.timeout_seconds,
         )
+
+
+@dataclass(slots=True, frozen=True)
+class RewriteProviderSmokeResult:
+    provider_call_attempted: bool
+    provider_call_succeeded: bool
+    raw_response_present: bool
+    raw_response_text: str | None
+    raw_response_text_length: int | None
+    usable_output: bool
+    rewrite_provider_error: str | None = None
+
+
+def run_rewrite_provider_smoke_test(config: LocalLLMConfig) -> RewriteProviderSmokeResult:
+    client, diagnostics = build_local_prompt_llm_with_diagnostics(config)
+    if client is None:
+        reason = str(diagnostics.get("provider_init_reason") or diagnostics.get("provider_init_status") or "provider_not_ready")
+        return RewriteProviderSmokeResult(
+            provider_call_attempted=False,
+            provider_call_succeeded=False,
+            raw_response_present=False,
+            raw_response_text=None,
+            raw_response_text_length=None,
+            usable_output=False,
+            rewrite_provider_error=f"provider_not_ready:{reason}",
+        )
+
+    prompt = (
+        "Rewrite this query for legal retrieval while preserving meaning. "
+        "Return strict JSON: {\"rewritten_query\": \"...\"}.\n\n"
+        "QUERY:\nwho is the employer?"
+    )
+    try:
+        raw = client.complete(prompt)
+    except Exception as exc:
+        return RewriteProviderSmokeResult(
+            provider_call_attempted=True,
+            provider_call_succeeded=False,
+            raw_response_present=False,
+            raw_response_text=None,
+            raw_response_text_length=None,
+            usable_output=False,
+            rewrite_provider_error=f"{type(exc).__name__}:{exc}",
+        )
+    if not isinstance(raw, str):
+        return RewriteProviderSmokeResult(
+            provider_call_attempted=True,
+            provider_call_succeeded=True,
+            raw_response_present=False,
+            raw_response_text=None,
+            raw_response_text_length=None,
+            usable_output=False,
+            rewrite_provider_error=f"malformed_response:type={type(raw).__name__}",
+        )
+    normalized = raw.strip()
+    if not normalized:
+        return RewriteProviderSmokeResult(
+            provider_call_attempted=True,
+            provider_call_succeeded=True,
+            raw_response_present=False,
+            raw_response_text=raw,
+            raw_response_text_length=len(raw),
+            usable_output=False,
+            rewrite_provider_error="empty_response",
+        )
+    usable_output = False
+    try:
+        parsed = json.loads(normalized)
+        rewritten = parsed.get("rewritten_query") if isinstance(parsed, dict) else None
+        usable_output = isinstance(rewritten, str) and bool(rewritten.strip())
+    except Exception:
+        usable_output = bool(normalized)
+    return RewriteProviderSmokeResult(
+        provider_call_attempted=True,
+        provider_call_succeeded=True,
+        raw_response_present=True,
+        raw_response_text=raw,
+        raw_response_text_length=len(normalized),
+        usable_output=usable_output,
+        rewrite_provider_error=None if usable_output else "malformed_response_or_unusable_output",
+    )
 
 
 def build_local_prompt_llm(config: LocalLLMConfig) -> PromptLLMClient | None:

@@ -545,9 +545,14 @@ def test_rewrite_invocation_exception_surfaces_specific_failure_diagnostics(tmp_
     assert runtime["local_llm_used"] is False
     assert runtime["rewrite_result_type"] == "failed"
     assert runtime["rewrite_fallback_reason"] == "provider_runtime_error"
+    assert runtime["rewrite_failure_stage"] == "provider_call"
     assert runtime["per_stage_local_llm_status"]["rewrite"] == "fallback"
     assert runtime["per_stage_fallback_reason"]["rewrite"] == "provider_runtime_error"
     assert runtime["rewrite_provider_error"] == "RuntimeError:provider_call_failed"
+    assert runtime["provider_call_attempted"] is True
+    assert runtime["provider_call_succeeded"] is False
+    assert runtime["raw_response_present"] is False
+    assert runtime["normalized_rewrite_present"] is False
     assert "rewrite" not in runtime["stages_using_local_llm"]
 
 
@@ -591,6 +596,7 @@ def test_rewrite_failure_reasons_distinguish_timeout_and_malformed(tmp_path: Pat
         latest_state=timeout_state, selected_documents=[descriptor], scope_meta=timeout_build.scope_meta
     )["local_llm_runtime"]
     assert timeout_runtime["rewrite_fallback_reason"] == "timeout"
+    assert timeout_runtime["rewrite_failure_stage"] == "provider_call"
 
     monkeypatch.setattr(
         "ui.local_backend.build_local_prompt_llm_with_diagnostics",
@@ -610,6 +616,7 @@ def test_rewrite_failure_reasons_distinguish_timeout_and_malformed(tmp_path: Pat
         latest_state=malformed_state, selected_documents=[descriptor], scope_meta=malformed_build.scope_meta
     )["local_llm_runtime"]
     assert malformed_runtime["rewrite_fallback_reason"] == "malformed_response"
+    assert malformed_runtime["rewrite_failure_stage"] == "response_parse"
 
 
 def test_rewrite_noop_is_not_reported_as_fallback(tmp_path: Path, monkeypatch: Any) -> None:
@@ -651,7 +658,10 @@ def test_rewrite_noop_is_not_reported_as_fallback(tmp_path: Path, monkeypatch: A
     ]
     assert runtime["rewrite_used_local_llm"] is True
     assert runtime["rewrite_result_type"] == "no_change"
+    assert runtime["rewrite_failure_stage"] is None
     assert runtime["per_stage_local_llm_status"]["rewrite"] == "used"
+    assert runtime["provider_call_succeeded"] is True
+    assert runtime["normalized_rewrite_present"] is True
     assert "rewrite" in runtime["stages_using_local_llm"]
 
 
@@ -694,6 +704,7 @@ def test_rewrite_accepts_fenced_json_and_marks_local_llm_used(tmp_path: Path, mo
     ]
     assert runtime["rewrite_used_local_llm"] is True
     assert runtime["rewrite_result_type"] == "rewritten"
+    assert runtime["rewrite_failure_stage"] is None
     assert runtime["rewrite_provider_error"] is None
     assert runtime["per_stage_local_llm_status"]["rewrite"] == "used"
     assert runtime["per_stage_fallback_reason"].get("rewrite") != "fallback_used"
@@ -740,6 +751,7 @@ def test_rewrite_validation_and_empty_failures_surface_specific_reasons(tmp_path
     )["local_llm_runtime"]
     assert validation_runtime["rewrite_result_type"] == "failed"
     assert validation_runtime["rewrite_fallback_reason"] == "validation_failed"
+    assert validation_runtime["rewrite_failure_stage"] == "response_validation"
     assert validation_runtime["per_stage_fallback_reason"]["rewrite"] == "validation_failed"
     assert validation_runtime["rewrite_provider_error"] == "validation_failed:missing_rewritten_query"
     assert validation_runtime["local_llm_used"] is False
@@ -763,6 +775,7 @@ def test_rewrite_validation_and_empty_failures_surface_specific_reasons(tmp_path
     )["local_llm_runtime"]
     assert empty_runtime["rewrite_result_type"] == "failed"
     assert empty_runtime["rewrite_fallback_reason"] == "empty_response"
+    assert empty_runtime["rewrite_failure_stage"] == "normalization"
     assert empty_runtime["per_stage_fallback_reason"]["rewrite"] == "empty_response"
     assert empty_runtime["rewrite_provider_error"] == "empty_response:rewritten_query_blank"
     assert empty_runtime["local_llm_used"] is False

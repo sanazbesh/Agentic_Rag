@@ -155,6 +155,7 @@ class RetrievalStageState(TypedDict):
 
     rewritten_query: str | None
     rewrite_notes: str | None
+    rewrite_call_outcome: dict[str, Any] | None
     resolved_query: str
     effective_query: str
     query_classification: QueryRoutingDecision | None
@@ -251,6 +252,7 @@ def default_retrieval_state(
         use_conversation_context=False,
         rewritten_query=None,
         rewrite_notes=None,
+        rewrite_call_outcome=None,
         resolved_query=normalized_query,
         effective_query=normalized_query,
         query_classification=None,
@@ -1235,6 +1237,7 @@ class RetrievalGraphNodes:
             result = self.dependencies.rewrite_query(original_query, **kwargs)
             updated["rewritten_query"] = result.rewritten_query
             updated["rewrite_notes"] = result.rewrite_notes
+            updated["rewrite_call_outcome"] = dict(result.rewrite_call_outcome) if isinstance(result.rewrite_call_outcome, dict) else None
             updated["effective_query"] = result.rewritten_query or original_query
             if isinstance(result.rewrite_notes, str) and result.rewrite_notes.startswith("resolved_reference_with_llm"):
                 updated["warnings"] = [*updated["warnings"], f"rewrite_path:llm:{result.rewrite_notes.split(':', 1)[1]}"]
@@ -1283,6 +1286,18 @@ class RetrievalGraphNodes:
                 "llm_failure_fallback_original_query:"
                 f"exception:reason={failure_reason}:error={provider_error}"
             )
+            updated["rewrite_call_outcome"] = {
+                "provider_call_attempted": True,
+                "provider_call_succeeded": False,
+                "raw_response_present": False,
+                "raw_response_text_length": None,
+                "normalized_rewrite_present": False,
+                "normalized_rewrite_text_length": None,
+                "rewrite_result_type": "failed",
+                "rewrite_failure_stage": "provider_call",
+                "rewrite_fallback_reason": failure_reason,
+                "rewrite_provider_error": provider_error,
+            }
             updated["effective_query"] = original_query
         logger.info(
             "node_exit name=rewrite_query_if_needed rewritten=%s effective_query_length=%s",

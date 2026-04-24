@@ -110,6 +110,11 @@ def _derive_local_llm_runtime(*, latest_state: dict[str, Any], local_llm_scope: 
         (item.split(":", 1)[1] for item in warnings if item.startswith("rewrite_provider_error:")),
         None,
     )
+    rewrite_call_outcome = (
+        dict(latest_state.get("rewrite_call_outcome"))
+        if isinstance(latest_state.get("rewrite_call_outcome"), dict)
+        else {}
+    )
 
     decomposition_plan = latest_state.get("decomposition_plan")
     planner_notes = [str(item) for item in list(getattr(decomposition_plan, "planner_notes", []))]
@@ -137,6 +142,29 @@ def _derive_local_llm_runtime(*, latest_state: dict[str, Any], local_llm_scope: 
     rewritten_query = str(latest_state.get("rewritten_query") or "")
     original_query = str(latest_state.get("resolved_query") or latest_state.get("original_query") or "")
     rewrite_result_type = "failed"
+    rewrite_failure_stage: str | None = None
+    provider_call_attempted = bool(rewrite_call_outcome.get("provider_call_attempted", False))
+    provider_call_succeeded = bool(rewrite_call_outcome.get("provider_call_succeeded", False))
+    raw_response_present = bool(rewrite_call_outcome.get("raw_response_present", False))
+    raw_response_text_length = (
+        int(rewrite_call_outcome["raw_response_text_length"])
+        if isinstance(rewrite_call_outcome.get("raw_response_text_length"), int)
+        else None
+    )
+    normalized_rewrite_present = bool(rewrite_call_outcome.get("normalized_rewrite_present", False))
+    normalized_rewrite_text_length = (
+        int(rewrite_call_outcome["normalized_rewrite_text_length"])
+        if isinstance(rewrite_call_outcome.get("normalized_rewrite_text_length"), int)
+        else None
+    )
+    if isinstance(rewrite_call_outcome.get("rewrite_result_type"), str):
+        rewrite_result_type = str(rewrite_call_outcome["rewrite_result_type"])
+    if isinstance(rewrite_call_outcome.get("rewrite_failure_stage"), str):
+        rewrite_failure_stage = str(rewrite_call_outcome["rewrite_failure_stage"])
+    if isinstance(rewrite_call_outcome.get("rewrite_fallback_reason"), str):
+        rewrite_fallback_reason = str(rewrite_call_outcome["rewrite_fallback_reason"])
+    if isinstance(rewrite_call_outcome.get("rewrite_provider_error"), str):
+        rewrite_provider_error = str(rewrite_call_outcome["rewrite_provider_error"])
 
     if rewrite_applicable:
         if mock_backend_active:
@@ -153,6 +181,11 @@ def _derive_local_llm_runtime(*, latest_state: dict[str, Any], local_llm_scope: 
                 rewrite_fallback_reason = rewrite_failure_reason or "fallback_used"
             elif rewrite_used_local_llm:
                 rewrite_result_type = "no_change" if rewritten_query == original_query else "rewritten"
+                rewrite_failure_stage = None
+                provider_call_attempted = True if not provider_call_attempted else provider_call_attempted
+                provider_call_succeeded = True if not provider_call_succeeded else provider_call_succeeded
+                raw_response_present = True if not raw_response_present else raw_response_present
+                normalized_rewrite_present = True if not normalized_rewrite_present else normalized_rewrite_present
     elif not rewrite_toggle_enabled:
         rewrite_fallback_reason = "disabled_by_toggle"
         rewrite_result_type = "failed"
@@ -180,7 +213,9 @@ def _derive_local_llm_runtime(*, latest_state: dict[str, Any], local_llm_scope: 
             if provider_init_status != "ready":
                 return "skipped", "provider_not_ready", False
             if stage in fallback_stages:
-                return "fallback", rewrite_failure_reason or "fallback_used", True
+                return "fallback", rewrite_fallback_reason or rewrite_failure_reason or "fallback_used", True
+            if provider_call_attempted and not rewrite_used_local_llm:
+                return "fallback", rewrite_fallback_reason or rewrite_failure_reason or "fallback_used", True
             return "fallback", "fallback_used", True
 
         if stage == "decomposition":
@@ -253,5 +288,12 @@ def _derive_local_llm_runtime(*, latest_state: dict[str, Any], local_llm_scope: 
         "rewrite_used_local_llm": rewrite_used_local_llm,
         "rewrite_fallback_reason": rewrite_fallback_reason,
         "rewrite_result_type": rewrite_result_type,
+        "rewrite_failure_stage": rewrite_failure_stage,
         "rewrite_provider_error": rewrite_provider_error,
+        "provider_call_attempted": provider_call_attempted,
+        "provider_call_succeeded": provider_call_succeeded,
+        "raw_response_present": raw_response_present,
+        "raw_response_text_length": raw_response_text_length,
+        "normalized_rewrite_present": normalized_rewrite_present,
+        "normalized_rewrite_text_length": normalized_rewrite_text_length,
     }
