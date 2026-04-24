@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from importlib.util import find_spec
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -90,13 +91,16 @@ class LlamaCppChatProvider:
         if not Path(self.model_path).is_file():
             raise RuntimeError("llama_cpp_model_missing")
 
-        llm = Llama(
-            model_path=self.model_path,
-            n_ctx=self.n_ctx,
-            n_gpu_layers=self.n_gpu_layers,
-            n_threads=self.threads,
-            verbose=False,
-        )
+        try:
+            llm = Llama(
+                model_path=self.model_path,
+                n_ctx=self.n_ctx,
+                n_gpu_layers=self.n_gpu_layers,
+                n_threads=self.threads,
+                verbose=False,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"llama_cpp_model_load_failed:{type(exc).__name__}") from exc
         try:
             response = llm.create_chat_completion(
                 messages=messages,
@@ -135,12 +139,34 @@ class PromptLLMClient:
 
 
 def build_local_prompt_llm(config: LocalLLMConfig) -> PromptLLMClient | None:
+    client, _ = build_local_prompt_llm_with_diagnostics(config)
+    return client
+
+
+def build_local_prompt_llm_with_diagnostics(config: LocalLLMConfig) -> tuple[PromptLLMClient | None, dict[str, str | bool | None]]:
+    diagnostics: dict[str, str | bool | None] = {
+        "local_llm_attempted": bool(config.enabled and config.provider == "llama_cpp"),
+        "provider_init_status": "not_attempted",
+        "provider_init_error": None,
+        "provider_init_reason": None,
+    }
     if not config.enabled:
-        return None
+        diagnostics["provider_init_status"] = "disabled"
+        return None, diagnostics
     if config.provider != "llama_cpp":
-        return None
+        diagnostics["provider_init_status"] = "unsupported_provider"
+        diagnostics["provider_init_reason"] = "provider_init_failed"
+        return None, diagnostics
     if not config.model_path or not Path(config.model_path).is_file():
-        return None
+        diagnostics["provider_init_status"] = "failed"
+        diagnostics["provider_init_reason"] = "invalid_model_path"
+        return None, diagnostics
+    if find_spec("llama_cpp") is None:
+        diagnostics["provider_init_status"] = "failed"
+        diagnostics["provider_init_reason"] = "provider_import_failed"
+        diagnostics["provider_init_error"] = "llama_cpp_import_unavailable"
+        return None, diagnostics
+    diagnostics["provider_init_status"] = "ready"
     return PromptLLMClient(
         provider=LlamaCppChatProvider(
             model_path=config.model_path,
@@ -150,7 +176,7 @@ def build_local_prompt_llm(config: LocalLLMConfig) -> PromptLLMClient | None:
             threads=config.threads,
         ),
         config=config,
-    )
+    ), diagnostics
 
 
 def build_local_prompt_llm_from_env(env: dict[str, str] | None = None) -> PromptLLMClient | None:
