@@ -1243,6 +1243,25 @@ class RetrievalGraphNodes:
                 or result.rewrite_notes.startswith("deterministic_fallback")
             ):
                 updated["warnings"] = [*updated["warnings"], f"rewrite_path:deterministic_fallback:{result.rewrite_notes.split(':', 1)[1]}"]
+            if isinstance(result.rewrite_notes, str) and result.rewrite_notes.startswith("llm_failure_fallback_original_query:"):
+                reason_marker = "reason="
+                error_marker = ":error="
+                reason_idx = result.rewrite_notes.find(reason_marker)
+                if reason_idx != -1:
+                    reason_start = reason_idx + len(reason_marker)
+                    error_idx = result.rewrite_notes.find(error_marker, reason_start)
+                    reason = (
+                        result.rewrite_notes[reason_start:error_idx]
+                        if error_idx != -1
+                        else result.rewrite_notes[reason_start:]
+                    ).strip()
+                    if reason:
+                        updated["warnings"] = [*updated["warnings"], f"rewrite_failure_reason:{reason}"]
+                error_idx = result.rewrite_notes.find(error_marker)
+                if error_idx != -1:
+                    provider_error = result.rewrite_notes[error_idx + len(error_marker) :].strip()
+                    if provider_error:
+                        updated["warnings"] = [*updated["warnings"], f"rewrite_provider_error:{provider_error}"]
         except Exception as exc:  # pragma: no cover - defensive fallback
             updated["warnings"] = [*updated["warnings"], f"rewrite_failed:{type(exc).__name__}"]
             updated["rewritten_query"] = None

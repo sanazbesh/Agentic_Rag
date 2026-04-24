@@ -11,6 +11,7 @@ import logging
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from json import JSONDecodeError
 from typing import Any, Protocol
 
 from agentic_rag.llm import build_local_prompt_llm_from_env, local_llm_config_from_env
@@ -54,6 +55,16 @@ class QueryDecompositionResult:
     sub_queries: tuple[str, ...]
     used_conversation_context: bool
     decomposition_notes: str = ""
+
+
+@dataclass(slots=True, frozen=True)
+class _LLMRewriteOutcome:
+    """Internal outcome for rewrite provider calls."""
+
+    ok: bool
+    rewritten_query: str | None = None
+    failure_reason: str | None = None
+    provider_error: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -600,20 +611,27 @@ class QueryTransformationService:
         llm_attempt_eligible = bool(self.llm_client is not None and (needs_context or force_llm_rewrite_attempt))
 
         if llm_attempt_eligible:
-            llm_ok, llm_result = self._llm_rewrite_query(normalized_query, context_blob or None)
-            if llm_ok and llm_result is not None:
+            llm_outcome = self._llm_rewrite_query(normalized_query, context_blob or None)
+            if llm_outcome.ok and llm_outcome.rewritten_query is not None:
+                rewrite_state = "no_change" if llm_outcome.rewritten_query == normalized_query else "rewritten"
                 return QueryRewriteResult(
                     original_query=original_query,
-                    rewritten_query=llm_result,
+                    rewritten_query=llm_outcome.rewritten_query,
                     used_conversation_context=bool(context_blob),
-                    rewrite_notes=f"resolved_reference_with_llm:{self.llm_provider_label}",
+                    rewrite_notes=f"resolved_reference_with_llm:{self.llm_provider_label}:{rewrite_state}",
                 )
-            if not llm_ok:
+            if not llm_outcome.ok:
+                provider_error_suffix = (
+                    f":error={llm_outcome.provider_error}" if llm_outcome.provider_error else ""
+                )
                 return QueryRewriteResult(
                     original_query=original_query,
                     rewritten_query=normalized_query,
                     used_conversation_context=False,
-                    rewrite_notes=f"llm_failure_fallback_original_query:{self.llm_provider_label}",
+                    rewrite_notes=(
+                        f"llm_failure_fallback_original_query:{self.llm_provider_label}:"
+                        f"reason={llm_outcome.failure_reason or 'inference_failed'}{provider_error_suffix}"
+                    ),
                 )
 
         if not needs_context:
@@ -726,7 +744,7 @@ class QueryTransformationService:
             rewritten = re.sub(pattern, referent, rewritten, flags=re.IGNORECASE)
         return rewritten
 
-    def _llm_rewrite_query(self, query: str, context_blob: str | None) -> tuple[bool, str | None]:
+    def _llm_rewrite_query(self, query: str, context_blob: str | None) -> _LLMRewriteOutcome:
         context_section = context_blob or "(none)"
         prompt = (
             "Rewrite the legal retrieval query to maximize retrieval precision while preserving legal meaning. "
@@ -737,12 +755,55 @@ class QueryTransformationService:
         )
         try:
             raw = self.llm_client.complete(prompt)  # type: ignore[union-attr]
-            parsed = json.loads(raw)
-            rewritten = str(parsed.get("rewritten_query", "")).strip()
-            return True, rewritten or None
-        except Exception:
+        except Exception as exc:
             logger.exception("LLM rewrite failed; using heuristic/safe fallback.")
-            return False, None
+            return _LLMRewriteOutcome(
+                ok=False,
+                failure_reason=self._classify_llm_exception(exc),
+                provider_error=f"{type(exc).__name__}:{exc}",
+            )
+
+        if not isinstance(raw, str) or not raw.strip():
+            return _LLMRewriteOutcome(ok=False, failure_reason="empty_response")
+
+        try:
+            parsed = json.loads(raw)
+        except JSONDecodeError as exc:
+            return _LLMRewriteOutcome(
+                ok=False,
+                failure_reason="malformed_response",
+                provider_error=f"{type(exc).__name__}:{exc}",
+            )
+        except Exception as exc:
+            return _LLMRewriteOutcome(
+                ok=False,
+                failure_reason="provider_runtime_error",
+                provider_error=f"{type(exc).__name__}:{exc}",
+            )
+
+        if not isinstance(parsed, Mapping):
+            return _LLMRewriteOutcome(ok=False, failure_reason="malformed_response")
+        if "rewritten_query" not in parsed:
+            return _LLMRewriteOutcome(ok=False, failure_reason="validation_failed")
+        rewritten_raw = parsed.get("rewritten_query")
+        if rewritten_raw is None:
+            return _LLMRewriteOutcome(ok=False, failure_reason="empty_response")
+        if not isinstance(rewritten_raw, str):
+            return _LLMRewriteOutcome(ok=False, failure_reason="validation_failed")
+        rewritten = rewritten_raw.strip()
+        if not rewritten:
+            return _LLMRewriteOutcome(ok=False, failure_reason="empty_response")
+        return _LLMRewriteOutcome(ok=True, rewritten_query=rewritten)
+
+    def _classify_llm_exception(self, exc: Exception) -> str:
+        message = str(exc).lower()
+        if isinstance(exc, TimeoutError) or "timeout" in message or "timed out" in message:
+            return "timeout"
+        if "generation_failed" in message:
+            return "inference_failed"
+        if isinstance(exc, RuntimeError):
+            return "provider_runtime_error"
+        return "inference_failed"
 
     def _llm_decompose_query(
         self,
