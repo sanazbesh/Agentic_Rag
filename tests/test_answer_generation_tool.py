@@ -208,6 +208,42 @@ def test_who_is_the_employee_returns_individual_side_party_when_supported() -> N
     assert "acme holdings llc" not in result.answer_text.lower().split("direct answer:")[1].split("\n")[0]
 
 
+def test_intro_pattern_between_and_with_explicit_role_labels_resolves_roles() -> None:
+    context = [
+        _parent(
+            "p-1",
+            "Parties",
+            "BETWEEN:\nAcme Holdings LLC (the “Employer”)\nAND:\nJane Smith (the “Employee”)\n",
+        )
+    ]
+
+    employer = generate_answer(context, "Who is the employer?")
+    employee = generate_answer(context, "Who is the employee?")
+
+    assert employer.sufficient_context is True
+    assert employee.sufficient_context is True
+    assert "acme holdings llc" in employer.answer_text.lower()
+    assert "jane smith" in employee.answer_text.lower()
+    assert employer.citations
+    assert employee.citations
+
+
+def test_intro_pattern_as_role_format_resolves_parties() -> None:
+    context = [
+        _parent(
+            "p-1",
+            "Introduction",
+            "Acme Holdings LLC as Employer and Jane Smith as Employee agree to the following terms.",
+        )
+    ]
+
+    result = generate_answer(context, "Who are the parties?")
+
+    assert result.sufficient_context is True
+    assert "acme holdings llc" in result.answer_text.lower()
+    assert "jane smith" in result.answer_text.lower()
+
+
 def test_who_are_the_parties_returns_both_parties_when_supported() -> None:
     context = [
         _parent(
@@ -363,6 +399,27 @@ def test_ambiguous_or_missing_role_resolution_still_fails_safely() -> None:
     assert result.sufficient_context is False
     assert result.grounded is False
     assert any("party_role_assignment_unresolved" in warning for warning in result.warnings)
+
+
+def test_hiring_company_and_company_side_variants_use_intro_party_resolution() -> None:
+    context = [
+        _parent(
+            "p-1",
+            "Parties",
+            'This Employment Agreement is between Acme Holdings LLC ("Employer") and Jane Smith ("Employee").',
+        )
+    ]
+
+    hiring_company = generate_answer(context, "Who is the hiring company?")
+    company_side = generate_answer(context, "Which party is the company side?")
+    individual_side = generate_answer(context, "Which party is the individual side?")
+
+    assert hiring_company.sufficient_context is True
+    assert company_side.sufficient_context is True
+    assert individual_side.sufficient_context is True
+    assert "acme holdings llc" in hiring_company.answer_text.lower()
+    assert "acme holdings llc" in company_side.answer_text.lower()
+    assert "jane smith" in individual_side.answer_text.lower()
 
 
 
