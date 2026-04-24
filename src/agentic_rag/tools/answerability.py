@@ -23,6 +23,15 @@ if TYPE_CHECKING:  # pragma: no cover
     from agentic_rag.orchestration.query_understanding import QueryUnderstandingResult
 
 from agentic_rag.tools.evidence_units import EvidenceUnit, build_evidence_units
+from agentic_rag.tools.party_role_resolution import (
+    compare_query_entities_against_extracted_parties,
+    extract_intro_party_role_assignment,
+    is_usable_party_entity,
+    normalize_party_text,
+    parse_party_verification_query_entities,
+    pick_company_party,
+    pick_individual_party,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -187,6 +196,8 @@ class _PartyRoleAssignment:
     parties: tuple[str, ...]
     employer: str | None
     employee: str | None
+    company_side_party: str | None
+    individual_side_party: str | None
 
 
 @dataclass(slots=True)
@@ -1925,6 +1936,9 @@ class AnswerabilityAssessor:
             r"\bwho\s+is\s+the\s+employee\b",
             r"\bwho\s+are\s+the\s+parties\b",
             r"\bwhich\s+company\s+is\s+this\s+agreement\s+for\b",
+            r"\bwho\s+is\s+the\s+hiring\s+company\b",
+            r"\bwhich\s+party\s+is\s+the\s+company\s+side\b",
+            r"\bwhich\s+party\s+is\s+the\s+individual\s+side\b",
             r"\bis\s+this\s+agreement\s+between\b",
             r"\bis\s+(?:this|the)\s+agreement\s+with\b",
             r"\bis\s+(?:this|the)\s+agreement\s+for\b",
@@ -1949,6 +1963,19 @@ class AnswerabilityAssessor:
             r"\bwhat\s+is\s+this\s+(?:matter|document)\s+about\b",
         )
         return any(re.search(pattern, lowered) for pattern in patterns)
+
+    def _is_company_side_query(self, lowered_query: str) -> bool:
+        return any(
+            re.search(pattern, lowered_query)
+            for pattern in (
+                r"\bwhich\s+company\s+is\s+this\s+agreement\s+for\b",
+                r"\bwho\s+is\s+the\s+hiring\s+company\b",
+                r"\bwhich\s+party\s+is\s+the\s+company\s+side\b",
+            )
+        )
+
+    def _is_individual_side_query(self, lowered_query: str) -> bool:
+        return bool(re.search(r"\bwhich\s+party\s+is\s+the\s+individual\s+side\b", lowered_query))
 
     def _has_matter_metadata_evidence(self, substantive: Sequence[Mapping[str, Any]], query: str) -> bool:
         lowered_query = self._canonical_phrase(query)
@@ -2122,8 +2149,8 @@ class AnswerabilityAssessor:
                 extracted_parties=role_assignment.parties,
             )
 
-        if "which company is this agreement for" in lowered_query:
-            company = role_assignment.employer or self._pick_company_party(role_assignment.parties)
+        if self._is_company_side_query(lowered_query):
+            company = role_assignment.company_side_party or role_assignment.employer or self._pick_company_party(role_assignment.parties)
             if company:
                 return {
                     "supported": True,
@@ -2139,6 +2166,23 @@ class AnswerabilityAssessor:
                 "signals": ["party_role_assignment_resolved"],
                 "missing": ["company_side_party_not_identified"],
             }
+        if self._is_individual_side_query(lowered_query):
+            individual = role_assignment.individual_side_party or role_assignment.employee or pick_individual_party(role_assignment.parties)
+            if individual:
+                return {
+                    "supported": True,
+                    "signals": [
+                        "party_role_responsive_evidence_detected",
+                        "party_role_assignment_resolved",
+                        "individual_side_party_identified",
+                    ],
+                    "missing": [],
+                }
+            return {
+                "supported": False,
+                "signals": ["party_role_assignment_resolved"],
+                "missing": ["individual_side_party_not_identified"],
+            }
 
         return {
             "supported": False,
@@ -2153,23 +2197,7 @@ class AnswerabilityAssessor:
         return cast(tuple[str, ...], parsed["targets"])
 
     def _parse_party_verification_query_entities(self, lowered_query: str) -> dict[str, object] | None:
-        between_match = re.search(r"\bis\s+(?:this|the)\s+agreement\s+between\s+(.+?)\s+and\s+(.+?)\??$", lowered_query)
-        if between_match:
-            first = self._normalize_party_text(between_match.group(1))
-            second = self._normalize_party_text(between_match.group(2))
-            ambiguous = (
-                not self._is_usable_party_entity(first)
-                or not self._is_usable_party_entity(second)
-                or first == second
-            )
-            return {"targets": (first, second), "ambiguous": ambiguous}
-
-        single_party_match = re.search(r"\bis\s+(?:this|the)\s+agreement\s+(?:with|for)\s+(.+?)\??$", lowered_query)
-        if single_party_match:
-            target = self._normalize_party_text(single_party_match.group(1))
-            ambiguous = not self._is_usable_party_entity(target)
-            return {"targets": (target,), "ambiguous": ambiguous}
-        return None
+        return parse_party_verification_query_entities(lowered_query)
 
     def _compare_query_entities_against_extracted_parties(
         self,
@@ -2177,28 +2205,23 @@ class AnswerabilityAssessor:
         verification_targets: tuple[str, ...],
         extracted_parties: Sequence[str],
     ) -> dict[str, object]:
-        normalized_extracted = [
-            self._normalize_party_text(party)
-            for party in extracted_parties
-            if self._is_usable_party_entity(self._normalize_party_text(party))
-        ]
-        extracted_set = set(normalized_extracted)
-        if len(extracted_set) < 2:
+        comparison = compare_query_entities_against_extracted_parties(
+            verification_targets=verification_targets,
+            extracted_parties=extracted_parties,
+        )
+        if comparison["status"] == "incomplete_party_set":
             return {
                 "supported": False,
                 "signals": ["party_role_assignment_resolved"],
                 "missing": ["extracted_party_set_incomplete_or_ambiguous"],
             }
-
-        target_set = set(verification_targets)
-        if len(target_set) != len(verification_targets) or not target_set:
+        if comparison["status"] == "query_ambiguous":
             return {
                 "supported": False,
                 "signals": ["party_role_assignment_resolved"],
                 "missing": ["query_entity_set_incomplete_or_ambiguous"],
             }
-
-        if all(target in extracted_set for target in verification_targets):
+        if comparison["status"] == "matched":
             return {
                 "supported": True,
                 "signals": [
@@ -2221,68 +2244,27 @@ class AnswerabilityAssessor:
             text = str(item.get("text") or "").strip()
             if not text:
                 continue
-            assignment = self._extract_intro_assignment(text)
-            if assignment is not None:
-                return assignment
+            parsed = extract_intro_party_role_assignment(text)
+            if parsed is not None:
+                return _PartyRoleAssignment(
+                    parties=parsed.parties,
+                    employer=parsed.employer,
+                    employee=parsed.employee,
+                    company_side_party=parsed.company_side_party,
+                    individual_side_party=parsed.individual_side_party,
+                )
         return None
 
     def _extract_intro_assignment(self, text: str) -> _PartyRoleAssignment | None:
-        lowered = text.lower()
-        has_intro_anchor = bool(
-            re.search(r"\b(this\s+.+?\s+agreement\s+is\s+made(?:\s+effective)?|by\s+and\s+between|between|parties\s+to\s+this\s+agreement\s+are)\b", lowered)
-        )
-        if not has_intro_anchor:
+        parsed = extract_intro_party_role_assignment(text)
+        if parsed is None:
             return None
-
-        employer_label = re.search(r"\bemployer\s*[:\-]\s*([^;\n.]+)", text, flags=re.IGNORECASE)
-        employee_label = re.search(r"\bemployee\s*[:\-]\s*([^;\n.]+)", text, flags=re.IGNORECASE)
-        employer = self._clean_party_name(employer_label.group(1)) if employer_label else None
-        employee = self._clean_party_name(employee_label.group(1)) if employee_label else None
-
-        between_match = re.search(r"\bbetween\s+(.+?)\s+and\s+(.+?)(?:[.;\n]|$)", text, flags=re.IGNORECASE)
-        parties_are_match = re.search(r"\bparties\s+to\s+this\s+agreement\s+are\s+(.+?)\s+and\s+(.+?)(?:[.;\n]|$)", text, flags=re.IGNORECASE)
-        role_source = between_match or parties_are_match
-        parties: list[str] = []
-        if role_source:
-            first = self._clean_party_name(role_source.group(1))
-            second = self._clean_party_name(role_source.group(2))
-            if first:
-                parties.append(first)
-            if second:
-                parties.append(second)
-
-            first_role = self._detect_inline_role(role_source.group(1))
-            second_role = self._detect_inline_role(role_source.group(2))
-            if first_role == "employer":
-                employer = employer or first
-            elif first_role == "employee":
-                employee = employee or first
-            if second_role == "employer":
-                employer = employer or second
-            elif second_role == "employee":
-                employee = employee or second
-
-        if len(parties) >= 2 and (employer is None or employee is None):
-            inferred_employer, inferred_employee = self._infer_employer_employee(parties[0], parties[1], lowered)
-            employer = employer or inferred_employer
-            employee = employee or inferred_employee
-
-        if employer and self._is_placeholder_party(employer):
-            employer = None
-        if employee and self._is_placeholder_party(employee):
-            employee = None
-        parties = [party for party in parties if not self._is_placeholder_party(party)]
-
-        if not parties and employer and employee:
-            parties = [employer, employee]
-
-        if len(parties) < 2:
-            return None
-
         return _PartyRoleAssignment(
-            parties=tuple(parties[:2]),
-            employer=employer,
-            employee=employee,
+            parties=parsed.parties,
+            employer=parsed.employer,
+            employee=parsed.employee,
+            company_side_party=parsed.company_side_party,
+            individual_side_party=parsed.individual_side_party,
         )
 
     def _detect_inline_role(self, value: str) -> str | None:

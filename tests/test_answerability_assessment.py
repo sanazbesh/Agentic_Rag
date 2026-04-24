@@ -1021,6 +1021,64 @@ def test_successful_employee_role_resolution_counts_as_fact_support() -> None:
     assert "employee_role_assignment_resolved" in result.evidence_notes
 
 
+def test_between_and_multiline_intro_with_explicit_role_labels_is_sufficient_for_party_role() -> None:
+    query = "who is the employer?"
+    understanding = understand_query(query)
+    context = [
+        _parent(
+            "p1",
+            "BETWEEN:\nAcme Holdings LLC (the “Employer”)\nAND:\nJane Smith (the “Employee”)",
+            heading="Parties",
+        )
+    ]
+
+    result = assess_answerability(query, understanding, context)
+
+    assert result.sufficient_context is True
+    assert result.should_answer is True
+    assert "employer_role_assignment_resolved" in result.evidence_notes
+
+
+def test_as_role_intro_assignment_is_sufficient_for_parties_question() -> None:
+    query = "who are the parties?"
+    understanding = understand_query(query)
+    context = [
+        _parent(
+            "p1",
+            "Acme Holdings LLC as Employer and Jane Smith as Employee enter this Employment Agreement.",
+            heading="Introduction",
+        )
+    ]
+
+    result = assess_answerability(query, understanding, context)
+
+    assert result.sufficient_context is True
+    assert result.should_answer is True
+    assert "party_set_resolved" in result.evidence_notes
+
+
+def test_company_side_and_individual_side_queries_use_explicit_intro_role_evidence() -> None:
+    company_query = "which party is the company side?"
+    company_understanding = understand_query(company_query)
+    individual_query = "which party is the individual side?"
+    individual_understanding = understand_query(individual_query)
+    context = [
+        _parent(
+            "p1",
+            'This Employment Agreement is between Acme Holdings LLC ("Employer") and Jane Smith ("Employee").',
+            heading="Parties",
+        )
+    ]
+
+    company_result = assess_answerability(company_query, company_understanding, context)
+    individual_result = assess_answerability(individual_query, individual_understanding, context)
+
+    assert company_result.sufficient_context is True
+    assert individual_result.sufficient_context is True
+    assert "company_side_party_identified" in company_result.evidence_notes
+    assert "individual_side_party_identified" in individual_result.evidence_notes
+
+
 def test_successful_parties_resolution_counts_as_fact_support() -> None:
     query = "who are the parties?"
     understanding = understand_query(query)
