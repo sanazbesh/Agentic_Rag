@@ -3,6 +3,8 @@ from __future__ import annotations
 from agentic_rag.orchestration.query_understanding import understand_query
 from agentic_rag.retrieval.parent_child import ParentChunkResult
 from agentic_rag.tools.answerability import (
+    PARTY_ROLE_PREVIEW_END_CHARS,
+    PARTY_ROLE_PREVIEW_START_CHARS,
     CoverageEvaluation,
     EvidenceStrengthEvaluation,
     assess_answerability,
@@ -1190,6 +1192,82 @@ def test_ambiguous_or_missing_role_resolution_still_fails_safely_in_answerabilit
 
 
 
+
+
+def test_party_role_resolution_debug_payload_includes_per_parent_previews_for_runtime_checked_parents() -> None:
+    query = "who is the employer?"
+    understanding = understand_query(query)
+    context = [
+        _parent(
+            "p1",
+            "INTRODUCTION\nThis is a short heading-only section without party intro details.",
+            heading="Introduction",
+        ),
+        _parent(
+            "p2",
+            (
+                "This Employment Agreement is entered into by and between Acme Corp (\"Employer\") "
+                "and Jane Smith (\"Employee\").\nAdditional terms follow in later sections."
+            ),
+            heading="Agreement Overview",
+        ),
+    ]
+
+    result = assess_answerability(query, understanding, context)
+
+    assert result.party_role_resolution_debug is not None
+    debug = result.party_role_resolution_debug
+    assert debug.party_role_resolution_checked_parent_count == 2
+    assert debug.party_role_resolution_checked_parent_ids == ["p1", "p2"]
+    assert len(debug.checked_parent_previews) == 2
+    assert debug.checked_parent_previews[0].parent_chunk_id == "p1"
+    assert debug.checked_parent_previews[0].heading == "Introduction"
+    assert debug.checked_parent_previews[0].text_length_chars > 0
+    assert debug.checked_parent_previews[0].preview_start
+    assert debug.checked_parent_previews[0].preview_end
+    assert debug.checked_parent_previews[1].intro_pattern_detected is True
+    assert debug.checked_parent_previews[1].resolver_considered_usable_intro_text is True
+
+
+def test_party_role_resolution_debug_flags_missing_intro_pattern_when_runtime_context_lacks_intro_text() -> None:
+    query = "who is the employer?"
+    understanding = understand_query(query)
+    context = [
+        _parent(
+            "p1",
+            "EMPLOYMENT AGREEMENT\nSection 1 - Compensation\nSection 2 - Benefits",
+            heading="Cover Page",
+        )
+    ]
+
+    result = assess_answerability(query, understanding, context)
+
+    assert result.party_role_resolution_debug is not None
+    debug = result.party_role_resolution_debug
+    assert debug.party_role_resolution_debug_outcome == "not_found"
+    assert debug.party_role_resolution_intro_pattern_parent_ids == []
+    assert debug.checked_parent_previews[0].intro_pattern_detected is False
+    assert debug.checked_parent_previews[0].resolver_considered_usable_intro_text is False
+
+
+def test_party_role_resolution_debug_preview_text_is_bounded_and_not_full_dump() -> None:
+    query = "who is the employer?"
+    understanding = understand_query(query)
+    long_text = (
+        "This Employment Agreement is made by and between Acme Corp (Employer) and Jane Smith (Employee).\n"
+        + ("Body paragraph with many details.\n" * 80)
+    )
+    context = [_parent("p1", long_text, heading="Introduction")]
+
+    result = assess_answerability(query, understanding, context)
+
+    assert result.party_role_resolution_debug is not None
+    preview = result.party_role_resolution_debug.checked_parent_previews[0]
+    assert len(preview.preview_start) <= PARTY_ROLE_PREVIEW_START_CHARS
+    assert len(preview.preview_end) <= PARTY_ROLE_PREVIEW_END_CHARS
+    assert preview.text_length_chars > (PARTY_ROLE_PREVIEW_START_CHARS + PARTY_ROLE_PREVIEW_END_CHARS)
+    assert preview.preview_start != long_text
+    assert preview.preview_end != long_text
 
 def test_agreement_between_query_extracts_query_side_entity_set_for_comparison() -> None:
     query = "is this agreement between Aurora Data Systems Inc. and Daniel Reza Mohammadi?"
