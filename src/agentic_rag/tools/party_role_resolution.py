@@ -47,6 +47,11 @@ def extract_intro_party_role_assignment(text: str) -> PartyRoleAssignment | None
         individual_side_party = employee
 
     if len(parties) >= 2:
+        employer = _coerce_role_value_to_parties(employer, parties)
+        employee = _coerce_role_value_to_parties(employee, parties)
+        company_side_party = _coerce_role_value_to_parties(company_side_party, parties)
+        individual_side_party = _coerce_role_value_to_parties(individual_side_party, parties)
+
         first, second = parties[0], parties[1]
         first_role = _detect_inline_role(first)
         second_role = _detect_inline_role(second)
@@ -259,9 +264,43 @@ def _clean_party_name(value: str | None) -> str | None:
     cleaned = re.sub(r"\((?:the\s+)?[\"“']?(?:employer|employee|company(?:\s+side)?|individual(?:\s+side)?)[\"”']?\)", " ", value, flags=re.IGNORECASE)
     cleaned = re.sub(r"\([^)]*\)", " ", cleaned)
     cleaned = re.sub(r"[\"'“”]+", " ", cleaned)
+    cleaned = re.sub(r"^\s*and\s+", " ", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\b(?:the\s+)?(employer|employee|company|individual|party|parties)\b", " ", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,;:-")
+    cleaned = _strip_trailing_location_fragments(cleaned)
     return cleaned or None
+
+
+def _strip_trailing_location_fragments(value: str) -> str:
+    segments = [segment.strip() for segment in value.split(",") if segment.strip()]
+    if len(segments) <= 1:
+        return value.strip(" ,;:-")
+
+    entity_segments = [segments[0]]
+    for segment in segments[1:]:
+        if _looks_like_legal_suffix_segment(segment):
+            entity_segments.append(segment)
+            continue
+        break
+    return ", ".join(entity_segments).strip(" ,;:-")
+
+
+def _looks_like_legal_suffix_segment(segment: str) -> bool:
+    normalized = re.sub(r"[^a-z]", "", segment.lower())
+    return normalized in {
+        "inc",
+        "incorporated",
+        "corp",
+        "corporation",
+        "co",
+        "company",
+        "llc",
+        "ltd",
+        "limited",
+        "plc",
+        "llp",
+        "lp",
+    }
 
 
 def _detect_inline_role(value: str) -> str | None:
@@ -316,3 +355,28 @@ def _dedupe_parties(values: Sequence[str]) -> list[str]:
         seen.add(normalized)
         deduped.append(value)
     return deduped
+
+
+def _align_role_value_to_parties(role_value: str | None, parties: Sequence[str]) -> str | None:
+    if not role_value:
+        return None
+    normalized_role = normalize_party_text(role_value)
+    if not normalized_role:
+        return None
+    for party in parties:
+        normalized_party = normalize_party_text(party)
+        if not normalized_party:
+            continue
+        if (
+            normalized_role == normalized_party
+            or normalized_role in normalized_party
+            or normalized_party in normalized_role
+        ):
+            return party
+    return None
+
+
+def _coerce_role_value_to_parties(role_value: str | None, parties: Sequence[str]) -> str | None:
+    if not role_value:
+        return None
+    return _align_role_value_to_parties(role_value, parties)

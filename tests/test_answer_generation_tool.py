@@ -228,6 +228,47 @@ def test_intro_pattern_between_and_with_explicit_role_labels_resolves_roles() ->
     assert employee.citations
 
 
+def test_role_labeled_intro_with_location_returns_party_name_not_location_and_keeps_citation_excerpt() -> None:
+    context = [
+        _parent(
+            "p-1",
+            "Introduction",
+            (
+                "This Employment Agreement is made by and between "
+                "Aurora Data Systems Inc., Toronto, Ontario (the “Employer”) and "
+                "Daniel Reza Mohammadi, Toronto, Ontario (the “Employee”)."
+            ),
+        )
+    ]
+
+    employer = generate_answer(context, "Who is the employer?")
+    employee = generate_answer(context, "Who is the employee?")
+    parties = generate_answer(context, "Who are the parties?")
+    between = generate_answer(context, "Is this agreement between Aurora Data Systems Inc. and Daniel Reza Mohammadi?")
+
+    employer_direct_line = employer.answer_text.splitlines()[0]
+    employee_direct_line = employee.answer_text.splitlines()[0]
+    parties_direct_line = parties.answer_text.splitlines()[0]
+
+    assert employer.sufficient_context is True
+    assert "Aurora Data Systems Inc." in employer.answer_text
+    assert "Toronto, Ontario" not in employer_direct_line
+    assert employer.citations
+    assert "Aurora Data Systems Inc., Toronto, Ontario" in employer.citations[0].supporting_excerpt
+
+    assert employee.sufficient_context is True
+    assert "Daniel Reza Mohammadi" in employee.answer_text
+    assert "Toronto, Ontario" not in employee_direct_line
+
+    assert parties.sufficient_context is True
+    assert "Aurora Data Systems Inc." in parties.answer_text
+    assert "Daniel Reza Mohammadi" in parties.answer_text
+    assert "Toronto, Ontario" not in parties_direct_line
+
+    assert between.sufficient_context is True
+    assert "yes" in between.answer_text.lower()
+
+
 def test_intro_pattern_as_role_format_resolves_parties() -> None:
     context = [
         _parent(
