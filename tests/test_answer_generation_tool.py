@@ -301,6 +301,25 @@ def test_who_are_the_parties_returns_both_parties_when_supported() -> None:
     assert "jane smith" in result.answer_text.lower()
 
 
+def test_party_set_variants_return_both_parties_with_citations_when_supported() -> None:
+    context = [
+        _parent(
+            "p-1",
+            "Introduction",
+            "This Employment Agreement is made by and between Acme Corp and Jane Smith.",
+        )
+    ]
+    for query in (
+        "Who are the parties involved in this document?",
+        "Identify the parties in this agreement",
+    ):
+        result = generate_answer(context, query)
+        assert result.sufficient_context is True
+        assert "acme corp" in result.answer_text.lower()
+        assert "jane smith" in result.answer_text.lower()
+        assert result.citations
+
+
 def test_agreement_between_x_and_y_checks_both_extracted_parties() -> None:
     context = [
         _parent(

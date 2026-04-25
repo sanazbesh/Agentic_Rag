@@ -411,6 +411,7 @@ class QueryTransformationService:
     _PARTY_ROLE_QUERY_PATTERNS: tuple[re.Pattern[str], ...] = (
         re.compile(r"\bwho\s+is\s+the\s+(employer|employee)\b", flags=re.IGNORECASE),
         re.compile(r"\bwho\s+are\s+the\s+parties\b", flags=re.IGNORECASE),
+        re.compile(r"\bidentify\s+(?:the\s+)?parties\b", flags=re.IGNORECASE),
         re.compile(r"\bwhich\s+company\s+is\s+this\s+agreement\s+for\b", flags=re.IGNORECASE),
         re.compile(r"\bis\s+this\s+agreement\s+between\b", flags=re.IGNORECASE),
         re.compile(r"\bis\s+(?:this|the)\s+agreement\s+with\b", flags=re.IGNORECASE),

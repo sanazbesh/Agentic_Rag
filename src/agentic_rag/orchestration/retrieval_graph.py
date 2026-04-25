@@ -1055,6 +1055,8 @@ class RetrievalGraphNodes:
             re.search(r"\bis\s+(?:this|the)\s+agreement\s+between\b", lowered_query)
             or re.search(r"\bis\s+(?:this|the)\s+agreement\s+(?:with|for)\b", lowered_query)
         )
+        is_party_role_query = _is_party_role_entity_family(decision)
+        selected_scope_doc_id = selected_doc_ids[0] if len(selected_doc_ids) == 1 else None
 
         if decision.is_context_dependent:
             if decision.refers_to_prior_document_scope and len(candidate_doc_ids) > 1:
@@ -1080,10 +1082,16 @@ class RetrievalGraphNodes:
             if used_context and topic_hints and query.lower().startswith("what about"):
                 resolved_query = f"{query} in relation to {topic_hints[0]}"
 
+        selected_scope_bound = False
+        if is_party_role_query and selected_scope_doc_id:
+            candidate_doc_ids = [selected_scope_doc_id]
+            selected_scope_bound = True
+            resolution_notes.append("resolved_document_scope_from_single_selected_document_for_party_role")
+
         resolution = QueryContextResolution(
             resolved_query=resolved_query,
             used_conversation_context=used_context,
-            resolved_document_ids=candidate_doc_ids if used_context else [],
+            resolved_document_ids=candidate_doc_ids if (used_context or selected_scope_bound) else [],
             resolved_topic_hints=topic_hints if used_context else [],
             resolution_notes=resolution_notes,
             unresolved_references=unresolved_references,

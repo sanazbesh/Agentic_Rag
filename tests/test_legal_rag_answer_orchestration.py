@@ -330,6 +330,8 @@ def test_party_role_runtime_family_answers_short_agreement_intro() -> None:
         "who is the employer?": "Acme Holdings LLC",
         "who is the employee?": "Jane Smith",
         "who are the parties?": "Acme Holdings LLC and Jane Smith",
+        "who are the parties involved in this document?": "Acme Holdings LLC and Jane Smith",
+        "identify the parties in this agreement": "Acme Holdings LLC and Jane Smith",
         "who is the hiring company?": "Acme Holdings LLC",
     }
     for query, expected in checks.items():
