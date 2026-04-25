@@ -35,6 +35,7 @@ class FakeServices:
     classifier: QueryRoutingDecision
     rewritten_query: str = ""
     hybrid_results: list[HybridSearchResult] = field(default_factory=list)
+    hybrid_results_by_query: dict[str, list[HybridSearchResult]] = field(default_factory=dict)
     reranked_results: list[RerankedChunkResult] = field(default_factory=list)
     parent_results: list[ParentChunkResult] = field(default_factory=list)
     compressed_items: list[CompressedParentChunk] = field(default_factory=list)
@@ -43,6 +44,7 @@ class FakeServices:
     answer_raises: bool = False
 
     answer_calls: list[dict[str, Any]] = field(default_factory=list)
+    hybrid_calls: list[dict[str, Any]] = field(default_factory=list)
     answerability_raises: bool = False
     answerability_result: AnswerabilityAssessment | None = None
 
@@ -102,7 +104,9 @@ class FakeServices:
         )
 
     def hybrid_search(self, query: str, *, filters: dict[str, Any] | None = None, top_k: int = 10) -> list[HybridSearchResult]:
-        _ = (query, filters, top_k)
+        self.hybrid_calls.append({"query": query, "filters": filters, "top_k": top_k})
+        if query in self.hybrid_results_by_query:
+            return self.hybrid_results_by_query[query]
         return self.hybrid_results
 
     def rerank_chunks(self, chunks: list[HybridSearchResult], query: str) -> list[RerankedChunkResult]:
@@ -344,6 +348,54 @@ def test_party_role_runtime_family_answers_short_agreement_intro() -> None:
         note == "agreement_between_pair_confirmed_from_extracted_parties"
         for note in verification_state["answerability_result"].evidence_notes
     )
+
+
+def test_party_role_runtime_parent_expansion_includes_intro_parent_chunk() -> None:
+    services = FakeServices(
+        classifier=understand_query("who is the employer?"),
+        hybrid_results=[
+            _hybrid("c-heading", "p1"),
+            _hybrid("c-section", "p3"),
+        ],
+        reranked_results=[
+            _reranked("c-heading", "p1"),
+            _reranked("c-section", "p3"),
+        ],
+        parent_results=[
+            _parent("p1", text="EMPLOYMENT AGREEMENT\nEffective Date: January 1, 2025."),
+            _parent(
+                "p2",
+                text=(
+                    "This Employment Agreement is between Acme Holdings LLC (the \"Employer\") and "
+                    "Jane Smith (the \"Employee\")."
+                ),
+            ),
+            _parent("p3", text="1. POSITION AND DUTIES\nThe Employee will perform assigned duties."),
+        ],
+    )
+    services.hybrid_results_by_query[
+        "who is the employer? agreement preamble intro between and employer employee parties definitions"
+    ] = [
+        _hybrid(
+            "c-intro",
+            "p2",
+        )
+    ]
+
+    runtime_dependencies = LegalRagDependencies(
+        retrieval=services.retrieval_dependencies(),
+        generate_grounded_answer=generate_answer,
+        assess_answerability=assess_answerability,
+    )
+    result, state = run_legal_rag_turn_with_state(query="who is the employer?", dependencies=runtime_dependencies)
+
+    assert result.sufficient_context is True
+    assert "Acme Holdings LLC" in result.answer_text
+    debug = state["answerability_result"].party_role_resolution_debug
+    assert debug is not None
+    assert "p2" in debug.party_role_resolution_checked_parent_ids
+    assert "p2" in debug.party_role_resolution_intro_pattern_parent_ids
+    assert any("Acme Holdings LLC" in preview.preview_start for preview in debug.checked_parent_previews)
 
 
 def test_party_role_runtime_heading_only_context_fails_safely() -> None:

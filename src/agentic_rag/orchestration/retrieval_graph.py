@@ -333,6 +333,19 @@ def _extract_family_from_routing_notes(notes: Sequence[str]) -> str | None:
     return None
 
 
+def _is_party_role_entity_family(decision: QueryRoutingDecision | None) -> bool:
+    if not isinstance(decision, QueryRoutingDecision):
+        return False
+    family = _extract_family_from_routing_notes(decision.routing_notes)
+    return family == "party_role_entity"
+
+
+def _build_party_role_intro_retrieval_query(effective_query: str) -> str:
+    base = " ".join((effective_query or "").split())
+    suffix = "agreement preamble intro between and employer employee parties definitions"
+    return f"{base} {suffix}".strip()
+
+
 def _merge_two_candidates(
     *,
     existing: MergedRetrievalCandidate,
@@ -1625,6 +1638,40 @@ class RetrievalGraphNodes:
                 continue
             seen.add(parent_id)
             parent_ids.append(parent_id)
+
+        decision = updated.get("query_classification")
+        if _is_party_role_entity_family(decision):
+            target_document_ids = {item.document_id for item in parent_source if item.document_id}
+            try:
+                supplemental_hits = self.dependencies.hybrid_search(
+                    _build_party_role_intro_retrieval_query(updated.get("effective_query", "")),
+                    filters=updated.get("filters"),
+                    top_k=max(4, min(8, self.config.hybrid_top_k)),
+                )
+            except Exception as exc:  # pragma: no cover
+                updated["warnings"] = [
+                    *updated["warnings"],
+                    f"party_role_intro_parent_augmentation_failed:{type(exc).__name__}",
+                ]
+                supplemental_hits = []
+
+            supplemental_added = 0
+            for hit in supplemental_hits:
+                parent_id = hit.parent_chunk_id
+                if not parent_id or parent_id in seen:
+                    continue
+                if target_document_ids and hit.document_id not in target_document_ids:
+                    continue
+                seen.add(parent_id)
+                parent_ids.append(parent_id)
+                supplemental_added += 1
+                if supplemental_added >= 2:
+                    break
+            if supplemental_added:
+                updated["warnings"] = [
+                    *updated["warnings"],
+                    f"party_role_intro_parent_augmented:{supplemental_added}",
+                ]
         updated["parent_ids"] = parent_ids
         logger.info("node_exit name=collect_parent_ids source=%s parent_count=%s", source_name, len(parent_ids))
         return cast(RetrievalStageState, updated)
