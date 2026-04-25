@@ -25,6 +25,7 @@ from agentic_rag.orchestration.retrieval_graph import (
 from agentic_rag.retrieval.parent_child import HybridSearchResult, ParentChunkResult, RerankedChunkResult
 from agentic_rag.tools.answerability import AnswerabilityAssessment, assess_answerability
 from agentic_rag.tools.answer_generation import AnswerCitation, GenerateAnswerResult
+from agentic_rag.tools.answer_generation import generate_answer
 from agentic_rag.tools.context_processing import CompressContextResult, CompressedParentChunk
 from agentic_rag.tools.query_intelligence import LegalEntityExtractionResult, LegalEntityFilters, QueryRewriteResult
 
@@ -261,6 +262,104 @@ def test_parent_chunks_fallback_when_compressed_empty() -> None:
     run_legal_rag_turn(query="Q", dependencies=services.as_dependencies())
     used_context = services.answer_calls[0]["context"]
     assert isinstance(used_context[0], ParentChunkResult)
+
+
+def test_party_role_queries_use_parent_context_not_heading_only_compressed_context() -> None:
+    agreement_intro = (
+        "EMPLOYMENT AGREEMENT\n\n"
+        "BETWEEN:\n"
+        "Acme Holdings LLC (the \"Employer\")\n"
+        "AND:\n"
+        "Jane Smith (the \"Employee\")\n\n"
+        "1. POSITION AND DUTIES\n"
+        "The Employee will perform assigned duties."
+    )
+    services = FakeServices(
+        classifier=understand_query("who is the employer?"),
+        hybrid_results=[_hybrid("c1", "p1")],
+        reranked_results=[_reranked("c1", "p1")],
+        parent_results=[_parent("p1", text=agreement_intro)],
+        compressed_items=[
+            CompressedParentChunk(
+                parent_chunk_id="p1",
+                document_id="doc-1",
+                source="test",
+                source_name="compressed-source",
+                heading_text="EMPLOYMENT AGREEMENT",
+                compressed_text="EMPLOYMENT AGREEMENT\n1. POSITION AND DUTIES",
+            )
+        ],
+    )
+    result, state = run_legal_rag_turn_with_state(
+        query="who is the employer?",
+        dependencies=services.as_dependencies(),
+        retrieval_config=RetrievalGraphConfig(compress_if_parent_chunks_gte=1),
+    )
+    used_context = services.answer_calls[0]["context"]
+    assert isinstance(used_context[0], ParentChunkResult)
+    assert "Acme Holdings LLC" in used_context[0].text
+    assert result.sufficient_context is True
+    assert any(note == "party_role_assignment_resolved" for note in state["answerability_result"].evidence_notes)
+
+
+def test_party_role_runtime_family_answers_short_agreement_intro() -> None:
+    agreement_intro = (
+        "This Employment Agreement is made effective as of January 1, 2025, by and between "
+        "Acme Holdings LLC (the \"Employer\") and Jane Smith (the \"Employee\").\n"
+        "1. POSITION AND DUTIES\n"
+        "The Employee will perform assigned duties."
+    )
+    services = FakeServices(
+        classifier=understand_query("who is the employer?"),
+        hybrid_results=[_hybrid("c1", "p1")],
+        reranked_results=[_reranked("c1", "p1")],
+        parent_results=[_parent("p1", text=agreement_intro)],
+    )
+    runtime_dependencies = LegalRagDependencies(
+        retrieval=services.retrieval_dependencies(),
+        generate_grounded_answer=generate_answer,
+        assess_answerability=assess_answerability,
+    )
+    checks = {
+        "who is the employer?": "Acme Holdings LLC",
+        "who is the employee?": "Jane Smith",
+        "who are the parties?": "Acme Holdings LLC and Jane Smith",
+        "who is the hiring company?": "Acme Holdings LLC",
+    }
+    for query, expected in checks.items():
+        result, state = run_legal_rag_turn_with_state(query=query, dependencies=runtime_dependencies)
+        assert result.sufficient_context is True
+        assert expected in result.answer_text
+        assert any(note == "party_role_assignment_resolved" for note in state["answerability_result"].evidence_notes)
+        assert any(warning == "party_role_resolution_invoked" for warning in result.warnings)
+
+    verification_result, verification_state = run_legal_rag_turn_with_state(
+        query="Is this agreement between Acme Holdings LLC and Jane Smith?",
+        dependencies=runtime_dependencies,
+    )
+    assert verification_result.sufficient_context is True
+    assert "Yes" in verification_result.answer_text
+    assert any(warning == "party_role_resolution_invoked" for warning in verification_result.warnings)
+    assert any(
+        note == "agreement_between_pair_confirmed_from_extracted_parties"
+        for note in verification_state["answerability_result"].evidence_notes
+    )
+
+
+def test_party_role_runtime_heading_only_context_fails_safely() -> None:
+    services = FakeServices(
+        classifier=understand_query("who is the employer?"),
+        hybrid_results=[_hybrid("c1", "p1")],
+        reranked_results=[_reranked("c1", "p1")],
+        parent_results=[_parent("p1", text="EMPLOYMENT AGREEMENT\n1. POSITION AND DUTIES")],
+    )
+    result, state = run_legal_rag_turn_with_state(query="who is the employer?", dependencies=services.as_dependencies())
+    assert result.sufficient_context is False
+    assert any(note.startswith("party_role_resolution_outcome:") for note in state["answerability_result"].evidence_notes)
+    assert any(
+        warning == "answerability_gate:fact_not_found" or warning.startswith("answerability_gate:")
+        for warning in result.warnings
+    )
 
 
 def test_empty_context_insufficiency_response() -> None:
