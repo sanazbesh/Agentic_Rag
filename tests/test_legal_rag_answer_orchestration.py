@@ -22,6 +22,8 @@ from agentic_rag.orchestration.retrieval_graph import (
     SubqueryCoverageRecord,
     SubquerySupportClassification,
 )
+from agentic_rag.chunking import MarkdownParentChildChunker
+from agentic_rag.types import Document
 from agentic_rag.retrieval.parent_child import HybridSearchResult, ParentChunkResult, RerankedChunkResult
 from agentic_rag.tools.answerability import AnswerabilityAssessment, assess_answerability
 from agentic_rag.tools.answer_generation import AnswerCitation, GenerateAnswerResult
@@ -396,6 +398,81 @@ def test_party_role_runtime_parent_expansion_includes_intro_parent_chunk() -> No
     assert "p2" in debug.party_role_resolution_checked_parent_ids
     assert "p2" in debug.party_role_resolution_intro_pattern_parent_ids
     assert any("Acme Holdings LLC" in preview.preview_start for preview in debug.checked_parent_previews)
+
+
+def test_party_role_runtime_from_chunked_agreement_preserves_intro_preamble_in_checked_preview() -> None:
+    text = (
+        "# EMPLOYMENT AGREEMENT\n"
+        "This Employment Agreement is made effective as of January 1, 2025.\n"
+        "## BETWEEN:\n"
+        "Aurora Data Systems Inc. (the \"Employer\")\n"
+        "## AND:\n"
+        "Daniel Reza Mohammadi (the \"Employee\")\n"
+        "## 1. POSITION AND DUTIES\n"
+        "The Employee will perform assigned duties.\n"
+        "## 2. TERM\n"
+        "The initial term is one year.\n"
+    )
+    chunked = MarkdownParentChildChunker().chunk(
+        Document(id="doc-1", text=text, metadata={"source": "fixtures/agreement.md", "source_name": "agreement.md"})
+    )
+    parents = [
+        ParentChunkResult(
+            parent_chunk_id=parent.parent_chunk_id,
+            document_id=parent.document_id,
+            text=parent.text,
+            source=parent.source,
+            source_name=parent.source_name,
+            heading_text=parent.heading_text,
+            heading_path=parent.heading_path,
+            metadata={},
+        )
+        for parent in chunked.parent_chunks
+    ]
+    intro_parent = parents[0]
+    first_numbered_parent = next(parent for parent in parents if parent.heading_text == "1. POSITION AND DUTIES")
+
+    services = FakeServices(
+        classifier=understand_query("who is the employer?"),
+        hybrid_results=[_hybrid("c-section", first_numbered_parent.parent_chunk_id)],
+        reranked_results=[_reranked("c-section", first_numbered_parent.parent_chunk_id)],
+        parent_results=parents,
+    )
+    services.hybrid_results_by_query[
+        "who is the employer? agreement preamble intro between and employer employee parties definitions"
+    ] = [
+        HybridSearchResult(
+            child_chunk_id="c-intro",
+            parent_chunk_id=intro_parent.parent_chunk_id,
+            document_id="doc-1",
+            text=intro_parent.text,
+            hybrid_score=0.95,
+        )
+    ]
+
+    runtime_dependencies = LegalRagDependencies(
+        retrieval=services.retrieval_dependencies(),
+        generate_grounded_answer=generate_answer,
+        assess_answerability=assess_answerability,
+    )
+    result, state = run_legal_rag_turn_with_state(query="who is the employer?", dependencies=runtime_dependencies)
+
+    assert result.sufficient_context is True
+    assert "Aurora Data Systems Inc." in result.answer_text
+    debug = state["answerability_result"].party_role_resolution_debug
+    assert debug is not None
+    assert debug.party_role_resolution_intro_pattern_parent_ids
+    assert any("Aurora Data Systems Inc." in preview.preview_start for preview in debug.checked_parent_previews)
+    assert any("Daniel Reza Mohammadi" in preview.preview_start for preview in debug.checked_parent_previews)
+
+    employee_result, _ = run_legal_rag_turn_with_state(query="who is the employee?", dependencies=runtime_dependencies)
+    parties_result, _ = run_legal_rag_turn_with_state(query="who are the parties?", dependencies=runtime_dependencies)
+
+    assert employee_result.sufficient_context is True
+    assert "Daniel Reza Mohammadi" in employee_result.answer_text
+    assert parties_result.sufficient_context is True
+    assert "Aurora Data Systems Inc." in parties_result.answer_text
+    assert "Daniel Reza Mohammadi" in parties_result.answer_text
 
 
 def test_party_role_runtime_heading_only_context_fails_safely() -> None:

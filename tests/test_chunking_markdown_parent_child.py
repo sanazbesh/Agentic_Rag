@@ -125,3 +125,60 @@ def test_edge_case_tiny_leftover_at_beginning() -> None:
         if child.parent_chunk_id == result.parent_chunks[0].parent_chunk_id
     ]
     assert first_parent_children[0].text.startswith("Hi")
+
+
+def test_document_start_between_and_preamble_is_preserved_in_opening_parent() -> None:
+    text = (
+        "# EMPLOYMENT AGREEMENT\n"
+        "This Employment Agreement is made effective as of January 1, 2025.\n"
+        "## BETWEEN:\n"
+        "Aurora Data Systems Inc. (the \"Employer\")\n"
+        "## AND:\n"
+        "Daniel Reza Mohammadi (the \"Employee\")\n"
+        "## 1. POSITION AND DUTIES\n"
+        "The Employee will perform assigned duties.\n"
+    )
+
+    result = MarkdownParentChildChunker().chunk(_doc(text))
+    opening_parent = result.parent_chunks[0]
+    lowered = opening_parent.text.lower()
+
+    assert "between" in lowered
+    assert "aurora data systems inc." in lowered
+    assert "daniel reza mohammadi" in lowered
+    assert "the \"employer\"" in lowered
+    assert "the \"employee\"" in lowered
+
+
+def test_document_start_between_sentence_is_preserved_in_opening_parent() -> None:
+    text = (
+        "# EMPLOYMENT AGREEMENT\n"
+        "This Employment Agreement is made by and between Acme Holdings LLC and Jane Smith.\n"
+        "## 1. POSITION AND DUTIES\n"
+        "The Employee will perform assigned duties.\n"
+    )
+
+    result = MarkdownParentChildChunker().chunk(_doc(text))
+    opening_parent = result.parent_chunks[0]
+
+    assert "made by and between Acme Holdings LLC and Jane Smith" in opening_parent.text
+
+
+def test_first_numbered_section_chunking_still_produces_numbered_parent() -> None:
+    text = (
+        "# EMPLOYMENT AGREEMENT\n"
+        "Effective Date: January 1, 2025.\n"
+        "## BETWEEN:\n"
+        "Acme Holdings LLC (the \"Employer\")\n"
+        "## AND:\n"
+        "Jane Smith (the \"Employee\")\n"
+        "## 1. POSITION AND DUTIES\n"
+        "The Employee will perform assigned duties.\n"
+        "## 2. TERM\n"
+        "The initial term is one year.\n"
+    )
+
+    result = MarkdownParentChildChunker().chunk(_doc(text))
+
+    assert any(parent.heading_text == "1. POSITION AND DUTIES" for parent in result.parent_chunks)
+    assert any(parent.heading_text == "2. TERM" for parent in result.parent_chunks)
