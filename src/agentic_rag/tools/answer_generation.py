@@ -19,6 +19,7 @@ from agentic_rag.tools.evidence_units import EvidenceUnit, build_evidence_units
 from agentic_rag.tools.party_role_resolution import (
     compare_query_entities_against_extracted_parties,
     extract_intro_party_role_assignment,
+    has_intro_role_signal,
     is_usable_party_entity,
     normalize_party_text,
     parse_party_verification_query_entities,
@@ -257,7 +258,7 @@ class LegalAnswerSynthesizer:
         if not self._is_party_role_question(lowered_query):
             return None
 
-        role_assignment = self._resolve_party_roles_from_intro(context)
+        role_assignment, resolution_warnings = self._resolve_party_roles_from_intro(context)
         if role_assignment is None:
             return GenerateAnswerResult(
                 answer_text=(
@@ -271,7 +272,7 @@ class LegalAnswerSynthesizer:
                 grounded=False,
                 sufficient_context=False,
                 citations=[],
-                warnings=["party_role_assignment_unresolved"],
+                warnings=["party_role_assignment_unresolved", *resolution_warnings],
             )
 
         citation = AnswerCitation(
@@ -290,6 +291,7 @@ class LegalAnswerSynthesizer:
                 direct=f"The employer is {role_assignment.employer}.",
                 citation=citation,
                 source_line=source_line,
+                warnings=resolution_warnings,
             )
 
         if "who is the employee" in lowered_query:
@@ -299,6 +301,7 @@ class LegalAnswerSynthesizer:
                 direct=f"The employee is {role_assignment.employee}.",
                 citation=citation,
                 source_line=source_line,
+                warnings=resolution_warnings,
             )
 
         if "who are the parties" in lowered_query:
@@ -308,6 +311,7 @@ class LegalAnswerSynthesizer:
                 direct=f"The parties are {role_assignment.parties[0]} and {role_assignment.parties[1]}.",
                 citation=citation,
                 source_line=source_line,
+                warnings=resolution_warnings,
             )
 
         if self._is_company_side_query(lowered_query):
@@ -318,6 +322,7 @@ class LegalAnswerSynthesizer:
                 direct=f"The agreement appears to be for {company}.",
                 citation=citation,
                 source_line=source_line,
+                warnings=resolution_warnings,
             )
         if self._is_individual_side_query(lowered_query):
             individual = role_assignment.individual_side_party or role_assignment.employee or pick_individual_party(role_assignment.parties)
@@ -327,6 +332,7 @@ class LegalAnswerSynthesizer:
                 direct=f"The individual-side party is {individual}.",
                 citation=citation,
                 source_line=source_line,
+                warnings=resolution_warnings,
             )
 
         parsed_verification = self._parse_party_verification_query_entities(lowered_query)
@@ -344,7 +350,13 @@ class LegalAnswerSynthesizer:
                 if comparison["status"] == "matched"
                 else "No, the agreement-introduction evidence does not identify that queried party set."
             )
-            return self._party_role_success(direct=direct, citation=citation, source_line=source_line)
+            return self._party_role_success(
+                direct=direct,
+                citation=citation,
+                source_line=source_line,
+                warnings=resolution_warnings,
+            )
+
 
         return None
 
@@ -392,6 +404,7 @@ class LegalAnswerSynthesizer:
         direct: str,
         citation: AnswerCitation,
         source_line: str,
+        warnings: Sequence[str] | None = None,
     ) -> GenerateAnswerResult:
         return GenerateAnswerResult(
             answer_text=(
@@ -404,7 +417,7 @@ class LegalAnswerSynthesizer:
             grounded=True,
             sufficient_context=True,
             citations=[citation],
-            warnings=[],
+            warnings=list(warnings or []),
         )
 
     def _insufficient_party_role_with_citation(
@@ -1380,11 +1393,20 @@ class LegalAnswerSynthesizer:
                 values.append(parsed)
         return values
 
-    def _resolve_party_roles_from_intro(self, context: Sequence[dict[str, Any]]) -> "_PartyRoleAssignment | None":
+    def _resolve_party_roles_from_intro(
+        self, context: Sequence[dict[str, Any]]
+    ) -> tuple["_PartyRoleAssignment | None", list[str]]:
+        checked_parent_ids: list[str] = []
+        intro_parent_ids: list[str] = []
         for item in context:
             text = str(item.get("text") or "").strip()
             if not text:
                 continue
+            parent_id = str(item.get("parent_chunk_id") or "").strip()
+            if parent_id:
+                checked_parent_ids.append(parent_id)
+            if has_intro_role_signal(text) and parent_id:
+                intro_parent_ids.append(parent_id)
             parsed = extract_intro_party_role_assignment(text)
             if parsed is None:
                 continue
@@ -1409,8 +1431,26 @@ class LegalAnswerSynthesizer:
             assignment.supporting_excerpt = self._best_excerpt(text, "parties employer employee agreement")
             if not assignment.supporting_excerpt:
                 assignment.supporting_excerpt = text
-            return assignment
-        return None
+            return assignment, [
+                "party_role_resolution_invoked",
+                f"party_role_resolution_checked_parent_chunks:{len(checked_parent_ids)}",
+                f"party_role_resolution_checked_parent_ids:{','.join(checked_parent_ids) or 'none'}",
+                f"party_role_resolution_intro_pattern_parent_ids:{','.join(intro_parent_ids) or 'none'}",
+                "party_role_resolution_outcome:resolved",
+            ]
+        reason = (
+            "party_role_resolution_not_found_reason:intro_text_present_parser_miss"
+            if intro_parent_ids
+            else "party_role_resolution_not_found_reason:intro_text_absent_from_runtime_context"
+        )
+        return None, [
+            "party_role_resolution_invoked",
+            f"party_role_resolution_checked_parent_chunks:{len(checked_parent_ids)}",
+            f"party_role_resolution_checked_parent_ids:{','.join(checked_parent_ids) or 'none'}",
+            f"party_role_resolution_intro_pattern_parent_ids:{','.join(intro_parent_ids) or 'none'}",
+            "party_role_resolution_outcome:not_found",
+            reason,
+        ]
 
     def _extract_intro_assignment(self, text: str) -> "_PartyRoleAssignment | None":
         parsed = extract_intro_party_role_assignment(text)

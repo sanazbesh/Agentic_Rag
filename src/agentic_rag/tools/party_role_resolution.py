@@ -100,6 +100,15 @@ def extract_intro_party_role_assignment(text: str) -> PartyRoleAssignment | None
     )
 
 
+def has_intro_role_signal(text: str) -> bool:
+    """Return whether text contains agreement-intro role anchor patterns."""
+
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    return _has_intro_anchor(raw.lower())
+
+
 def parse_party_verification_query_entities(lowered_query: str) -> dict[str, object] | None:
     between_match = re.search(r"\bis\s+(?:this|the)\s+agreement\s+between\s+(.+?)\s+and\s+(.+?)\??$", lowered_query)
     if between_match:

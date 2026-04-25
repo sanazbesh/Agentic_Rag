@@ -489,6 +489,24 @@ class AnswerStageNodes:
         self.answer_generator = answer_generator
         self.answerability_evaluator = answerability_evaluator
 
+    def _is_party_role_entity_query(self, state: Mapping[str, Any]) -> bool:
+        query_classification = state.get("query_classification")
+        routing_notes = getattr(query_classification, "routing_notes", []) if query_classification is not None else []
+        if any(note == "legal_question_family:party_role_entity" for note in (routing_notes or [])):
+            return True
+
+        query = str(state.get("effective_query") or state.get("original_query") or "").strip().lower()
+        if not query:
+            return False
+        party_patterns = (
+            r"\bwho\s+is\s+the\s+employer\b",
+            r"\bwho\s+is\s+the\s+employee\b",
+            r"\bwho\s+are\s+the\s+parties\b",
+            r"\bis\s+(?:this|the)\s+agreement\s+between\b",
+            r"\bhiring\s+company\b",
+        )
+        return any(re.search(pattern, query) for pattern in party_patterns)
+
     def prepare_answer_context(self, state: LegalRagState) -> LegalRagState:
         """Select answer context deterministically: compressed context first, then parent chunks."""
 
@@ -498,7 +516,11 @@ class AnswerStageNodes:
         try:
             compressed_context = list(updated.get("compressed_context", []))
             parent_chunks = list(updated.get("parent_chunks", []))
-            if compressed_context:
+            is_party_role_query = self._is_party_role_entity_query(updated)
+            if is_party_role_query and parent_chunks:
+                answer_context = parent_chunks
+                source = "parent_chunks_party_role_integration"
+            elif compressed_context:
                 answer_context: list[ParentChunkResult | CompressedParentChunk] = compressed_context
                 source = "compressed_context"
             else:
