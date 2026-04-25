@@ -59,6 +59,10 @@ def build_real_debug_payload(
     if not invoked:
         warnings.append("answerability_result unavailable: assess_answerability not invoked in this execution path")
 
+    scope = dict(scope_meta) if isinstance(scope_meta, dict) else {}
+    local_llm_scope = scope.get("local_llm") if isinstance(scope, dict) else None
+    runtime = _derive_local_llm_runtime(latest_state=latest_state, local_llm_scope=local_llm_scope)
+
     return {
         "meta": {
             "mode": "real",
@@ -66,7 +70,8 @@ def build_real_debug_payload(
             "selected_document_paths": selected_paths,
             "uses_uploaded_documents": any(doc.get("source") == "uploaded" for doc in selected_docs),
         },
-        "scope": dict(scope_meta) if isinstance(scope_meta, dict) else {},
+        "scope": scope,
+        "local_llm_runtime": runtime,
         "query_classification": _to_debug_jsonable(latest_state.get("query_classification")),
         "context_resolution": _to_debug_jsonable(latest_state.get("context_resolution")),
         "decomposition": decomposition,
@@ -79,4 +84,252 @@ def build_real_debug_payload(
         "metrics": _to_debug_jsonable(latest_state.get("metrics")),
         "warnings": warnings,
         "recent_messages_used": _to_debug_jsonable(latest_state.get("recent_messages", [])),
+    }
+
+
+def _derive_local_llm_runtime(*, latest_state: dict[str, Any], local_llm_scope: Any) -> dict[str, Any]:
+    scope = local_llm_scope if isinstance(local_llm_scope, dict) else {}
+    stage_toggles = scope.get("stage_toggles") if isinstance(scope.get("stage_toggles"), dict) else {}
+    warnings = [str(item) for item in list(latest_state.get("warnings", []))]
+    final_answer = latest_state.get("final_answer")
+    final_warnings = []
+    if final_answer is not None:
+        final_warnings = [str(item) for item in list(getattr(final_answer, "warnings", []))]
+
+    used_stages: list[str] = []
+    fallback_stages: list[str] = []
+    if any(item.startswith("rewrite_path:llm:") for item in warnings):
+        used_stages.append("rewrite")
+    if any(item.startswith("rewrite_path:deterministic_fallback:") for item in warnings):
+        fallback_stages.append("rewrite")
+    rewrite_failure_reason = next(
+        (item.split(":", 1)[1] for item in warnings if item.startswith("rewrite_failure_reason:")),
+        None,
+    )
+    rewrite_provider_error = next(
+        (item.split(":", 1)[1] for item in warnings if item.startswith("rewrite_provider_error:")),
+        None,
+    )
+    rewrite_call_outcome = (
+        dict(latest_state.get("rewrite_call_outcome"))
+        if isinstance(latest_state.get("rewrite_call_outcome"), dict)
+        else {}
+    )
+
+    decomposition_plan = latest_state.get("decomposition_plan")
+    planner_notes = [str(item) for item in list(getattr(decomposition_plan, "planner_notes", []))]
+    if any(item.startswith("planner_path:llm:") for item in planner_notes):
+        used_stages.append("decomposition")
+    if any(item.startswith("planner_path:deterministic_fallback:") for item in planner_notes):
+        fallback_stages.append("decomposition")
+
+    if any(item.startswith("answer_synthesis_path:llm:") for item in final_warnings):
+        used_stages.append("synthesis")
+    if any(item.startswith("answer_synthesis_path:deterministic_fallback:") for item in final_warnings):
+        fallback_stages.append("synthesis")
+
+    enabled = bool(scope.get("effective_enabled", False))
+    ui_enabled = bool(scope.get("ui_enabled", False))
+    mock_backend_active = bool(scope.get("mock_backend_active", False))
+    provider_init_reason = scope.get("provider_init_reason")
+    provider_init_status = scope.get("provider_init_status", "not_attempted")
+    rewrite_requested = bool(latest_state.get("should_rewrite", False))
+    rewrite_toggle_enabled = bool(stage_toggles.get("rewrite", False))
+    rewrite_applicable = bool(rewrite_requested and rewrite_toggle_enabled)
+    rewrite_used_local_llm = "rewrite" in used_stages
+    rewrite_fallback_reason: str | None = None
+    rewrite_attempted = False
+    rewritten_query = str(latest_state.get("rewritten_query") or "")
+    original_query = str(latest_state.get("resolved_query") or latest_state.get("original_query") or "")
+    rewrite_result_type = "failed"
+    rewrite_failure_stage: str | None = None
+    provider_call_attempted = bool(rewrite_call_outcome.get("provider_call_attempted", False))
+    provider_call_succeeded = bool(rewrite_call_outcome.get("provider_call_succeeded", False))
+    raw_response_present = bool(rewrite_call_outcome.get("raw_response_present", False))
+    raw_response_text_length = (
+        int(rewrite_call_outcome["raw_response_text_length"])
+        if isinstance(rewrite_call_outcome.get("raw_response_text_length"), int)
+        else None
+    )
+    normalized_rewrite_present = bool(rewrite_call_outcome.get("normalized_rewrite_present", False))
+    normalized_rewrite_text_length = (
+        int(rewrite_call_outcome["normalized_rewrite_text_length"])
+        if isinstance(rewrite_call_outcome.get("normalized_rewrite_text_length"), int)
+        else None
+    )
+    if isinstance(rewrite_call_outcome.get("rewrite_result_type"), str):
+        rewrite_result_type = str(rewrite_call_outcome["rewrite_result_type"])
+    if isinstance(rewrite_call_outcome.get("rewrite_failure_stage"), str):
+        rewrite_failure_stage = str(rewrite_call_outcome["rewrite_failure_stage"])
+    if isinstance(rewrite_call_outcome.get("rewrite_fallback_reason"), str):
+        rewrite_fallback_reason = str(rewrite_call_outcome["rewrite_fallback_reason"])
+    if isinstance(rewrite_call_outcome.get("rewrite_provider_error"), str):
+        rewrite_provider_error = str(rewrite_call_outcome["rewrite_provider_error"])
+
+    if rewrite_applicable:
+        if mock_backend_active:
+            rewrite_fallback_reason = "mock_backend_active"
+        elif not ui_enabled:
+            rewrite_fallback_reason = "local_llm_disabled"
+        elif not enabled:
+            rewrite_fallback_reason = "local_llm_disabled"
+        elif provider_init_status != "ready":
+            rewrite_fallback_reason = "provider_not_ready"
+        else:
+            rewrite_attempted = bool(provider_call_attempted)
+            if "rewrite" in fallback_stages:
+                rewrite_attempted = True
+                rewrite_fallback_reason = rewrite_failure_reason or "fallback_used"
+            elif rewrite_used_local_llm:
+                rewrite_attempted = True
+                rewrite_result_type = "no_change" if rewritten_query == original_query else "rewritten"
+                rewrite_failure_stage = None
+                provider_call_attempted = True if not provider_call_attempted else provider_call_attempted
+                provider_call_succeeded = True if not provider_call_succeeded else provider_call_succeeded
+                raw_response_present = True if not raw_response_present else raw_response_present
+                normalized_rewrite_present = True if not normalized_rewrite_present else normalized_rewrite_present
+            elif rewrite_result_type == "failed" or rewrite_failure_reason or rewrite_provider_error:
+                rewrite_attempted = True
+                if rewrite_failure_stage is None:
+                    rewrite_failure_stage = "provider_call" if provider_call_attempted else "stage_guard"
+                if rewrite_fallback_reason is None:
+                    rewrite_fallback_reason = rewrite_failure_reason or (
+                        "provider_runtime_error" if provider_call_attempted else "pre_call_guard"
+                    )
+            else:
+                rewrite_attempted = True
+                rewrite_result_type = "failed"
+                rewrite_failure_stage = "stage_guard"
+                rewrite_fallback_reason = "pre_call_guard"
+                if rewrite_provider_error is None and rewrite_failure_reason:
+                    rewrite_provider_error = rewrite_failure_reason
+    elif not rewrite_toggle_enabled:
+        rewrite_fallback_reason = "disabled_by_toggle"
+        rewrite_result_type = "failed"
+    else:
+        rewrite_fallback_reason = "rewrite_not_requested"
+        rewrite_result_type = "failed"
+
+    if rewrite_result_type in {"rewritten", "no_change"}:
+        rewrite_failure_stage = None
+        rewrite_fallback_reason = None
+        rewrite_provider_error = None
+    elif rewrite_result_type == "failed":
+        if provider_call_attempted and not provider_call_succeeded and rewrite_failure_stage is None:
+            rewrite_failure_stage = "provider_call"
+        if not provider_call_attempted and rewrite_failure_stage is None and rewrite_attempted:
+            rewrite_failure_stage = "stage_guard"
+        if rewrite_fallback_reason is None and rewrite_failure_stage is not None:
+            if rewrite_failure_stage in {"stage_guard", "provider_not_ready", "prompt_build", "pre_call_validation", "missing_client", "config_invalid"}:
+                rewrite_fallback_reason = "pre_call_guard"
+            elif rewrite_failure_stage == "provider_call":
+                rewrite_fallback_reason = "provider_runtime_error"
+            else:
+                rewrite_fallback_reason = "inference_failed"
+        if rewrite_fallback_reason is None and rewrite_provider_error is None:
+            rewrite_fallback_reason = "inference_failed"
+
+    def _stage_status(stage: str) -> tuple[str, str | None, bool]:
+        toggle_enabled = bool(stage_toggles.get(stage, False))
+        used = stage in used_stages
+        if used:
+            return "used", None, True
+        if not toggle_enabled:
+            return "skipped", "disabled_by_toggle", False
+
+        if stage == "rewrite":
+            if not rewrite_requested:
+                return "skipped", "rewrite_not_requested", False
+            if mock_backend_active:
+                return "skipped", "mock_backend_active", False
+            if not ui_enabled:
+                return "skipped", "local_llm_disabled", False
+            if not enabled:
+                return "skipped", "local_llm_disabled", False
+            if provider_init_status != "ready":
+                return "skipped", "provider_not_ready", False
+            if stage in fallback_stages:
+                return "fallback", rewrite_fallback_reason or rewrite_failure_reason or "fallback_used", True
+            if rewrite_attempted and not rewrite_used_local_llm:
+                return "fallback", rewrite_fallback_reason or rewrite_failure_reason or "fallback_used", True
+            return "fallback", "fallback_used", True
+
+        if stage == "decomposition":
+            reached = bool(latest_state.get("needs_decomposition", False))
+            if not reached:
+                return "skipped", "stage_not_applicable", False
+            if not enabled:
+                return "fallback", "fallback_used", True
+            if provider_init_status != "ready":
+                return "fallback", str(provider_init_reason or "provider_init_failed"), True
+            if stage in fallback_stages:
+                return "fallback", "inference_failed", True
+            return "skipped", "stage_not_reached", False
+
+        reached = bool(latest_state.get("should_generate_answer", False))
+        if not reached:
+            if bool(latest_state.get("should_return_insufficient_response", False)):
+                return "blocked", "upstream_blocked", False
+            return "skipped", "stage_not_reached", False
+        if not enabled:
+            return "fallback", "fallback_used", True
+        if provider_init_status != "ready":
+            return "fallback", str(provider_init_reason or "provider_init_failed"), True
+        if stage in fallback_stages:
+            return "fallback", "inference_failed", True
+        return "skipped", "stage_not_applicable", False
+
+    per_stage_status: dict[str, str] = {}
+    per_stage_reason: dict[str, str] = {}
+    attempted_stages: list[str] = []
+    for stage_name in ("rewrite", "decomposition", "synthesis"):
+        status, reason, attempted = _stage_status(stage_name)
+        per_stage_status[stage_name] = status
+        if reason is not None:
+            per_stage_reason[stage_name] = reason
+        if attempted:
+            attempted_stages.append(stage_name)
+
+    effective_mode = "llama_cpp_assisted" if used_stages else "deterministic"
+    return {
+        "ui_enabled": bool(scope.get("ui_enabled", False)),
+        "effective_enabled": enabled,
+        "provider": scope.get("provider", "llama_cpp"),
+        "model_path": scope.get("model_path", ""),
+        "n_ctx": scope.get("n_ctx"),
+        "temperature": scope.get("temperature"),
+        "timeout_seconds": scope.get("timeout_seconds"),
+        "max_tokens": scope.get("max_tokens"),
+        "n_gpu_layers": scope.get("n_gpu_layers"),
+        "threads": scope.get("threads"),
+        "stage_toggles": {
+            "rewrite": bool(stage_toggles.get("rewrite", False)),
+            "decomposition": bool(stage_toggles.get("decomposition", False)),
+            "synthesis": bool(stage_toggles.get("synthesis", False)),
+        },
+        "local_llm_attempted": bool(scope.get("local_llm_attempted", False)),
+        "provider_init_status": provider_init_status,
+        "provider_init_error": scope.get("provider_init_error"),
+        "provider_init_reason": provider_init_reason,
+        "stages_using_local_llm": sorted(set(used_stages)),
+        "fallback_stages": sorted(set(fallback_stages)),
+        "stages_attempted_local_llm": sorted(set(attempted_stages)),
+        "per_stage_local_llm_status": per_stage_status,
+        "per_stage_fallback_reason": per_stage_reason,
+        "local_llm_used": bool(used_stages),
+        "effective_mode": effective_mode if enabled else "deterministic",
+        "rewrite_requested": rewrite_requested,
+        "rewrite_applicable": rewrite_applicable,
+        "rewrite_attempted": rewrite_attempted,
+        "rewrite_used_local_llm": rewrite_used_local_llm,
+        "rewrite_fallback_reason": rewrite_fallback_reason,
+        "rewrite_result_type": rewrite_result_type,
+        "rewrite_failure_stage": rewrite_failure_stage,
+        "rewrite_provider_error": rewrite_provider_error,
+        "provider_call_attempted": provider_call_attempted,
+        "provider_call_succeeded": provider_call_succeeded,
+        "raw_response_present": raw_response_present,
+        "raw_response_text_length": raw_response_text_length,
+        "normalized_rewrite_present": normalized_rewrite_present,
+        "normalized_rewrite_text_length": normalized_rewrite_text_length,
     }

@@ -11,7 +11,10 @@ import logging
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from json import JSONDecodeError
 from typing import Any, Protocol
+
+from agentic_rag.llm import build_local_prompt_llm_from_env, local_llm_config_from_env
 
 
 logger = logging.getLogger(__name__)
@@ -37,6 +40,7 @@ class QueryRewriteResult:
     rewritten_query: str
     used_conversation_context: bool
     rewrite_notes: str = ""
+    rewrite_call_outcome: dict[str, Any] | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -52,6 +56,17 @@ class QueryDecompositionResult:
     sub_queries: tuple[str, ...]
     used_conversation_context: bool
     decomposition_notes: str = ""
+
+
+@dataclass(slots=True, frozen=True)
+class _LLMRewriteOutcome:
+    """Internal outcome for rewrite provider calls."""
+
+    ok: bool
+    rewritten_query: str | None = None
+    failure_reason: str | None = None
+    provider_error: str | None = None
+    call_outcome: dict[str, Any] | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -391,10 +406,12 @@ class QueryTransformationService:
         re.compile(r"\b[A-Z][A-Za-z\s]+\s+Act\b"),
     )
     llm_client: QueryTransformationLLM | None = None
+    llm_provider_label: str = "llama_cpp:unknown"
 
     _PARTY_ROLE_QUERY_PATTERNS: tuple[re.Pattern[str], ...] = (
         re.compile(r"\bwho\s+is\s+the\s+(employer|employee)\b", flags=re.IGNORECASE),
         re.compile(r"\bwho\s+are\s+the\s+parties\b", flags=re.IGNORECASE),
+        re.compile(r"\bidentify\s+(?:the\s+)?parties\b", flags=re.IGNORECASE),
         re.compile(r"\bwhich\s+company\s+is\s+this\s+agreement\s+for\b", flags=re.IGNORECASE),
         re.compile(r"\bis\s+this\s+agreement\s+between\b", flags=re.IGNORECASE),
         re.compile(r"\bis\s+(?:this|the)\s+agreement\s+with\b", flags=re.IGNORECASE),
@@ -549,6 +566,7 @@ class QueryTransformationService:
         query: str,
         conversation_summary: str | None = None,
         recent_messages: Sequence[Any] | None = None,
+        force_llm_rewrite_attempt: bool = False,
     ) -> QueryRewriteResult:
         """Return one retrieval-optimized query string with optional context use."""
 
@@ -562,28 +580,30 @@ class QueryTransformationService:
                 rewrite_notes="empty_input",
             )
 
-        if self._is_party_role_entity_query(normalized_query):
+        prefer_llm_rewrite = bool(force_llm_rewrite_attempt and self.llm_client is not None)
+
+        if not prefer_llm_rewrite and self._is_party_role_entity_query(normalized_query):
             return QueryRewriteResult(
                 original_query=original_query,
                 rewritten_query=self._expand_party_role_query(normalized_query),
                 used_conversation_context=False,
                 rewrite_notes="party_role_entity_query_expansion",
             )
-        if self._is_matter_metadata_query(normalized_query):
+        if not prefer_llm_rewrite and self._is_matter_metadata_query(normalized_query):
             return QueryRewriteResult(
                 original_query=original_query,
                 rewritten_query=self._expand_matter_metadata_query(normalized_query),
                 used_conversation_context=False,
                 rewrite_notes="matter_document_metadata_query_expansion",
             )
-        if self._is_employment_lifecycle_query(normalized_query):
+        if not prefer_llm_rewrite and self._is_employment_lifecycle_query(normalized_query):
             return QueryRewriteResult(
                 original_query=original_query,
                 rewritten_query=self._expand_employment_lifecycle_query(normalized_query),
                 used_conversation_context=False,
                 rewrite_notes="employment_contract_lifecycle_query_expansion",
             )
-        if self._is_employment_mitigation_query(normalized_query):
+        if not prefer_llm_rewrite and self._is_employment_mitigation_query(normalized_query):
             return QueryRewriteResult(
                 original_query=original_query,
                 rewritten_query=self._expand_employment_mitigation_query(normalized_query),
@@ -593,6 +613,33 @@ class QueryTransformationService:
 
         context_blob = _build_context_blob(conversation_summary, recent_messages)
         needs_context = bool(self._AMBIGUOUS_REFERENCE_PATTERN.search(normalized_query))
+        llm_attempt_eligible = bool(self.llm_client is not None and (needs_context or force_llm_rewrite_attempt))
+
+        if llm_attempt_eligible:
+            llm_outcome = self._llm_rewrite_query(normalized_query, context_blob or None)
+            if llm_outcome.ok and llm_outcome.rewritten_query is not None:
+                rewrite_state = "no_change" if llm_outcome.rewritten_query == normalized_query else "rewritten"
+                return QueryRewriteResult(
+                    original_query=original_query,
+                    rewritten_query=llm_outcome.rewritten_query,
+                    used_conversation_context=bool(context_blob),
+                    rewrite_notes=f"resolved_reference_with_llm:{self.llm_provider_label}:{rewrite_state}",
+                    rewrite_call_outcome=llm_outcome.call_outcome,
+                )
+            if not llm_outcome.ok:
+                provider_error_suffix = (
+                    f":error={llm_outcome.provider_error}" if llm_outcome.provider_error else ""
+                )
+                return QueryRewriteResult(
+                    original_query=original_query,
+                    rewritten_query=normalized_query,
+                    used_conversation_context=False,
+                    rewrite_notes=(
+                        f"llm_failure_fallback_original_query:{self.llm_provider_label}:"
+                        f"reason={llm_outcome.failure_reason or 'inference_failed'}{provider_error_suffix}"
+                    ),
+                    rewrite_call_outcome=llm_outcome.call_outcome,
+                )
 
         if not needs_context:
             return QueryRewriteResult(
@@ -602,30 +649,17 @@ class QueryTransformationService:
                 rewrite_notes="query_already_clear",
             )
 
-        if self.llm_client is not None and context_blob:
-            llm_ok, llm_result = self._llm_rewrite_query(normalized_query, context_blob)
-            if llm_ok and llm_result is not None:
-                return QueryRewriteResult(
-                    original_query=original_query,
-                    rewritten_query=llm_result,
-                    used_conversation_context=True,
-                    rewrite_notes="resolved_reference_with_llm",
-                )
-            if not llm_ok:
-                return QueryRewriteResult(
-                    original_query=original_query,
-                    rewritten_query=normalized_query,
-                    used_conversation_context=False,
-                    rewrite_notes="llm_failure_fallback_original_query",
-                )
-
         referent = self._extract_reference_target(context_blob) if context_blob else None
         if not referent:
             return QueryRewriteResult(
                 original_query=original_query,
                 rewritten_query=normalized_query,
                 used_conversation_context=False,
-                rewrite_notes="ambiguous_but_no_context_reference_found",
+                rewrite_notes=(
+                    f"deterministic_fallback_no_reference:{self.llm_provider_label}"
+                    if self.llm_client is None
+                    else "ambiguous_but_no_context_reference_found"
+                ),
             )
 
         rewritten = self._replace_ambiguous_reference(normalized_query, referent)
@@ -635,7 +669,11 @@ class QueryTransformationService:
             original_query=original_query,
             rewritten_query=rewritten,
             used_conversation_context=True,
-            rewrite_notes="resolved_reference_from_context",
+            rewrite_notes=(
+                f"deterministic_fallback_context_resolution:{self.llm_provider_label}"
+                if self.llm_client is None
+                else "resolved_reference_from_context"
+            ),
         )
 
     def decompose_query(
@@ -678,7 +716,7 @@ class QueryTransformationService:
                     original_query=query,
                     sub_queries=safe_parts,
                     used_conversation_context=False,
-                    decomposition_notes="llm_failure_fallback_original_query",
+                    decomposition_notes=f"llm_failure_fallback_original_query:{self.llm_provider_label}",
                 )
             parts = llm_parts if llm_parts else self._split_into_sub_queries(rewritten_query)
         else:
@@ -690,7 +728,7 @@ class QueryTransformationService:
             original_query=query,
             sub_queries=tuple(parts),
             used_conversation_context=rewrite_result.used_conversation_context,
-            decomposition_notes="single_query" if len(parts) == 1 else "multi_issue_query",
+            decomposition_notes=(f"llm_multi_issue_query:{self.llm_provider_label}" if self.llm_client is not None and len(parts) > 1 else "single_query" if len(parts) == 1 else "multi_issue_query"),
         )
 
     def _extract_reference_target(self, context_blob: str) -> str | None:
@@ -713,21 +751,199 @@ class QueryTransformationService:
             rewritten = re.sub(pattern, referent, rewritten, flags=re.IGNORECASE)
         return rewritten
 
-    def _llm_rewrite_query(self, query: str, context_blob: str) -> tuple[bool, str | None]:
+    def _llm_rewrite_query(self, query: str, context_blob: str | None) -> _LLMRewriteOutcome:
+        context_section = context_blob or "(none)"
         prompt = (
-            "Rewrite the legal retrieval query by resolving ambiguous references only from context. "
+            "Rewrite the legal retrieval query to maximize retrieval precision while preserving legal meaning. "
+            "Resolve ambiguous references from context when available. "
             "Preserve jurisdiction, dates, parties, and legal scope. "
             "Return strict JSON: {\"rewritten_query\": \"...\"}.\n\n"
-            f"CONTEXT:\n{context_blob}\n\nQUERY:\n{query}"
+            f"CONTEXT:\n{context_section}\n\nQUERY:\n{query}"
         )
         try:
             raw = self.llm_client.complete(prompt)  # type: ignore[union-attr]
-            parsed = json.loads(raw)
-            rewritten = str(parsed.get("rewritten_query", "")).strip()
-            return True, rewritten or None
-        except Exception:
+        except Exception as exc:
             logger.exception("LLM rewrite failed; using heuristic/safe fallback.")
-            return False, None
+            failure_reason = self._classify_llm_exception(exc)
+            return _LLMRewriteOutcome(
+                ok=False,
+                failure_reason=failure_reason,
+                provider_error=f"{type(exc).__name__}:{exc}",
+                call_outcome={
+                    "provider_call_attempted": True,
+                    "provider_call_succeeded": False,
+                    "raw_response_present": False,
+                    "raw_response_text_length": None,
+                    "normalized_rewrite_present": False,
+                    "normalized_rewrite_text_length": None,
+                    "rewrite_result_type": "failed",
+                    "rewrite_failure_stage": "provider_call",
+                    "rewrite_fallback_reason": failure_reason,
+                    "rewrite_provider_error": f"{type(exc).__name__}:{exc}",
+                },
+            )
+
+        if not isinstance(raw, str) or not raw.strip():
+            return _LLMRewriteOutcome(
+                ok=False,
+                failure_reason="empty_response",
+                provider_error="empty_response:provider_returned_blank",
+                call_outcome={
+                    "provider_call_attempted": True,
+                    "provider_call_succeeded": True,
+                    "raw_response_present": False,
+                    "raw_response_text_length": len(raw) if isinstance(raw, str) else None,
+                    "normalized_rewrite_present": False,
+                    "normalized_rewrite_text_length": None,
+                    "rewrite_result_type": "failed",
+                    "rewrite_failure_stage": "provider_call",
+                    "rewrite_fallback_reason": "empty_response",
+                    "rewrite_provider_error": "empty_response:provider_returned_blank",
+                },
+            )
+        raw_stripped = raw.strip()
+
+        parse_ok, parsed, parse_error = _parse_json_object_response(raw)
+        if not parse_ok:
+            return _LLMRewriteOutcome(
+                ok=False,
+                failure_reason="malformed_response",
+                provider_error=parse_error or "malformed_response:json_parse_failed",
+                call_outcome={
+                    "provider_call_attempted": True,
+                    "provider_call_succeeded": True,
+                    "raw_response_present": True,
+                    "raw_response_text_length": len(raw_stripped),
+                    "normalized_rewrite_present": False,
+                    "normalized_rewrite_text_length": None,
+                    "rewrite_result_type": "failed",
+                    "rewrite_failure_stage": "response_parse",
+                    "rewrite_fallback_reason": "malformed_response",
+                    "rewrite_provider_error": parse_error or "malformed_response:json_parse_failed",
+                },
+            )
+
+        if not isinstance(parsed, Mapping):
+            return _LLMRewriteOutcome(
+                ok=False,
+                failure_reason="malformed_response",
+                provider_error=f"malformed_response:top_level_type={type(parsed).__name__}",
+                call_outcome={
+                    "provider_call_attempted": True,
+                    "provider_call_succeeded": True,
+                    "raw_response_present": True,
+                    "raw_response_text_length": len(raw_stripped),
+                    "normalized_rewrite_present": False,
+                    "normalized_rewrite_text_length": None,
+                    "rewrite_result_type": "failed",
+                    "rewrite_failure_stage": "response_parse",
+                    "rewrite_fallback_reason": "malformed_response",
+                    "rewrite_provider_error": f"malformed_response:top_level_type={type(parsed).__name__}",
+                },
+            )
+        if "rewritten_query" not in parsed:
+            return _LLMRewriteOutcome(
+                ok=False,
+                failure_reason="validation_failed",
+                provider_error="validation_failed:missing_rewritten_query",
+                call_outcome={
+                    "provider_call_attempted": True,
+                    "provider_call_succeeded": True,
+                    "raw_response_present": True,
+                    "raw_response_text_length": len(raw_stripped),
+                    "normalized_rewrite_present": False,
+                    "normalized_rewrite_text_length": None,
+                    "rewrite_result_type": "failed",
+                    "rewrite_failure_stage": "response_validation",
+                    "rewrite_fallback_reason": "validation_failed",
+                    "rewrite_provider_error": "validation_failed:missing_rewritten_query",
+                },
+            )
+        rewritten_raw = parsed.get("rewritten_query")
+        if rewritten_raw is None:
+            return _LLMRewriteOutcome(
+                ok=False,
+                failure_reason="empty_response",
+                provider_error="empty_response:rewritten_query_null",
+                call_outcome={
+                    "provider_call_attempted": True,
+                    "provider_call_succeeded": True,
+                    "raw_response_present": True,
+                    "raw_response_text_length": len(raw_stripped),
+                    "normalized_rewrite_present": False,
+                    "normalized_rewrite_text_length": None,
+                    "rewrite_result_type": "failed",
+                    "rewrite_failure_stage": "response_validation",
+                    "rewrite_fallback_reason": "empty_response",
+                    "rewrite_provider_error": "empty_response:rewritten_query_null",
+                },
+            )
+        if not isinstance(rewritten_raw, str):
+            return _LLMRewriteOutcome(
+                ok=False,
+                failure_reason="validation_failed",
+                provider_error=f"validation_failed:rewritten_query_type={type(rewritten_raw).__name__}",
+                call_outcome={
+                    "provider_call_attempted": True,
+                    "provider_call_succeeded": True,
+                    "raw_response_present": True,
+                    "raw_response_text_length": len(raw_stripped),
+                    "normalized_rewrite_present": False,
+                    "normalized_rewrite_text_length": None,
+                    "rewrite_result_type": "failed",
+                    "rewrite_failure_stage": "response_validation",
+                    "rewrite_fallback_reason": "validation_failed",
+                    "rewrite_provider_error": f"validation_failed:rewritten_query_type={type(rewritten_raw).__name__}",
+                },
+            )
+        rewritten = rewritten_raw.strip()
+        if not rewritten:
+            return _LLMRewriteOutcome(
+                ok=False,
+                failure_reason="empty_response",
+                provider_error="empty_response:rewritten_query_blank",
+                call_outcome={
+                    "provider_call_attempted": True,
+                    "provider_call_succeeded": True,
+                    "raw_response_present": True,
+                    "raw_response_text_length": len(raw_stripped),
+                    "normalized_rewrite_present": False,
+                    "normalized_rewrite_text_length": None,
+                    "rewrite_result_type": "failed",
+                    "rewrite_failure_stage": "normalization",
+                    "rewrite_fallback_reason": "empty_response",
+                    "rewrite_provider_error": "empty_response:rewritten_query_blank",
+                },
+            )
+        rewrite_result_type = "no_change" if rewritten == query else "rewritten"
+        return _LLMRewriteOutcome(
+            ok=True,
+            rewritten_query=rewritten,
+            call_outcome={
+                "provider_call_attempted": True,
+                "provider_call_succeeded": True,
+                "raw_response_present": True,
+                "raw_response_text_length": len(raw_stripped),
+                "normalized_rewrite_present": True,
+                "normalized_rewrite_text_length": len(rewritten),
+                "rewrite_result_type": rewrite_result_type,
+                "rewrite_failure_stage": None,
+                "rewrite_fallback_reason": None,
+                "rewrite_provider_error": None,
+            },
+        )
+
+    def _classify_llm_exception(self, exc: Exception) -> str:
+        message = str(exc).lower()
+        if isinstance(exc, TimeoutError) or "timeout" in message or "timed out" in message:
+            return "timeout"
+        if "model_load_failed" in message or "generation_failed" in message:
+            return "model_execution_failed"
+        if "inference_failed" in message:
+            return "inference_failed"
+        if isinstance(exc, RuntimeError):
+            return "provider_runtime_error"
+        return "inference_failed"
 
     def _llm_decompose_query(
         self,
@@ -793,6 +1009,33 @@ def _build_context_blob(conversation_summary: str | None, recent_messages: Seque
     return "\n".join([summary_text, *message_texts]).strip()
 
 
+def _strip_markdown_json_fence(raw: str) -> str:
+    candidate = raw.strip()
+    if not candidate.startswith("```"):
+        return candidate
+    fence_match = re.match(r"^```(?:json)?\s*(.*?)\s*```$", candidate, flags=re.DOTALL | re.IGNORECASE)
+    if fence_match is None:
+        return candidate
+    return fence_match.group(1).strip()
+
+
+def _parse_json_object_response(raw: str) -> tuple[bool, Any | None, str | None]:
+    candidate = _strip_markdown_json_fence(raw)
+    try:
+        return True, json.loads(candidate), None
+    except JSONDecodeError as exc:
+        object_match = re.search(r"\{[\s\S]*\}", candidate)
+        if object_match is not None:
+            object_candidate = object_match.group(0).strip()
+            try:
+                return True, json.loads(object_candidate), None
+            except JSONDecodeError as nested_exc:
+                return False, None, f"{type(nested_exc).__name__}:{nested_exc}"
+        return False, None, f"{type(exc).__name__}:{exc}"
+    except Exception as exc:  # pragma: no cover - defensive guard
+        return False, None, f"{type(exc).__name__}:{exc}"
+
+
 def _is_rule_exception_pattern(part: str) -> bool:
     lowered = part.lower()
     return "rule" in lowered and "exception" in lowered and " and " in lowered
@@ -830,7 +1073,11 @@ def _is_complex_query(query: str) -> bool:
     return False
 
 
-_DEFAULT_QUERY_TRANSFORMATION_SERVICE = QueryTransformationService()
+_LOCAL_LLM_CONFIG = local_llm_config_from_env()
+_DEFAULT_QUERY_TRANSFORMATION_SERVICE = QueryTransformationService(
+    llm_client=build_local_prompt_llm_from_env(),
+    llm_provider_label=f"{_LOCAL_LLM_CONFIG.provider}:{_LOCAL_LLM_CONFIG.model_path or 'unset_model_path'}",
+)
 _DEFAULT_LEGAL_ENTITY_EXTRACTOR = LegalEntityExtractor()
 
 

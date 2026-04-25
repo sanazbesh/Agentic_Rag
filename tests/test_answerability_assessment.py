@@ -3,6 +3,8 @@ from __future__ import annotations
 from agentic_rag.orchestration.query_understanding import understand_query
 from agentic_rag.retrieval.parent_child import ParentChunkResult
 from agentic_rag.tools.answerability import (
+    PARTY_ROLE_PREVIEW_END_CHARS,
+    PARTY_ROLE_PREVIEW_START_CHARS,
     CoverageEvaluation,
     EvidenceStrengthEvaluation,
     assess_answerability,
@@ -941,6 +943,28 @@ def test_who_are_the_parties_returns_party_evidence_when_present() -> None:
     assert result.should_answer is True
 
 
+def test_party_set_variants_are_sufficient_when_intro_party_assignment_is_present() -> None:
+    context = [
+        _parent(
+            "p1",
+            (
+                "The parties to this Agreement are Acme Corp (the Employer) and Jane Smith (the Employee). "
+                "These identified parties are the signatories and are bound by the operative provisions below."
+            ),
+            heading="Parties",
+        )
+    ]
+    for query in (
+        "who are the parties involved in this document?",
+        "identify the parties in this agreement",
+    ):
+        understanding = understand_query(query)
+        result = assess_answerability(query, understanding, context)
+        assert result.sufficient_context is True
+        assert result.should_answer is True
+        assert "party_set_resolved" in result.evidence_notes
+
+
 def test_which_company_is_this_agreement_for_uses_entity_evidence_when_present() -> None:
     query = "which company is this agreement for?"
     understanding = understand_query(query)
@@ -1019,6 +1043,64 @@ def test_successful_employee_role_resolution_counts_as_fact_support() -> None:
     assert result.sufficient_context is True
     assert result.should_answer is True
     assert "employee_role_assignment_resolved" in result.evidence_notes
+
+
+def test_between_and_multiline_intro_with_explicit_role_labels_is_sufficient_for_party_role() -> None:
+    query = "who is the employer?"
+    understanding = understand_query(query)
+    context = [
+        _parent(
+            "p1",
+            "BETWEEN:\nAcme Holdings LLC (the “Employer”)\nAND:\nJane Smith (the “Employee”)",
+            heading="Parties",
+        )
+    ]
+
+    result = assess_answerability(query, understanding, context)
+
+    assert result.sufficient_context is True
+    assert result.should_answer is True
+    assert "employer_role_assignment_resolved" in result.evidence_notes
+
+
+def test_as_role_intro_assignment_is_sufficient_for_parties_question() -> None:
+    query = "who are the parties?"
+    understanding = understand_query(query)
+    context = [
+        _parent(
+            "p1",
+            "Acme Holdings LLC as Employer and Jane Smith as Employee enter this Employment Agreement.",
+            heading="Introduction",
+        )
+    ]
+
+    result = assess_answerability(query, understanding, context)
+
+    assert result.sufficient_context is True
+    assert result.should_answer is True
+    assert "party_set_resolved" in result.evidence_notes
+
+
+def test_company_side_and_individual_side_queries_use_explicit_intro_role_evidence() -> None:
+    company_query = "which party is the company side?"
+    company_understanding = understand_query(company_query)
+    individual_query = "which party is the individual side?"
+    individual_understanding = understand_query(individual_query)
+    context = [
+        _parent(
+            "p1",
+            'This Employment Agreement is between Acme Holdings LLC ("Employer") and Jane Smith ("Employee").',
+            heading="Parties",
+        )
+    ]
+
+    company_result = assess_answerability(company_query, company_understanding, context)
+    individual_result = assess_answerability(individual_query, individual_understanding, context)
+
+    assert company_result.sufficient_context is True
+    assert individual_result.sufficient_context is True
+    assert "company_side_party_identified" in company_result.evidence_notes
+    assert "individual_side_party_identified" in individual_result.evidence_notes
 
 
 def test_successful_parties_resolution_counts_as_fact_support() -> None:
@@ -1132,6 +1214,82 @@ def test_ambiguous_or_missing_role_resolution_still_fails_safely_in_answerabilit
 
 
 
+
+
+def test_party_role_resolution_debug_payload_includes_per_parent_previews_for_runtime_checked_parents() -> None:
+    query = "who is the employer?"
+    understanding = understand_query(query)
+    context = [
+        _parent(
+            "p1",
+            "INTRODUCTION\nThis is a short heading-only section without party intro details.",
+            heading="Introduction",
+        ),
+        _parent(
+            "p2",
+            (
+                "This Employment Agreement is entered into by and between Acme Corp (\"Employer\") "
+                "and Jane Smith (\"Employee\").\nAdditional terms follow in later sections."
+            ),
+            heading="Agreement Overview",
+        ),
+    ]
+
+    result = assess_answerability(query, understanding, context)
+
+    assert result.party_role_resolution_debug is not None
+    debug = result.party_role_resolution_debug
+    assert debug.party_role_resolution_checked_parent_count == 2
+    assert debug.party_role_resolution_checked_parent_ids == ["p1", "p2"]
+    assert len(debug.checked_parent_previews) == 2
+    assert debug.checked_parent_previews[0].parent_chunk_id == "p1"
+    assert debug.checked_parent_previews[0].heading == "Introduction"
+    assert debug.checked_parent_previews[0].text_length_chars > 0
+    assert debug.checked_parent_previews[0].preview_start
+    assert debug.checked_parent_previews[0].preview_end
+    assert debug.checked_parent_previews[1].intro_pattern_detected is True
+    assert debug.checked_parent_previews[1].resolver_considered_usable_intro_text is True
+
+
+def test_party_role_resolution_debug_flags_missing_intro_pattern_when_runtime_context_lacks_intro_text() -> None:
+    query = "who is the employer?"
+    understanding = understand_query(query)
+    context = [
+        _parent(
+            "p1",
+            "EMPLOYMENT AGREEMENT\nSection 1 - Compensation\nSection 2 - Benefits",
+            heading="Cover Page",
+        )
+    ]
+
+    result = assess_answerability(query, understanding, context)
+
+    assert result.party_role_resolution_debug is not None
+    debug = result.party_role_resolution_debug
+    assert debug.party_role_resolution_debug_outcome == "not_found"
+    assert debug.party_role_resolution_intro_pattern_parent_ids == []
+    assert debug.checked_parent_previews[0].intro_pattern_detected is False
+    assert debug.checked_parent_previews[0].resolver_considered_usable_intro_text is False
+
+
+def test_party_role_resolution_debug_preview_text_is_bounded_and_not_full_dump() -> None:
+    query = "who is the employer?"
+    understanding = understand_query(query)
+    long_text = (
+        "This Employment Agreement is made by and between Acme Corp (Employer) and Jane Smith (Employee).\n"
+        + ("Body paragraph with many details.\n" * 80)
+    )
+    context = [_parent("p1", long_text, heading="Introduction")]
+
+    result = assess_answerability(query, understanding, context)
+
+    assert result.party_role_resolution_debug is not None
+    preview = result.party_role_resolution_debug.checked_parent_previews[0]
+    assert len(preview.preview_start) <= PARTY_ROLE_PREVIEW_START_CHARS
+    assert len(preview.preview_end) <= PARTY_ROLE_PREVIEW_END_CHARS
+    assert preview.text_length_chars > (PARTY_ROLE_PREVIEW_START_CHARS + PARTY_ROLE_PREVIEW_END_CHARS)
+    assert preview.preview_start != long_text
+    assert preview.preview_end != long_text
 
 def test_agreement_between_query_extracts_query_side_entity_set_for_comparison() -> None:
     query = "is this agreement between Aurora Data Systems Inc. and Daniel Reza Mohammadi?"

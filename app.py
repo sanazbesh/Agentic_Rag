@@ -45,9 +45,10 @@ from ui.components import (
     render_debug_panel,
     render_download_button,
     render_query_input,
+    render_runtime_mode_status,
     render_sidebar,
 )
-from ui.local_backend import build_local_backend_dependencies
+from ui.local_backend import LocalLLMRuntimeSettings, build_local_backend_dependencies
 from ui.session_memory import append_conversation_turn, build_backend_context
 from ui.quality_dashboard import render_quality_dashboard
 from ui.trace_dashboard import render_trace_dashboard
@@ -95,6 +96,7 @@ def build_real_backend_runners() -> tuple[Callable[..., Any] | None, Callable[..
         conversation_summary: str | None = None,
         recent_messages: list[dict[str, Any]] | None = None,
         selected_documents: list[dict[str, Any]] | None = None,
+        local_llm_settings: LocalLLMRuntimeSettings | None = None,
     ) -> Any:
         selected_docs = [doc for doc in (selected_documents or []) if isinstance(doc, dict)]
         selected_ids = [str(doc.get("id")) for doc in selected_docs if doc.get("id")]
@@ -104,7 +106,7 @@ def build_real_backend_runners() -> tuple[Callable[..., Any] | None, Callable[..
         local_scope_meta: dict[str, Any] | None = None
 
         if active_dependencies is None:
-            local_backend = build_local_backend_dependencies(selected_docs)
+            local_backend = build_local_backend_dependencies(selected_docs, local_llm_settings=local_llm_settings)
             active_dependencies = local_backend.dependencies
             local_scope_meta = dict(local_backend.scope_meta)
 
@@ -143,6 +145,7 @@ def build_real_backend_runners() -> tuple[Callable[..., Any] | None, Callable[..
             "selected_document_count": len(selected_docs),
             "selected_document_ids": selected_ids,
             "selected_document_paths": selected_paths,
+            "local_llm_ui_enabled": bool(local_llm_settings and local_llm_settings.ui_enabled),
         }
         if local_scope_meta:
             scope_meta.update(local_scope_meta)
@@ -234,6 +237,7 @@ def main() -> None:
                         recent_messages=recent_messages,
                         selected_documents=sidebar_state["selected_documents"],
                         use_mock_backend=sidebar_state["use_mock_backend"],
+                        local_llm_settings=sidebar_state["local_llm_settings"],
                         real_backend_runner=real_backend_runner,
                         real_debug_runner=real_debug_runner,
                     )
@@ -292,6 +296,10 @@ def main() -> None:
     final_result = last_run["final_result"]
     debug_payload = last_run.get("debug_payload")
 
+    render_runtime_mode_status(
+        use_mock_backend=bool(sidebar_state.get("use_mock_backend", True)),
+        debug_payload=debug_payload,
+    )
     render_answer_panel(final_result)
     render_citations(final_result.get("citations", []))
     adapter_meta = (debug_payload or {}).get("adapter_meta") if isinstance(debug_payload, dict) else None

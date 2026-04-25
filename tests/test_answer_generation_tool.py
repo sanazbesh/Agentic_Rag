@@ -208,6 +208,83 @@ def test_who_is_the_employee_returns_individual_side_party_when_supported() -> N
     assert "acme holdings llc" not in result.answer_text.lower().split("direct answer:")[1].split("\n")[0]
 
 
+def test_intro_pattern_between_and_with_explicit_role_labels_resolves_roles() -> None:
+    context = [
+        _parent(
+            "p-1",
+            "Parties",
+            "BETWEEN:\nAcme Holdings LLC (the “Employer”)\nAND:\nJane Smith (the “Employee”)\n",
+        )
+    ]
+
+    employer = generate_answer(context, "Who is the employer?")
+    employee = generate_answer(context, "Who is the employee?")
+
+    assert employer.sufficient_context is True
+    assert employee.sufficient_context is True
+    assert "acme holdings llc" in employer.answer_text.lower()
+    assert "jane smith" in employee.answer_text.lower()
+    assert employer.citations
+    assert employee.citations
+
+
+def test_role_labeled_intro_with_location_returns_party_name_not_location_and_keeps_citation_excerpt() -> None:
+    context = [
+        _parent(
+            "p-1",
+            "Introduction",
+            (
+                "This Employment Agreement is made by and between "
+                "Aurora Data Systems Inc., Toronto, Ontario (the “Employer”) and "
+                "Daniel Reza Mohammadi, Toronto, Ontario (the “Employee”)."
+            ),
+        )
+    ]
+
+    employer = generate_answer(context, "Who is the employer?")
+    employee = generate_answer(context, "Who is the employee?")
+    parties = generate_answer(context, "Who are the parties?")
+    between = generate_answer(context, "Is this agreement between Aurora Data Systems Inc. and Daniel Reza Mohammadi?")
+
+    employer_direct_line = employer.answer_text.splitlines()[0]
+    employee_direct_line = employee.answer_text.splitlines()[0]
+    parties_direct_line = parties.answer_text.splitlines()[0]
+
+    assert employer.sufficient_context is True
+    assert "Aurora Data Systems Inc." in employer.answer_text
+    assert "Toronto, Ontario" not in employer_direct_line
+    assert employer.citations
+    assert "Aurora Data Systems Inc., Toronto, Ontario" in employer.citations[0].supporting_excerpt
+
+    assert employee.sufficient_context is True
+    assert "Daniel Reza Mohammadi" in employee.answer_text
+    assert "Toronto, Ontario" not in employee_direct_line
+
+    assert parties.sufficient_context is True
+    assert "Aurora Data Systems Inc." in parties.answer_text
+    assert "Daniel Reza Mohammadi" in parties.answer_text
+    assert "Toronto, Ontario" not in parties_direct_line
+
+    assert between.sufficient_context is True
+    assert "yes" in between.answer_text.lower()
+
+
+def test_intro_pattern_as_role_format_resolves_parties() -> None:
+    context = [
+        _parent(
+            "p-1",
+            "Introduction",
+            "Acme Holdings LLC as Employer and Jane Smith as Employee agree to the following terms.",
+        )
+    ]
+
+    result = generate_answer(context, "Who are the parties?")
+
+    assert result.sufficient_context is True
+    assert "acme holdings llc" in result.answer_text.lower()
+    assert "jane smith" in result.answer_text.lower()
+
+
 def test_who_are_the_parties_returns_both_parties_when_supported() -> None:
     context = [
         _parent(
@@ -222,6 +299,25 @@ def test_who_are_the_parties_returns_both_parties_when_supported() -> None:
     assert result.sufficient_context is True
     assert "acme corp" in result.answer_text.lower()
     assert "jane smith" in result.answer_text.lower()
+
+
+def test_party_set_variants_return_both_parties_with_citations_when_supported() -> None:
+    context = [
+        _parent(
+            "p-1",
+            "Introduction",
+            "This Employment Agreement is made by and between Acme Corp and Jane Smith.",
+        )
+    ]
+    for query in (
+        "Who are the parties involved in this document?",
+        "Identify the parties in this agreement",
+    ):
+        result = generate_answer(context, query)
+        assert result.sufficient_context is True
+        assert "acme corp" in result.answer_text.lower()
+        assert "jane smith" in result.answer_text.lower()
+        assert result.citations
 
 
 def test_agreement_between_x_and_y_checks_both_extracted_parties() -> None:
@@ -363,6 +459,27 @@ def test_ambiguous_or_missing_role_resolution_still_fails_safely() -> None:
     assert result.sufficient_context is False
     assert result.grounded is False
     assert any("party_role_assignment_unresolved" in warning for warning in result.warnings)
+
+
+def test_hiring_company_and_company_side_variants_use_intro_party_resolution() -> None:
+    context = [
+        _parent(
+            "p-1",
+            "Parties",
+            'This Employment Agreement is between Acme Holdings LLC ("Employer") and Jane Smith ("Employee").',
+        )
+    ]
+
+    hiring_company = generate_answer(context, "Who is the hiring company?")
+    company_side = generate_answer(context, "Which party is the company side?")
+    individual_side = generate_answer(context, "Which party is the individual side?")
+
+    assert hiring_company.sufficient_context is True
+    assert company_side.sufficient_context is True
+    assert individual_side.sufficient_context is True
+    assert "acme holdings llc" in hiring_company.answer_text.lower()
+    assert "acme holdings llc" in company_side.answer_text.lower()
+    assert "jane smith" in individual_side.answer_text.lower()
 
 
 
