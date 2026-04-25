@@ -170,7 +170,15 @@ def _parent(parent_id: str, text: str = "short legal text") -> ParentChunkResult
     )
 
 
-def _decision(*, followup: bool, ambiguous: bool, use_context: bool, rewrite: bool, extract: bool) -> QueryRoutingDecision:
+def _decision(
+    *,
+    followup: bool,
+    ambiguous: bool,
+    use_context: bool,
+    rewrite: bool,
+    extract: bool,
+    routing_notes: list[str] | None = None,
+) -> QueryRoutingDecision:
     return QueryRoutingDecision(
         original_query="q",
         normalized_query="q",
@@ -190,7 +198,7 @@ def _decision(*, followup: bool, ambiguous: bool, use_context: bool, rewrite: bo
         refers_to_prior_document_scope=followup,
         refers_to_prior_clause_or_topic=followup,
         ambiguity_notes=[],
-        routing_notes=["test"],
+        routing_notes=list(routing_notes or ["test"]),
         warnings=[],
     )
 
@@ -206,6 +214,46 @@ def test_self_contained_query_path_completes() -> None:
     assert state["effective_query"] == state["original_query"]
     assert state["use_conversation_context"] is False
     assert state["retrieval_stage_complete"] is True
+
+
+def test_party_role_family_parent_expansion_augments_intro_parent() -> None:
+    classifier = _decision(
+        followup=False,
+        ambiguous=False,
+        use_context=False,
+        rewrite=False,
+        extract=False,
+        routing_notes=["legal_question_family:party_role_entity"],
+    )
+    services = FakeServices(
+        classifier=classifier,
+        hybrid_results=[_hybrid("c1", "p1"), _hybrid("c2", "p3")],
+        reranked_results=[_reranked("c1", "p1"), _reranked("c2", "p3")],
+    )
+    services.hybrid_results_by_query[
+        "who is the employer? agreement preamble intro between and employer employee parties definitions"
+    ] = [_hybrid("c-intro", "p2", text='BETWEEN Acme Holdings LLC ("Employer") and Jane Smith ("Employee")')]
+    state = run_retrieval_stage(query="who is the employer?", dependencies=services.as_dependencies())
+
+    assert state["parent_ids"] == ["p1", "p3", "p2"]
+    assert any(note.startswith("party_role_intro_parent_augmented:") for note in state["warnings"])
+    assert len(services.hybrid_calls) == 2
+
+
+def test_non_party_role_family_does_not_augment_intro_parent() -> None:
+    services = FakeServices(
+        classifier=_decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False),
+        hybrid_results=[_hybrid("c1", "p1"), _hybrid("c2", "p3")],
+        reranked_results=[_reranked("c1", "p1"), _reranked("c2", "p3")],
+    )
+    services.hybrid_results_by_query[
+        "who is the employer? agreement preamble intro between and employer employee parties definitions"
+    ] = [_hybrid("c-intro", "p2", text='BETWEEN Acme Holdings LLC ("Employer") and Jane Smith ("Employee")')]
+    state = run_retrieval_stage(query="who is the employer?", dependencies=services.as_dependencies())
+
+    assert state["parent_ids"] == ["p1", "p3"]
+    assert not any(note.startswith("party_role_intro_parent_augmented:") for note in state["warnings"])
+    assert len(services.hybrid_calls) == 1
 
 
 def test_followup_query_uses_context_and_passes_to_rewrite() -> None:
