@@ -261,7 +261,78 @@ def _parse_markdown_sections(text: str) -> list[_MarkdownSection]:
 
     if not sections:
         return [_MarkdownSection(heading_line="", heading_path=(), raw_body=text)]
-    return sections
+    return _coalesce_document_start_preamble(sections)
+
+
+def _coalesce_document_start_preamble(sections: list[_MarkdownSection]) -> list[_MarkdownSection]:
+    """Preserve agreement-intro preambles as runtime-visible parent context.
+
+    Some PDF→Markdown converters emit preamble lines (effective-date/party definitions)
+    as multiple small heading sections before the first numbered section heading.
+    This coalesces those leading fragments into one opening section so parent chunk
+    construction keeps the full intro block intact.
+    """
+
+    if len(sections) < 2:
+        return sections
+
+    first_numbered_idx: int | None = None
+    for idx, section in enumerate(sections):
+        heading = _heading_text(section.heading_line)
+        if heading and _is_numbered_section_heading(heading):
+            first_numbered_idx = idx
+            break
+
+    if first_numbered_idx is None or first_numbered_idx <= 1:
+        return sections
+
+    leading = sections[:first_numbered_idx]
+    if not _looks_like_agreement_intro("".join(part.full_text for part in leading)):
+        return sections
+
+    first = leading[0]
+    if first.heading_line:
+        heading_line = first.heading_line
+        heading_path = first.heading_path
+        raw_body_parts = [first.raw_body]
+        raw_body_parts.extend(part.full_text for part in leading[1:])
+        raw_body = "".join(raw_body_parts).lstrip("\n")
+    else:
+        heading_line = ""
+        heading_path = ()
+        raw_body = "".join(part.full_text for part in leading)
+
+    merged_intro = _MarkdownSection(
+        heading_line=heading_line,
+        heading_path=heading_path,
+        raw_body=raw_body,
+    )
+    return [merged_intro, *sections[first_numbered_idx:]]
+
+
+def _heading_text(heading_line: str) -> str:
+    if not heading_line:
+        return ""
+    return re.sub(r"^#{1,6}\s*", "", heading_line).strip()
+
+
+def _is_numbered_section_heading(heading: str) -> bool:
+    normalized = heading.strip().lower()
+    return bool(re.match(r"^(section\s+)?\d{1,3}(?:\.\d+)*[\).:\-]?\s+\S", normalized))
+
+
+def _looks_like_agreement_intro(text: str) -> bool:
+    lowered = text.lower()
+    intro_markers = (
+        "agreement",
+        "between",
+        "by and between",
+        "effective",
+        "parties to this agreement",
+        "employer",
+        "employee",
+    )
+    return any(marker in lowered for marker in intro_markers)
 
 
 def _split_large_parent_section(
