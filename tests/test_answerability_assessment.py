@@ -943,6 +943,28 @@ def test_who_are_the_parties_returns_party_evidence_when_present() -> None:
     assert result.should_answer is True
 
 
+def test_party_set_variants_are_sufficient_when_intro_party_assignment_is_present() -> None:
+    context = [
+        _parent(
+            "p1",
+            (
+                "The parties to this Agreement are Acme Corp (the Employer) and Jane Smith (the Employee). "
+                "These identified parties are the signatories and are bound by the operative provisions below."
+            ),
+            heading="Parties",
+        )
+    ]
+    for query in (
+        "who are the parties involved in this document?",
+        "identify the parties in this agreement",
+    ):
+        understanding = understand_query(query)
+        result = assess_answerability(query, understanding, context)
+        assert result.sufficient_context is True
+        assert result.should_answer is True
+        assert "party_set_resolved" in result.evidence_notes
+
+
 def test_which_company_is_this_agreement_for_uses_entity_evidence_when_present() -> None:
     query = "which company is this agreement for?"
     understanding = understand_query(query)

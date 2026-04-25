@@ -1982,6 +1982,7 @@ class AnswerabilityAssessor:
             r"\bwho\s+is\s+the\s+employer\b",
             r"\bwho\s+is\s+the\s+employee\b",
             r"\bwho\s+are\s+the\s+parties\b",
+            r"\bidentify\s+(?:the\s+)?parties\b",
             r"\bwhich\s+company\s+is\s+this\s+agreement\s+for\b",
             r"\bwho\s+is\s+the\s+hiring\s+company\b",
             r"\bwhich\s+party\s+is\s+the\s+company\s+side\b",
@@ -2023,6 +2024,17 @@ class AnswerabilityAssessor:
 
     def _is_individual_side_query(self, lowered_query: str) -> bool:
         return bool(re.search(r"\bwhich\s+party\s+is\s+the\s+individual\s+side\b", lowered_query))
+
+    def _is_party_set_query(self, lowered_query: str) -> bool:
+        patterns = (
+            r"\bwho\s+are\s+the\s+parties\b",
+            r"\bwho\s+are\s+the\s+parties\s+involved\b",
+            r"\bidentify\s+(?:the\s+)?parties\b",
+            r"\bidentify\s+the\s+parties\s+involved\b",
+            r"\bname\s+(?:the\s+)?parties\b",
+            r"\blist\s+(?:the\s+)?parties\b",
+        )
+        return any(re.search(pattern, lowered_query) for pattern in patterns)
 
     def _has_matter_metadata_evidence(self, substantive: Sequence[Mapping[str, Any]], query: str) -> bool:
         lowered_query = self._canonical_phrase(query)
@@ -2176,7 +2188,7 @@ class AnswerabilityAssessor:
                 "missing": ["employee_role_assignment_missing_or_ambiguous", *diagnostic_missing],
             })
 
-        if "who are the parties" in lowered_query:
+        if self._is_party_set_query(lowered_query):
             if len(role_assignment.parties) >= 2:
                 return with_debug({
                     "supported": True,

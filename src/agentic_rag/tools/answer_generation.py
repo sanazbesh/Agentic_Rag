@@ -304,7 +304,7 @@ class LegalAnswerSynthesizer:
                 warnings=resolution_warnings,
             )
 
-        if "who are the parties" in lowered_query:
+        if self._is_party_set_query(lowered_query):
             if len(role_assignment.parties) < 2:
                 return self._insufficient_party_role_with_citation(citation, source_line)
             return self._party_role_success(
@@ -444,6 +444,7 @@ class LegalAnswerSynthesizer:
             r"\bwho\s+is\s+the\s+employer\b",
             r"\bwho\s+is\s+the\s+employee\b",
             r"\bwho\s+are\s+the\s+parties\b",
+            r"\bidentify\s+(?:the\s+)?parties\b",
             r"\bwhich\s+company\s+is\s+this\s+agreement\s+for\b",
             r"\bwho\s+is\s+the\s+hiring\s+company\b",
             r"\bwhich\s+party\s+is\s+the\s+company\s+side\b",
@@ -451,6 +452,17 @@ class LegalAnswerSynthesizer:
             r"\bis\s+this\s+agreement\s+between\b",
             r"\bis\s+(?:this|the)\s+agreement\s+with\b",
             r"\bis\s+(?:this|the)\s+agreement\s+for\b",
+        )
+        return any(re.search(pattern, lowered_query) for pattern in patterns)
+
+    def _is_party_set_query(self, lowered_query: str) -> bool:
+        patterns = (
+            r"\bwho\s+are\s+the\s+parties\b",
+            r"\bwho\s+are\s+the\s+parties\s+involved\b",
+            r"\bidentify\s+(?:the\s+)?parties\b",
+            r"\bidentify\s+the\s+parties\s+involved\b",
+            r"\bname\s+(?:the\s+)?parties\b",
+            r"\blist\s+(?:the\s+)?parties\b",
         )
         return any(re.search(pattern, lowered_query) for pattern in patterns)
 

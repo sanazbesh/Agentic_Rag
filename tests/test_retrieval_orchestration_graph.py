@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from agentic_rag.orchestration.decomposition_gate import decide_decomposition_need
+from agentic_rag.orchestration.query_understanding import understand_query
 from agentic_rag.orchestration.retrieval_graph import (
     DecompositionPlan,
     MergedRetrievalCandidate,
@@ -254,6 +255,46 @@ def test_non_party_role_family_does_not_augment_intro_parent() -> None:
     assert state["parent_ids"] == ["p1", "p3"]
     assert not any(note.startswith("party_role_intro_parent_augmented:") for note in state["warnings"])
     assert len(services.hybrid_calls) == 1
+
+
+def test_party_role_queries_bind_single_selected_document_scope_without_followup_context() -> None:
+    queries = (
+        "who are the parties?",
+        "who are the parties involved in this document?",
+        "identify the parties in this agreement",
+    )
+    selected_documents = [{"id": "uploaded:agreement.md", "name": "agreement.md"}]
+    for query in queries:
+        services = FakeServices(
+            classifier=understand_query(query, selected_documents=selected_documents),
+            hybrid_results=[_hybrid("c1", "p1")],
+            reranked_results=[_reranked("c1", "p1")],
+        )
+        state = run_retrieval_stage(query=query, dependencies=services.as_dependencies(), selected_documents=selected_documents)
+        assert state["context_resolution"] is not None
+        assert state["context_resolution"].resolved_document_ids == ["uploaded:agreement.md"]
+        assert services.hybrid_calls
+        applied_filters = services.hybrid_calls[0]["filters"] or {}
+        assert applied_filters.get("resolved_document_ids") == ["uploaded:agreement.md"]
+
+
+def test_party_role_document_reference_with_multiple_selected_documents_does_not_bind_scope() -> None:
+    query = "who are the parties involved in this document?"
+    selected_documents = [
+        {"id": "uploaded:a.md", "name": "a.md"},
+        {"id": "uploaded:b.md", "name": "b.md"},
+    ]
+    services = FakeServices(
+        classifier=understand_query(query, selected_documents=selected_documents),
+        hybrid_results=[_hybrid("c1", "p1")],
+        reranked_results=[_reranked("c1", "p1")],
+    )
+    state = run_retrieval_stage(query=query, dependencies=services.as_dependencies(), selected_documents=selected_documents)
+
+    assert state["context_resolution"] is not None
+    assert state["context_resolution"].resolved_document_ids == []
+    applied_filters = services.hybrid_calls[0]["filters"] or {}
+    assert "resolved_document_ids" not in applied_filters
 
 
 def test_followup_query_uses_context_and_passes_to_rewrite() -> None:
