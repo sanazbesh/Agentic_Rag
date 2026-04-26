@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from typing import Any, Mapping
 
+from evals.runners import run_offline_eval as runner_module
 from evals.runners.run_offline_eval import run_offline_eval
 
 
@@ -269,3 +270,41 @@ def test_version_attribution_is_stable_across_repeated_offline_eval_runs(tmp_pat
     )
 
     assert first.case_results[0]["version_attribution"] == second.case_results[0]["version_attribution"]
+
+
+def test_main_wires_cli_case_executor(monkeypatch: Any, tmp_path: Path) -> None:
+    captured: dict[str, Any] = {}
+
+    def _fake_cli_executor() -> Any:
+        return "cli_executor"
+
+    def _fake_run_offline_eval(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return None
+
+    monkeypatch.setattr(runner_module, "_build_cli_case_executor", _fake_cli_executor)
+    monkeypatch.setattr(runner_module, "run_offline_eval", _fake_run_offline_eval)
+
+    output_path = tmp_path / "offline.json"
+    exit_code = runner_module.main(["--output", str(output_path), "--family", "party_role_verification"])
+
+    assert exit_code == 0
+    assert captured["case_executor"] == "cli_executor"
+    assert captured["output_path"] == str(output_path)
+    assert captured["family"] == "party_role_verification"
+
+
+def test_cli_selected_documents_merges_ids_paths_and_existing_descriptors() -> None:
+    selected = runner_module._resolve_cli_selected_documents(
+        {
+            "selected_documents": [{"id": "doc-existing", "path": "fixtures/existing.md", "name": "existing"}],
+            "selected_document_ids": ["doc-existing", "doc-added"],
+            "selected_document_paths": ["fixtures/existing.md", "fixtures/added.md", "fixtures/path_only.md"],
+        }
+    )
+
+    assert selected == [
+        {"id": "doc-existing", "path": "fixtures/existing.md", "name": "existing"},
+        {"id": "doc-added", "path": "fixtures/added.md"},
+        {"path": "fixtures/path_only.md"},
+    ]
