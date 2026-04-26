@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any, Mapping
 
 from evals.runners import run_offline_eval as runner_module
-from evals.runners.run_offline_eval import run_offline_eval
+from evals.runners.run_offline_eval import _normalize_for_json, run_offline_eval
+from evals.reports.build_report import build_report
+from agentic_rag.tools.answer_generation import AnswerCitation
 from ui.local_backend import build_local_backend_dependencies
 from evals.runners.offline_fixture_registry import known_offline_fixture_ids
 
@@ -357,3 +361,95 @@ def test_fixture_resolution_populates_local_backend_scope_and_retrieval() -> Non
         top_k=5,
     )
     assert hits
+
+
+def test_normalize_for_json_handles_nested_citation_objects_and_common_types() -> None:
+    class Grade(Enum):
+        HIGH = "high"
+
+    @dataclass
+    class DataRow:
+        path: Path
+        citation: AnswerCitation
+
+    class FakeModel:
+        def model_dump(self, mode: str = "json") -> dict[str, Any]:
+            _ = mode
+            return {"kind": "fake-model", "citation": AnswerCitation("p-md", "doc-md", "src-md", "h-md", "excerpt-md")}
+
+    class LooseObject:
+        def __init__(self) -> None:
+            self.path = Path("fixtures/loose.md")
+            self.citations = [AnswerCitation("p-loose", "doc-loose", "src-loose", "h-loose", "excerpt-loose")]
+
+    normalized = _normalize_for_json(
+        {
+            "citations": [AnswerCitation("p1", "doc-1", "src-1", "h-1", "excerpt-1")],
+            "nested": {
+                "row": DataRow(
+                    path=Path("fixtures/doc.md"),
+                    citation=AnswerCitation("p2", "doc-2", "src-2", "h-2", "excerpt-2"),
+                ),
+                "grade": Grade.HIGH,
+                "model": FakeModel(),
+                "loose": LooseObject(),
+            },
+        }
+    )
+
+    encoded = json.dumps(normalized)
+    decoded = json.loads(encoded)
+    assert decoded["citations"][0]["parent_chunk_id"] == "p1"
+    assert decoded["nested"]["row"]["citation"]["document_id"] == "doc-2"
+    assert decoded["nested"]["row"]["path"] == "fixtures/doc.md"
+    assert decoded["nested"]["grade"] == "high"
+    assert decoded["nested"]["model"]["citation"]["parent_chunk_id"] == "p-md"
+    assert decoded["nested"]["loose"]["citations"][0]["source_name"] == "src-loose"
+
+
+def test_runner_serializes_answercitation_in_run_artifact_and_report_builder_reads_it(tmp_path: Path) -> None:
+    dataset = tmp_path / "dataset.jsonl"
+    _write_dataset(dataset, [_case("case-citation", "party_role_verification")])
+    output = tmp_path / "offline.json"
+
+    def citation_executor(_: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        final_result = {
+            "answer_text": "citation answer",
+            "grounded": True,
+            "sufficient_context": True,
+            "citations": [AnswerCitation("p-final", "doc-final", "src-final", "h-final", "excerpt-final")],
+            "warnings": [],
+        }
+        debug_payload = {
+            "query_classification": {"family": "party_role_verification", "routing_notes": ["legal_question_family:party_role_verification"]},
+            "generated_citations": [AnswerCitation("p-debug", "doc-debug", "src-debug", "h-debug", "excerpt-debug")],
+            "warning_paths": [Path("fixtures/warn.md")],
+        }
+        state_payload = {
+            "child_results": [
+                {
+                    "child_chunk_id": "eu-1",
+                    "parent_chunk_id": "p-state",
+                    "document_id": "doc-state",
+                    "metadata": {"embedded_citation": AnswerCitation("p-state", "doc-state", "src-state", "h-state", "excerpt-state")},
+                }
+            ],
+        }
+        return final_result, debug_payload, state_payload
+
+    run_offline_eval(
+        output_path=output,
+        dataset_path=dataset,
+        case_executor=citation_executor,
+        run_model_graders=False,
+    )
+
+    blob = json.loads(output.read_text(encoding="utf-8"))
+    case = blob["cases"][0]
+    assert case["system_result"]["citations"][0]["parent_chunk_id"] == "p-final"
+    assert case["debug_payload"]["generated_citations"][0]["document_id"] == "doc-debug"
+    assert case["debug_payload"]["warning_paths"] == ["fixtures/warn.md"]
+
+    report_path = tmp_path / "report.md"
+    build_report(candidate_run=output, output_path=report_path)
+    assert report_path.exists()
