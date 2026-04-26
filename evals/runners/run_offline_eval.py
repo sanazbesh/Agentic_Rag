@@ -24,6 +24,7 @@ _ensure_src_path_for_local_runs()
 
 from ui.debug_payload import build_real_debug_payload
 from ui.local_backend import build_local_backend_dependencies
+from evals.runners.offline_fixture_registry import resolve_offline_eval_selected_documents
 from agentic_rag.versioning import get_version_attribution, normalize_model_version
 from evals.graders.answerability_checks import evaluate_answerability_checks
 from evals.graders.citation_checks import evaluate_citation_checks
@@ -257,34 +258,7 @@ def _resolve_recent_messages(eval_case: Mapping[str, Any]) -> list[Mapping[str, 
 
 
 def _resolve_cli_selected_documents(eval_case: Mapping[str, Any]) -> list[dict[str, Any]]:
-    selected_documents_raw = eval_case.get("selected_documents")
-    selected_documents: list[dict[str, Any]] = []
-    if isinstance(selected_documents_raw, list):
-        for item in selected_documents_raw:
-            if isinstance(item, Mapping):
-                selected_documents.append(dict(item))
-
-    selected_ids = [str(item) for item in list(eval_case.get("selected_document_ids") or []) if str(item).strip()]
-    selected_paths = [str(item) for item in list(eval_case.get("selected_document_paths") or []) if str(item).strip()]
-
-    existing_by_id = {str(doc.get("id")): doc for doc in selected_documents if doc.get("id")}
-    existing_paths = {str(doc.get("path")) for doc in selected_documents if doc.get("path")}
-
-    for index, selected_id in enumerate(selected_ids):
-        if selected_id in existing_by_id:
-            continue
-        descriptor: dict[str, Any] = {"id": selected_id}
-        if index < len(selected_paths):
-            descriptor["path"] = selected_paths[index]
-            existing_paths.add(selected_paths[index])
-        selected_documents.append(descriptor)
-
-    for selected_path in selected_paths:
-        if selected_path in existing_paths:
-            continue
-        selected_documents.append({"path": selected_path})
-
-    return selected_documents
+    return resolve_offline_eval_selected_documents(eval_case)
 
 
 def _build_cli_case_executor() -> CaseExecutor:
