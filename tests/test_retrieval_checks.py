@@ -163,3 +163,59 @@ def test_retrieval_evaluator_entrypoint_callable_for_offline_runner_integration(
 
     assert result.metadata["deterministic"] is True
     assert result.metadata["model_based_judgment"] is False
+
+
+def test_gold_evidence_matches_when_runtime_uses_parent_ids() -> None:
+    case = {
+        "id": "case-parent",
+        "family": "party_role_verification",
+        "gold_evidence_ids": ["parent-1"],
+        "gold_citation_refs": [{"document_id": "doc-employment-master"}],
+    }
+    result = evaluate_retrieval_checks(
+        eval_case=case,
+        retrieval_payload={
+            "reranked_child_results": [{"child_chunk_id": "child-a", "parent_chunk_id": "parent-1", "payload": {}}],
+            "citations": [{"parent_chunk_id": "parent-1", "document_id": "doc-employment-master"}],
+        },
+    )
+    recall5 = next(item for item in result.metrics if item.metric_name == "gold_chunk_recall_at_5")
+    assert recall5.passed is True
+    assert recall5.details["id_match_layer"] == "parent_chunk_id"
+
+
+def test_gold_evidence_matches_when_runtime_uses_child_ids() -> None:
+    case = {
+        "id": "case-child",
+        "family": "party_role_verification",
+        "gold_evidence_ids": ["child-1"],
+    }
+    result = evaluate_retrieval_checks(
+        eval_case=case,
+        retrieval_payload={"reranked_child_results": [{"child_chunk_id": "child-1", "parent_chunk_id": "parent-x", "payload": {}}]},
+    )
+    recall5 = next(item for item in result.metrics if item.metric_name == "gold_chunk_recall_at_5")
+    assert recall5.passed is True
+    assert recall5.details["id_match_layer"] == "child_chunk_id"
+
+
+def test_retrieval_details_show_citation_parent_alignment_layer() -> None:
+    case = {
+        "id": "case-legacy",
+        "family": "party_role_verification",
+        "gold_evidence_ids": ["eu.party.intro.2"],
+        "gold_citation_refs": [{"document_id": "doc-employment-master"}],
+    }
+    result = evaluate_retrieval_checks(
+        eval_case=case,
+        retrieval_payload={
+            "reranked_child_results": [
+                {"child_chunk_id": "child-1", "parent_chunk_id": "parent-intro", "document_id": "doc-employment-master", "payload": {}}
+            ],
+            "citations": [{"parent_chunk_id": "parent-intro", "document_id": "doc-employment-master"}],
+        },
+    )
+    recall5 = next(item for item in result.metrics if item.metric_name == "gold_chunk_recall_at_5")
+    assert recall5.passed is True
+    assert recall5.details["id_match_layer"] == "citation_parent_alignment"
+    assert result.metadata["id_match_layer"] == "citation_parent_alignment"

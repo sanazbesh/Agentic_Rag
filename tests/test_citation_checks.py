@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from evals.graders.citation_checks import (
     aggregate_citation_results_by_family,
     evaluate_citation_checks,
@@ -175,3 +177,23 @@ def test_citation_evaluator_entrypoint_callable_for_offline_runner_integration()
 
     assert result.metadata["deterministic"] is True
     assert result.metadata["model_based_judgment"] is False
+
+
+def test_structured_citation_objects_are_counted_for_presence() -> None:
+    @dataclass(slots=True, frozen=True)
+    class CitationObj:
+        parent_chunk_id: str
+        document_id: str
+        supporting_excerpt: str
+
+    final_result = {
+        "answer_text": "Employer is Acme Corp.",
+        "grounded": True,
+        "sufficient_context": True,
+        "citations": [CitationObj(parent_chunk_id="gold-eu-1", document_id="doc-1", supporting_excerpt="Excerpt")],
+        "warnings": [],
+    }
+    result = evaluate_citation_checks(eval_case=_base_case(), final_result=final_result, debug_payload={})
+    presence = _metric(result, "citation_presence")
+    assert presence.passed is True
+    assert presence.details["citation_count"] == 1

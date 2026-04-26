@@ -474,6 +474,7 @@ def _build_retrieval_payload(state_payload: Mapping[str, Any]) -> dict[str, Any]
         "child_results",
         "parent_ids",
         "parent_chunks",
+        "citations",
     )
     return {key: state_payload.get(key) for key in keys}
 
