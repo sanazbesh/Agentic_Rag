@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from typing import Any
 
 
@@ -393,11 +393,8 @@ def _extract_citations(final_result: Mapping[str, Any]) -> list[dict[str, Any]]:
 
     rows: list[dict[str, Any]] = []
     for item in raw:
-        if isinstance(item, Mapping):
-            mapping = item
-        elif hasattr(item, "__dict__"):
-            mapping = vars(item)
-        else:
+        mapping = _mapping(item)
+        if mapping is None:
             continue
 
         parent_chunk_id = _as_clean_str(mapping.get("parent_chunk_id"))
@@ -463,6 +460,23 @@ def _as_clean_str(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _mapping(value: Any) -> Mapping[str, Any] | None:
+    if isinstance(value, Mapping):
+        return value
+    if is_dataclass(value):
+        dumped = asdict(value)
+        if isinstance(dumped, Mapping):
+            return dumped
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        dumped = model_dump()
+        if isinstance(dumped, Mapping):
+            return dumped
+    if hasattr(value, "__dict__"):
+        return vars(value)
+    return None
 
 
 def _safe_rate(numerator: int, denominator: int) -> float:

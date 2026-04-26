@@ -62,9 +62,16 @@ def evaluate_retrieval_checks(
     case_family = str(eval_case.get("family") or "unknown")
     gold_child_ids = _string_list(eval_case.get("gold_evidence_ids"))
     gold_parent_ids = _string_list(eval_case.get("gold_parent_chunk_ids"))
+    gold_doc_ids = _extract_gold_citation_doc_ids(eval_case)
 
     ranked_hits = _extract_ranked_hits(retrieval_payload)
     observed_child_ids = [hit["child_chunk_id"] for hit in ranked_hits]
+    id_match_strategy = _resolve_id_match_strategy(
+        gold_ids=gold_child_ids,
+        ranked_hits=ranked_hits,
+        retrieval_payload=retrieval_payload,
+        gold_doc_ids=gold_doc_ids,
+    )
 
     metrics: list[RetrievalMetricResult] = []
     sorted_ks = sorted({int(k) for k in recall_ks if int(k) > 0})
@@ -72,7 +79,12 @@ def evaluate_retrieval_checks(
     recall_hit_by_k: dict[int, bool | None] = {}
 
     for k in sorted_ks:
-        metric = _gold_chunk_recall_at_k(gold_child_ids=gold_child_ids, ranked_hits=ranked_hits, k=k)
+        metric = _gold_chunk_recall_at_k(
+            gold_child_ids=gold_child_ids,
+            ranked_hits=ranked_hits,
+            k=k,
+            strategy=id_match_strategy,
+        )
         metrics.append(metric)
         recall_by_k[k] = metric.value
         recall_hit_by_k[k] = metric.passed
@@ -80,7 +92,11 @@ def evaluate_retrieval_checks(
     parent_metric = _gold_parent_recall(gold_parent_ids=gold_parent_ids, retrieval_payload=retrieval_payload)
     metrics.append(parent_metric)
 
-    rank_metric = _best_rank_of_gold_evidence(gold_child_ids=gold_child_ids, ranked_hits=ranked_hits)
+    rank_metric = _best_rank_of_gold_evidence(
+        gold_child_ids=gold_child_ids,
+        ranked_hits=ranked_hits,
+        strategy=id_match_strategy,
+    )
     metrics.append(rank_metric)
 
     wrong_family_metric = _wrong_family_usage_rate(
@@ -122,6 +138,8 @@ def evaluate_retrieval_checks(
             "ranked_child_result_count": len(observed_child_ids),
             "gold_child_id_count": len(gold_child_ids),
             "gold_parent_id_count": len(gold_parent_ids),
+            "gold_citation_doc_id_count": len(gold_doc_ids),
+            "id_match_layer": id_match_strategy["name"],
         },
     )
 
@@ -190,6 +208,7 @@ def _gold_chunk_recall_at_k(
     gold_child_ids: Sequence[str],
     ranked_hits: Sequence[dict[str, Any]],
     k: int,
+    strategy: Mapping[str, Any],
 ) -> RetrievalMetricResult:
     name = f"gold_chunk_recall_at_{k}"
     if not gold_child_ids:
@@ -202,11 +221,7 @@ def _gold_chunk_recall_at_k(
         )
 
     top_hits = list(ranked_hits[:k])
-    matched = sorted({
-        gold_id
-        for gold_id in gold_child_ids
-        if any(_hit_matches_gold(hit, gold_id) for hit in top_hits)
-    })
+    matched = sorted({gold_id for gold_id in gold_child_ids if any(_hit_matches_gold(hit, gold_id, strategy) for hit in top_hits)})
     any_match = bool(matched)
     return RetrievalMetricResult(
         metric_name=name,
@@ -218,6 +233,7 @@ def _gold_chunk_recall_at_k(
             "matched_gold_count": len(matched),
             "gold_id_count": len(gold_child_ids),
             "top_k_child_chunk_ids": [hit["child_chunk_id"] for hit in top_hits],
+            "id_match_layer": str(strategy.get("name") or "unknown"),
         },
     )
 
@@ -248,7 +264,12 @@ def _gold_parent_recall(*, gold_parent_ids: Sequence[str], retrieval_payload: Ma
     )
 
 
-def _best_rank_of_gold_evidence(*, gold_child_ids: Sequence[str], ranked_hits: Sequence[dict[str, Any]]) -> RetrievalMetricResult:
+def _best_rank_of_gold_evidence(
+    *,
+    gold_child_ids: Sequence[str],
+    ranked_hits: Sequence[dict[str, Any]],
+    strategy: Mapping[str, Any],
+) -> RetrievalMetricResult:
     if not gold_child_ids:
         return RetrievalMetricResult(
             metric_name="best_rank_of_gold_evidence",
@@ -261,7 +282,7 @@ def _best_rank_of_gold_evidence(*, gold_child_ids: Sequence[str], ranked_hits: S
     best_rank: int | None = None
     best_gold_id: str | None = None
     for idx, hit in enumerate(ranked_hits, start=1):
-        matched_gold = next((gold_id for gold_id in gold_child_ids if _hit_matches_gold(hit, gold_id)), None)
+        matched_gold = next((gold_id for gold_id in gold_child_ids if _hit_matches_gold(hit, gold_id, strategy)), None)
         if matched_gold is None:
             continue
         best_rank = idx
@@ -272,7 +293,7 @@ def _best_rank_of_gold_evidence(*, gold_child_ids: Sequence[str], ranked_hits: S
         metric_name="best_rank_of_gold_evidence",
         value=float(best_rank) if isinstance(best_rank, int) else None,
         passed=best_rank is not None,
-        details={"best_rank": best_rank, "matched_gold_id": best_gold_id},
+        details={"best_rank": best_rank, "matched_gold_id": best_gold_id, "id_match_layer": str(strategy.get("name") or "unknown")},
         note=None if best_rank is not None else "No gold evidence appeared in the ranked retrieval list.",
     )
 
@@ -480,8 +501,19 @@ def _normalize_family(family: str) -> str:
     return aliases.get(token, token)
 
 
-def _hit_matches_gold(hit: Mapping[str, Any], gold_id: str) -> bool:
+def _hit_matches_gold(hit: Mapping[str, Any], gold_id: str, strategy: Mapping[str, Any]) -> bool:
+    strategy_name = str(strategy.get("name") or "")
+    if strategy_name == "citation_parent_alignment":
+        citation_parent_ids = strategy.get("citation_parent_ids") or set()
+        if not isinstance(citation_parent_ids, set):
+            citation_parent_ids = set(citation_parent_ids)
+        if not citation_parent_ids:
+            return False
+        return str(hit.get("parent_chunk_id") or "") in citation_parent_ids
+
     if str(hit.get("child_chunk_id") or "") == gold_id:
+        return True
+    if str(hit.get("parent_chunk_id") or "") == gold_id:
         return True
     metadata = _mapping(hit.get("metadata")) or {}
     if str(metadata.get("evidence_unit_id") or "") == gold_id:
@@ -490,6 +522,67 @@ def _hit_matches_gold(hit: Mapping[str, Any], gold_id: str) -> bool:
     if isinstance(evidence_ids, Sequence) and not isinstance(evidence_ids, (str, bytes)):
         return gold_id in {str(item) for item in evidence_ids if isinstance(item, str)}
     return False
+
+
+def _resolve_id_match_strategy(
+    *,
+    gold_ids: Sequence[str],
+    ranked_hits: Sequence[Mapping[str, Any]],
+    retrieval_payload: Mapping[str, Any],
+    gold_doc_ids: set[str],
+) -> dict[str, Any]:
+    observed_child_ids = {str(hit.get("child_chunk_id") or "") for hit in ranked_hits if str(hit.get("child_chunk_id") or "")}
+    observed_parent_ids = {str(hit.get("parent_chunk_id") or "") for hit in ranked_hits if str(hit.get("parent_chunk_id") or "")}
+    observed_evidence_unit_ids: set[str] = set()
+    for hit in ranked_hits:
+        metadata = _mapping(hit.get("metadata")) or {}
+        evidence_unit_id = str(metadata.get("evidence_unit_id") or "")
+        if evidence_unit_id:
+            observed_evidence_unit_ids.add(evidence_unit_id)
+        evidence_ids = metadata.get("evidence_unit_ids")
+        if isinstance(evidence_ids, Sequence) and not isinstance(evidence_ids, (str, bytes)):
+            observed_evidence_unit_ids.update(str(item) for item in evidence_ids if isinstance(item, str) and item)
+
+    gold_set = {item for item in gold_ids if item}
+    if gold_set.intersection(observed_evidence_unit_ids):
+        return {"name": "evidence_unit_id", "gold_id_type": "evidence_unit", "citation_parent_ids": set()}
+    if gold_set.intersection(observed_child_ids):
+        return {"name": "child_chunk_id", "gold_id_type": "child_chunk", "citation_parent_ids": set()}
+    if gold_set.intersection(observed_parent_ids):
+        return {"name": "parent_chunk_id", "gold_id_type": "parent_chunk", "citation_parent_ids": set()}
+
+    citation_parent_ids = _extract_citation_parent_ids(retrieval_payload)
+    if citation_parent_ids and (gold_doc_ids or gold_set):
+        return {
+            "name": "citation_parent_alignment",
+            "gold_id_type": "legacy_or_unmapped",
+            "citation_parent_ids": citation_parent_ids,
+            "gold_citation_doc_ids": sorted(gold_doc_ids),
+        }
+
+    return {"name": "unmatched", "gold_id_type": "unknown", "citation_parent_ids": set()}
+
+
+def _extract_citation_parent_ids(payload: Mapping[str, Any]) -> set[str]:
+    citations = _as_sequence(payload.get("citations"))
+    parent_ids: set[str] = set()
+    for item in citations:
+        parent = str(_field(item, "parent_chunk_id") or "")
+        if parent:
+            parent_ids.add(parent)
+    return parent_ids
+
+
+def _extract_gold_citation_doc_ids(eval_case: Mapping[str, Any]) -> set[str]:
+    refs = eval_case.get("gold_citation_refs")
+    if not isinstance(refs, Sequence) or isinstance(refs, (str, bytes)):
+        return set()
+    doc_ids: set[str] = set()
+    for item in refs:
+        doc_id = str(_field(item, "document_id") or "").strip()
+        if doc_id:
+            doc_ids.add(doc_id)
+    return doc_ids
 
 
 def _field(value: Any, key: str) -> Any:
