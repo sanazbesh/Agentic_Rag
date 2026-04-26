@@ -4,8 +4,9 @@ import argparse
 import json
 import importlib.util
 import sys
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -55,6 +56,60 @@ class OfflineEvalRunResult:
     output_path: str
     summary: dict[str, Any]
     case_results: list[dict[str, Any]]
+
+
+def _normalize_for_json(value: Any, *, _seen: set[int] | None = None) -> Any:
+    """Recursively convert Python objects into JSON-safe primitives."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+
+    seen = _seen if _seen is not None else set()
+    obj_id = id(value)
+    if obj_id in seen:
+        return f"<circular_ref:{type(value).__name__}>"
+    seen.add(obj_id)
+    try:
+        if isinstance(value, Enum):
+            return _normalize_for_json(value.value, _seen=seen)
+        if isinstance(value, Path):
+            return str(value)
+
+        if isinstance(value, Mapping):
+            return {str(key): _normalize_for_json(item, _seen=seen) for key, item in value.items()}
+
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return [_normalize_for_json(item, _seen=seen) for item in value]
+
+        if is_dataclass(value) and not isinstance(value, type):
+            return _normalize_for_json(asdict(value), _seen=seen)
+
+        model_dump = getattr(value, "model_dump", None)
+        if callable(model_dump):
+            try:
+                dumped = model_dump(mode="json")
+            except TypeError:
+                dumped = model_dump()
+            except Exception:
+                dumped = None
+            if dumped is not None:
+                return _normalize_for_json(dumped, _seen=seen)
+
+        to_dict = getattr(value, "to_dict", None)
+        if callable(to_dict):
+            try:
+                dumped = to_dict()
+            except Exception:
+                dumped = None
+            if dumped is not None:
+                return _normalize_for_json(dumped, _seen=seen)
+
+        object_dict = getattr(value, "__dict__", None)
+        if isinstance(object_dict, dict):
+            return _normalize_for_json(object_dict, _seen=seen)
+
+        return repr(value)
+    finally:
+        seen.remove(obj_id)
 
 
 def run_offline_eval(
@@ -150,7 +205,8 @@ def run_offline_eval(
 
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(result_blob, ensure_ascii=False, indent=2), encoding="utf-8")
+    normalized_blob = _normalize_for_json(result_blob)
+    output.write_text(json.dumps(normalized_blob, ensure_ascii=False, indent=2), encoding="utf-8")
     return OfflineEvalRunResult(output_path=str(output), summary=summary, case_results=case_results)
 
 
