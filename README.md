@@ -34,3 +34,11 @@ The UI supports:
 - mock backend mode for immediate local testing
 - a clean adapter boundary for wiring your real `run_legal_rag_turn(...)` runner
 - expandable debug payload inspection panels
+
+## Persistence foundation (Postgres)
+
+For upcoming persistent ingestion pipeline work, Postgres connection settings are environment-driven:
+
+- `DATABASE_URL` (required to initialize engine/session factory)
+- `AGENTIC_RAG_DB_ECHO` (optional; `true/false`, default `false`)
+
