@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from agentic_rag.orchestration.decomposition_gate import decide_decomposition_need
+from agentic_rag.orchestration.query_understanding import understand_query
 from agentic_rag.orchestration.retrieval_graph import (
     DecompositionPlan,
     MergedRetrievalCandidate,
@@ -170,7 +171,15 @@ def _parent(parent_id: str, text: str = "short legal text") -> ParentChunkResult
     )
 
 
-def _decision(*, followup: bool, ambiguous: bool, use_context: bool, rewrite: bool, extract: bool) -> QueryRoutingDecision:
+def _decision(
+    *,
+    followup: bool,
+    ambiguous: bool,
+    use_context: bool,
+    rewrite: bool,
+    extract: bool,
+    routing_notes: list[str] | None = None,
+) -> QueryRoutingDecision:
     return QueryRoutingDecision(
         original_query="q",
         normalized_query="q",
@@ -190,7 +199,7 @@ def _decision(*, followup: bool, ambiguous: bool, use_context: bool, rewrite: bo
         refers_to_prior_document_scope=followup,
         refers_to_prior_clause_or_topic=followup,
         ambiguity_notes=[],
-        routing_notes=["test"],
+        routing_notes=list(routing_notes or ["test"]),
         warnings=[],
     )
 
@@ -206,6 +215,86 @@ def test_self_contained_query_path_completes() -> None:
     assert state["effective_query"] == state["original_query"]
     assert state["use_conversation_context"] is False
     assert state["retrieval_stage_complete"] is True
+
+
+def test_party_role_family_parent_expansion_augments_intro_parent() -> None:
+    classifier = _decision(
+        followup=False,
+        ambiguous=False,
+        use_context=False,
+        rewrite=False,
+        extract=False,
+        routing_notes=["legal_question_family:party_role_entity"],
+    )
+    services = FakeServices(
+        classifier=classifier,
+        hybrid_results=[_hybrid("c1", "p1"), _hybrid("c2", "p3")],
+        reranked_results=[_reranked("c1", "p1"), _reranked("c2", "p3")],
+    )
+    services.hybrid_results_by_query[
+        "who is the employer? agreement preamble intro between and employer employee parties definitions"
+    ] = [_hybrid("c-intro", "p2", text='BETWEEN Acme Holdings LLC ("Employer") and Jane Smith ("Employee")')]
+    state = run_retrieval_stage(query="who is the employer?", dependencies=services.as_dependencies())
+
+    assert state["parent_ids"] == ["p1", "p3", "p2"]
+    assert any(note.startswith("party_role_intro_parent_augmented:") for note in state["warnings"])
+    assert len(services.hybrid_calls) == 2
+
+
+def test_non_party_role_family_does_not_augment_intro_parent() -> None:
+    services = FakeServices(
+        classifier=_decision(followup=False, ambiguous=False, use_context=False, rewrite=False, extract=False),
+        hybrid_results=[_hybrid("c1", "p1"), _hybrid("c2", "p3")],
+        reranked_results=[_reranked("c1", "p1"), _reranked("c2", "p3")],
+    )
+    services.hybrid_results_by_query[
+        "who is the employer? agreement preamble intro between and employer employee parties definitions"
+    ] = [_hybrid("c-intro", "p2", text='BETWEEN Acme Holdings LLC ("Employer") and Jane Smith ("Employee")')]
+    state = run_retrieval_stage(query="who is the employer?", dependencies=services.as_dependencies())
+
+    assert state["parent_ids"] == ["p1", "p3"]
+    assert not any(note.startswith("party_role_intro_parent_augmented:") for note in state["warnings"])
+    assert len(services.hybrid_calls) == 1
+
+
+def test_party_role_queries_bind_single_selected_document_scope_without_followup_context() -> None:
+    queries = (
+        "who are the parties?",
+        "who are the parties involved in this document?",
+        "identify the parties in this agreement",
+    )
+    selected_documents = [{"id": "uploaded:agreement.md", "name": "agreement.md"}]
+    for query in queries:
+        services = FakeServices(
+            classifier=understand_query(query, selected_documents=selected_documents),
+            hybrid_results=[_hybrid("c1", "p1")],
+            reranked_results=[_reranked("c1", "p1")],
+        )
+        state = run_retrieval_stage(query=query, dependencies=services.as_dependencies(), selected_documents=selected_documents)
+        assert state["context_resolution"] is not None
+        assert state["context_resolution"].resolved_document_ids == ["uploaded:agreement.md"]
+        assert services.hybrid_calls
+        applied_filters = services.hybrid_calls[0]["filters"] or {}
+        assert applied_filters.get("resolved_document_ids") == ["uploaded:agreement.md"]
+
+
+def test_party_role_document_reference_with_multiple_selected_documents_does_not_bind_scope() -> None:
+    query = "who are the parties involved in this document?"
+    selected_documents = [
+        {"id": "uploaded:a.md", "name": "a.md"},
+        {"id": "uploaded:b.md", "name": "b.md"},
+    ]
+    services = FakeServices(
+        classifier=understand_query(query, selected_documents=selected_documents),
+        hybrid_results=[_hybrid("c1", "p1")],
+        reranked_results=[_reranked("c1", "p1")],
+    )
+    state = run_retrieval_stage(query=query, dependencies=services.as_dependencies(), selected_documents=selected_documents)
+
+    assert state["context_resolution"] is not None
+    assert state["context_resolution"].resolved_document_ids == []
+    applied_filters = services.hybrid_calls[0]["filters"] or {}
+    assert "resolved_document_ids" not in applied_filters
 
 
 def test_followup_query_uses_context_and_passes_to_rewrite() -> None:

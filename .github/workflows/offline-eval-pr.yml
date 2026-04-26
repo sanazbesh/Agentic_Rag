@@ -1,0 +1,100 @@
+name: Offline Eval PR Gates
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+jobs:
+  smoke_eval:
+    name: Smoke offline eval
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run smoke eval
+        run: |
+          python evals/ci/offline_eval_ci.py run --mode smoke --output artifacts/offline_eval/smoke_run.json
+
+      - name: Enforce smoke gate
+        run: |
+          python evals/ci/offline_eval_ci.py check-gate \
+            --run-json artifacts/offline_eval/smoke_run.json \
+            --min-pass-rate 1.0 \
+            --max-runner-failures 0
+
+      - name: Upload smoke run output
+        uses: actions/upload-artifact@v4
+        with:
+          name: offline-eval-smoke
+          path: artifacts/offline_eval/smoke_run.json
+
+  family_eval:
+    name: Family offline eval (touched areas)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Collect changed files
+        run: |
+          mkdir -p artifacts/offline_eval
+          git diff --name-only "${{ github.event.pull_request.base.sha }}" "${{ github.sha }}" > artifacts/offline_eval/changed_files.txt
+
+      - name: Resolve impacted families
+        run: |
+          python evals/ci/offline_eval_ci.py select-families \
+            --changed-files artifacts/offline_eval/changed_files.txt \
+            --output artifacts/offline_eval/impacted_families.json
+
+      - name: Run touched-family evals
+        run: |
+          python - <<'PY'
+          import json
+          import subprocess
+          from pathlib import Path
+
+          payload = json.loads(Path("artifacts/offline_eval/impacted_families.json").read_text(encoding="utf-8"))
+          families = payload.get("families", [])
+          cmd = ["python", "evals/ci/offline_eval_ci.py", "run", "--mode", "family", "--output", "artifacts/offline_eval/family_run.json"]
+          for family in families:
+              cmd.extend(["--family", family])
+          subprocess.run(cmd, check=True)
+          PY
+
+      - name: Enforce touched-family gate
+        run: |
+          python evals/ci/offline_eval_ci.py check-gate \
+            --run-json artifacts/offline_eval/family_run.json \
+            --min-pass-rate 1.0 \
+            --max-runner-failures 0
+
+      - name: Upload family run outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: offline-eval-family
+          path: |
+            artifacts/offline_eval/changed_files.txt
+            artifacts/offline_eval/impacted_families.json
+            artifacts/offline_eval/family_run.json
+            artifacts/offline_eval/family_*.json

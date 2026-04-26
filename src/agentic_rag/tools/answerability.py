@@ -23,6 +23,16 @@ if TYPE_CHECKING:  # pragma: no cover
     from agentic_rag.orchestration.query_understanding import QueryUnderstandingResult
 
 from agentic_rag.tools.evidence_units import EvidenceUnit, build_evidence_units
+from agentic_rag.tools.party_role_resolution import (
+    compare_query_entities_against_extracted_parties,
+    extract_intro_party_role_assignment,
+    has_intro_role_signal,
+    is_usable_party_entity,
+    normalize_party_text,
+    parse_party_verification_query_entities,
+    pick_company_party,
+    pick_individual_party,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -120,6 +130,7 @@ class AnswerabilityAssessment(BaseModel):
     matched_headings: list[str] = Field(default_factory=list)
     evidence_notes: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+    party_role_resolution_debug: "PartyRoleResolutionDebug | None" = None
 
 
 class CoverageEvaluation(BaseModel):
@@ -142,6 +153,7 @@ class CoverageEvaluation(BaseModel):
     supporting_signals: list[str] = Field(default_factory=list)
     missing_requirements: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+    party_role_resolution_debug: "PartyRoleResolutionDebug | None" = None
 
 
 class EvidenceStrengthEvaluation(BaseModel):
@@ -172,6 +184,44 @@ class EvidenceStrengthEvaluation(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+PARTY_ROLE_PREVIEW_START_CHARS = 400
+PARTY_ROLE_PREVIEW_END_CHARS = 250
+
+
+class PartyRoleParentChunkDebugPreview(BaseModel):
+    """Machine-readable parent chunk diagnostics for party-role resolution."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    text_length_chars: int
+    preview_start: str
+    preview_end: str
+    contains_between_keyword: bool
+    contains_and_keyword: bool
+    contains_employer_label: bool
+    contains_employee_label: bool
+    contains_role_parenthetical: bool
+    intro_pattern_detected: bool
+    resolver_considered_usable_intro_text: bool
+    parent_chunk_id: str | None = None
+    heading: str | None = None
+    source_name: str | None = None
+    document_id: str | None = None
+
+
+class PartyRoleResolutionDebug(BaseModel):
+    """Structured runtime diagnostics emitted by deterministic role resolution."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    party_role_resolution_checked_parent_count: int
+    party_role_resolution_debug_outcome: Literal["resolved", "not_found"]
+    party_role_resolution_debug_reason: str
+    party_role_resolution_checked_parent_ids: list[str] = Field(default_factory=list)
+    party_role_resolution_intro_pattern_parent_ids: list[str] = Field(default_factory=list)
+    checked_parent_previews: list[PartyRoleParentChunkDebugPreview] = Field(default_factory=list)
+
+
 @dataclass(slots=True, frozen=True)
 class EvidenceStrengthThresholds:
     """Centralized deterministic thresholds for evidence-strength classification."""
@@ -187,6 +237,8 @@ class _PartyRoleAssignment:
     parties: tuple[str, ...]
     employer: str | None
     employee: str | None
+    company_side_party: str | None
+    individual_side_party: str | None
 
 
 @dataclass(slots=True)
@@ -288,6 +340,7 @@ class AnswerabilityAssessor:
             supporting_signals: list[str] | None = None,
             missing_requirements: list[str] | None = None,
             warnings: list[str] | None = None,
+            party_role_resolution_debug: PartyRoleResolutionDebug | None = None,
         ) -> CoverageEvaluation:
             return CoverageEvaluation(
                 original_query=original_query,
@@ -302,6 +355,7 @@ class AnswerabilityAssessor:
                 supporting_signals=supporting_signals or [],
                 missing_requirements=missing_requirements or [],
                 warnings=warnings or [],
+                party_role_resolution_debug=party_role_resolution_debug,
             )
 
         if expectation == "definition_required":
@@ -603,6 +657,7 @@ class AnswerabilityAssessor:
                         partial_coverage=False,
                         reason="fact_supported",
                         supporting_signals=list(role_support["signals"]),
+                        party_role_resolution_debug=cast(PartyRoleResolutionDebug | None, role_support.get("debug")),
                     )
                 return build(
                     status="weak",
@@ -610,8 +665,10 @@ class AnswerabilityAssessor:
                     sufficient_coverage=False,
                     partial_coverage=False,
                     reason="fact_not_found",
+                    supporting_signals=list(role_support["signals"]),
                     missing_requirements=list(role_support["missing"]),
                     warnings=["heading_only_context"] if heading_only else [],
+                    party_role_resolution_debug=cast(PartyRoleResolutionDebug | None, role_support.get("debug")),
                 )
 
             is_chronology_query = self._is_chronology_date_event_query(original_query, query_understanding)
@@ -931,6 +988,7 @@ class AnswerabilityAssessor:
             matched_headings=coverage.matched_headings,
             evidence_notes=list(coverage.supporting_signals),
             warnings=list(coverage.warnings),
+            party_role_resolution_debug=coverage.party_role_resolution_debug,
         )
 
     def _map_coverage_reason(self, coverage: CoverageEvaluation) -> InsufficiencyReason | None:
@@ -1924,7 +1982,11 @@ class AnswerabilityAssessor:
             r"\bwho\s+is\s+the\s+employer\b",
             r"\bwho\s+is\s+the\s+employee\b",
             r"\bwho\s+are\s+the\s+parties\b",
+            r"\bidentify\s+(?:the\s+)?parties\b",
             r"\bwhich\s+company\s+is\s+this\s+agreement\s+for\b",
+            r"\bwho\s+is\s+the\s+hiring\s+company\b",
+            r"\bwhich\s+party\s+is\s+the\s+company\s+side\b",
+            r"\bwhich\s+party\s+is\s+the\s+individual\s+side\b",
             r"\bis\s+this\s+agreement\s+between\b",
             r"\bis\s+(?:this|the)\s+agreement\s+with\b",
             r"\bis\s+(?:this|the)\s+agreement\s+for\b",
@@ -1949,6 +2011,30 @@ class AnswerabilityAssessor:
             r"\bwhat\s+is\s+this\s+(?:matter|document)\s+about\b",
         )
         return any(re.search(pattern, lowered) for pattern in patterns)
+
+    def _is_company_side_query(self, lowered_query: str) -> bool:
+        return any(
+            re.search(pattern, lowered_query)
+            for pattern in (
+                r"\bwhich\s+company\s+is\s+this\s+agreement\s+for\b",
+                r"\bwho\s+is\s+the\s+hiring\s+company\b",
+                r"\bwhich\s+party\s+is\s+the\s+company\s+side\b",
+            )
+        )
+
+    def _is_individual_side_query(self, lowered_query: str) -> bool:
+        return bool(re.search(r"\bwhich\s+party\s+is\s+the\s+individual\s+side\b", lowered_query))
+
+    def _is_party_set_query(self, lowered_query: str) -> bool:
+        patterns = (
+            r"\bwho\s+are\s+the\s+parties\b",
+            r"\bwho\s+are\s+the\s+parties\s+involved\b",
+            r"\bidentify\s+(?:the\s+)?parties\b",
+            r"\bidentify\s+the\s+parties\s+involved\b",
+            r"\bname\s+(?:the\s+)?parties\b",
+            r"\blist\s+(?:the\s+)?parties\b",
+        )
+        return any(re.search(pattern, lowered_query) for pattern in patterns)
 
     def _has_matter_metadata_evidence(self, substantive: Sequence[Mapping[str, Any]], query: str) -> bool:
         lowered_query = self._canonical_phrase(query)
@@ -2049,102 +2135,135 @@ class AnswerabilityAssessor:
         return values
 
     def _evaluate_party_role_support(self, substantive: Sequence[Mapping[str, Any]], query: str) -> dict[str, object]:
-        role_assignment = self._resolve_party_roles_from_intro(substantive)
+        role_assignment, diagnostics = self._resolve_party_roles_from_intro(substantive)
+        diagnostic_signals = diagnostics["signals"]
+        diagnostic_missing = diagnostics["missing"]
+        role_resolution_debug = diagnostics.get("debug")
+
+        def with_debug(payload: dict[str, object]) -> dict[str, object]:
+            payload["debug"] = role_resolution_debug
+            return payload
+
         if role_assignment is None:
-            return {
+            return with_debug({
                 "supported": False,
-                "signals": [],
-                "missing": ["party_role_assignment_unresolved"],
-            }
+                "signals": list(diagnostic_signals),
+                "missing": ["party_role_assignment_unresolved", *diagnostic_missing],
+            })
 
         lowered_query = self._canonical_phrase(query)
         if "who is the employer" in lowered_query:
             if role_assignment.employer:
-                return {
+                return with_debug({
                     "supported": True,
                     "signals": [
+                        *diagnostic_signals,
                         "party_role_responsive_evidence_detected",
                         "party_role_assignment_resolved",
                         "employer_role_assignment_resolved",
                     ],
                     "missing": [],
-                }
-            return {
+                })
+            return with_debug({
                 "supported": False,
-                "signals": ["party_role_assignment_resolved"],
-                "missing": ["employer_role_assignment_missing_or_ambiguous"],
-            }
+                "signals": [*diagnostic_signals, "party_role_assignment_resolved", "party_role_resolution_outcome:ambiguous"],
+                "missing": ["employer_role_assignment_missing_or_ambiguous", *diagnostic_missing],
+            })
 
         if "who is the employee" in lowered_query:
             if role_assignment.employee:
-                return {
+                return with_debug({
                     "supported": True,
                     "signals": [
+                        *diagnostic_signals,
                         "party_role_responsive_evidence_detected",
                         "party_role_assignment_resolved",
                         "employee_role_assignment_resolved",
                     ],
                     "missing": [],
-                }
-            return {
+                })
+            return with_debug({
                 "supported": False,
-                "signals": ["party_role_assignment_resolved"],
-                "missing": ["employee_role_assignment_missing_or_ambiguous"],
-            }
+                "signals": [*diagnostic_signals, "party_role_assignment_resolved", "party_role_resolution_outcome:ambiguous"],
+                "missing": ["employee_role_assignment_missing_or_ambiguous", *diagnostic_missing],
+            })
 
-        if "who are the parties" in lowered_query:
+        if self._is_party_set_query(lowered_query):
             if len(role_assignment.parties) >= 2:
-                return {
+                return with_debug({
                     "supported": True,
                     "signals": [
+                        *diagnostic_signals,
                         "party_role_responsive_evidence_detected",
                         "party_role_assignment_resolved",
                         "party_set_resolved",
                     ],
                     "missing": [],
-                }
-            return {
+                })
+            return with_debug({
                 "supported": False,
-                "signals": ["party_role_assignment_resolved"],
-                "missing": ["party_set_incomplete"],
-            }
+                "signals": [*diagnostic_signals, "party_role_assignment_resolved", "party_role_resolution_outcome:ambiguous"],
+                "missing": ["party_set_incomplete", *diagnostic_missing],
+            })
 
         parsed_verification = self._parse_party_verification_query_entities(lowered_query)
         if parsed_verification is not None:
             if cast(bool, parsed_verification["ambiguous"]):
-                return {
+                return with_debug({
                     "supported": False,
-                    "signals": ["party_role_assignment_resolved"],
-                    "missing": ["query_entity_set_incomplete_or_ambiguous"],
-                }
-            return self._compare_query_entities_against_extracted_parties(
+                    "signals": [*diagnostic_signals, "party_role_assignment_resolved", "party_role_resolution_outcome:ambiguous"],
+                    "missing": ["query_entity_set_incomplete_or_ambiguous", *diagnostic_missing],
+                })
+            comparison = self._compare_query_entities_against_extracted_parties(
                 verification_targets=cast(tuple[str, ...], parsed_verification["targets"]),
                 extracted_parties=role_assignment.parties,
             )
+            comparison["signals"] = [*diagnostic_signals, *cast(list[str], comparison["signals"])]
+            comparison["missing"] = [*cast(list[str], comparison["missing"]), *diagnostic_missing]
+            return with_debug(comparison)
 
-        if "which company is this agreement for" in lowered_query:
-            company = role_assignment.employer or self._pick_company_party(role_assignment.parties)
+        if self._is_company_side_query(lowered_query):
+            company = role_assignment.company_side_party or role_assignment.employer or self._pick_company_party(role_assignment.parties)
             if company:
-                return {
+                return with_debug({
                     "supported": True,
                     "signals": [
+                        *diagnostic_signals,
                         "party_role_responsive_evidence_detected",
                         "party_role_assignment_resolved",
                         "company_side_party_identified",
                     ],
                     "missing": [],
-                }
-            return {
+                })
+            return with_debug({
                 "supported": False,
-                "signals": ["party_role_assignment_resolved"],
-                "missing": ["company_side_party_not_identified"],
-            }
+                "signals": [*diagnostic_signals, "party_role_assignment_resolved", "party_role_resolution_outcome:ambiguous"],
+                "missing": ["company_side_party_not_identified", *diagnostic_missing],
+            })
+        if self._is_individual_side_query(lowered_query):
+            individual = role_assignment.individual_side_party or role_assignment.employee or pick_individual_party(role_assignment.parties)
+            if individual:
+                return with_debug({
+                    "supported": True,
+                    "signals": [
+                        *diagnostic_signals,
+                        "party_role_responsive_evidence_detected",
+                        "party_role_assignment_resolved",
+                        "individual_side_party_identified",
+                    ],
+                    "missing": [],
+                })
+            return with_debug({
+                "supported": False,
+                "signals": [*diagnostic_signals, "party_role_assignment_resolved", "party_role_resolution_outcome:ambiguous"],
+                "missing": ["individual_side_party_not_identified", *diagnostic_missing],
+            })
 
-        return {
+        return with_debug({
             "supported": False,
-            "signals": [],
-            "missing": ["party_role_query_not_supported"],
-        }
+            "signals": list(diagnostic_signals),
+            "missing": ["party_role_query_not_supported", *diagnostic_missing],
+        })
 
     def _extract_party_verification_targets(self, lowered_query: str) -> tuple[str, ...] | None:
         parsed = self._parse_party_verification_query_entities(lowered_query)
@@ -2153,23 +2272,7 @@ class AnswerabilityAssessor:
         return cast(tuple[str, ...], parsed["targets"])
 
     def _parse_party_verification_query_entities(self, lowered_query: str) -> dict[str, object] | None:
-        between_match = re.search(r"\bis\s+(?:this|the)\s+agreement\s+between\s+(.+?)\s+and\s+(.+?)\??$", lowered_query)
-        if between_match:
-            first = self._normalize_party_text(between_match.group(1))
-            second = self._normalize_party_text(between_match.group(2))
-            ambiguous = (
-                not self._is_usable_party_entity(first)
-                or not self._is_usable_party_entity(second)
-                or first == second
-            )
-            return {"targets": (first, second), "ambiguous": ambiguous}
-
-        single_party_match = re.search(r"\bis\s+(?:this|the)\s+agreement\s+(?:with|for)\s+(.+?)\??$", lowered_query)
-        if single_party_match:
-            target = self._normalize_party_text(single_party_match.group(1))
-            ambiguous = not self._is_usable_party_entity(target)
-            return {"targets": (target,), "ambiguous": ambiguous}
-        return None
+        return parse_party_verification_query_entities(lowered_query)
 
     def _compare_query_entities_against_extracted_parties(
         self,
@@ -2177,28 +2280,23 @@ class AnswerabilityAssessor:
         verification_targets: tuple[str, ...],
         extracted_parties: Sequence[str],
     ) -> dict[str, object]:
-        normalized_extracted = [
-            self._normalize_party_text(party)
-            for party in extracted_parties
-            if self._is_usable_party_entity(self._normalize_party_text(party))
-        ]
-        extracted_set = set(normalized_extracted)
-        if len(extracted_set) < 2:
+        comparison = compare_query_entities_against_extracted_parties(
+            verification_targets=verification_targets,
+            extracted_parties=extracted_parties,
+        )
+        if comparison["status"] == "incomplete_party_set":
             return {
                 "supported": False,
                 "signals": ["party_role_assignment_resolved"],
                 "missing": ["extracted_party_set_incomplete_or_ambiguous"],
             }
-
-        target_set = set(verification_targets)
-        if len(target_set) != len(verification_targets) or not target_set:
+        if comparison["status"] == "query_ambiguous":
             return {
                 "supported": False,
                 "signals": ["party_role_assignment_resolved"],
                 "missing": ["query_entity_set_incomplete_or_ambiguous"],
             }
-
-        if all(target in extracted_set for target in verification_targets):
+        if comparison["status"] == "matched":
             return {
                 "supported": True,
                 "signals": [
@@ -2216,73 +2314,127 @@ class AnswerabilityAssessor:
             "missing": ["requested_query_entity_set_not_supported_by_extracted_party_set"],
         }
 
-    def _resolve_party_roles_from_intro(self, substantive: Sequence[Mapping[str, Any]]) -> _PartyRoleAssignment | None:
+    def _resolve_party_roles_from_intro(
+        self, substantive: Sequence[Mapping[str, Any]]
+    ) -> tuple[_PartyRoleAssignment | None, dict[str, Any]]:
+        checked_parent_ids: list[str] = []
+        intro_signal_parent_ids: list[str] = []
+        checked_parent_previews: list[PartyRoleParentChunkDebugPreview] = []
         for item in substantive:
             text = str(item.get("text") or "").strip()
             if not text:
                 continue
-            assignment = self._extract_intro_assignment(text)
-            if assignment is not None:
-                return assignment
-        return None
+            parent_id = str(item.get("parent_chunk_id") or "").strip()
+            if parent_id:
+                checked_parent_ids.append(parent_id)
+            intro_pattern_detected = has_intro_role_signal(text)
+            if intro_pattern_detected:
+                if parent_id:
+                    intro_signal_parent_ids.append(parent_id)
+            parsed = extract_intro_party_role_assignment(text)
+            checked_parent_previews.append(
+                self._build_party_role_parent_preview(
+                    item=item,
+                    text=text,
+                    intro_pattern_detected=intro_pattern_detected,
+                    resolver_considered_usable_intro_text=parsed is not None,
+                )
+            )
+            if parsed is not None:
+                debug = PartyRoleResolutionDebug(
+                    party_role_resolution_checked_parent_count=len(checked_parent_ids),
+                    party_role_resolution_checked_parent_ids=checked_parent_ids,
+                    party_role_resolution_intro_pattern_parent_ids=intro_signal_parent_ids,
+                    party_role_resolution_debug_outcome="resolved",
+                    party_role_resolution_debug_reason="resolver_found_intro_role_assignment",
+                    checked_parent_previews=checked_parent_previews,
+                )
+                diagnostics = {
+                    "signals": [
+                        "party_role_resolution_invoked",
+                        f"party_role_resolution_checked_parent_chunks:{len(checked_parent_ids)}",
+                        f"party_role_resolution_checked_parent_ids:{','.join(checked_parent_ids) or 'none'}",
+                        f"party_role_resolution_intro_pattern_parent_ids:{','.join(intro_signal_parent_ids) or 'none'}",
+                        "party_role_resolution_outcome:resolved",
+                    ],
+                    "missing": [],
+                    "debug": debug,
+                }
+                return (
+                    _PartyRoleAssignment(
+                        parties=parsed.parties,
+                        employer=parsed.employer,
+                        employee=parsed.employee,
+                        company_side_party=parsed.company_side_party,
+                        individual_side_party=parsed.individual_side_party,
+                    ),
+                    diagnostics,
+                )
+        not_found_reason = (
+            "party_role_resolution_not_found_reason:intro_text_present_parser_miss"
+            if intro_signal_parent_ids
+            else "party_role_resolution_not_found_reason:intro_text_absent_from_runtime_context"
+        )
+        debug = PartyRoleResolutionDebug(
+            party_role_resolution_checked_parent_count=len(checked_parent_ids),
+            party_role_resolution_checked_parent_ids=checked_parent_ids,
+            party_role_resolution_intro_pattern_parent_ids=intro_signal_parent_ids,
+            party_role_resolution_debug_outcome="not_found",
+            party_role_resolution_debug_reason=not_found_reason,
+            checked_parent_previews=checked_parent_previews,
+        )
+        diagnostics = {
+            "signals": [
+                "party_role_resolution_invoked",
+                f"party_role_resolution_checked_parent_chunks:{len(checked_parent_ids)}",
+                f"party_role_resolution_checked_parent_ids:{','.join(checked_parent_ids) or 'none'}",
+                f"party_role_resolution_intro_pattern_parent_ids:{','.join(intro_signal_parent_ids) or 'none'}",
+                "party_role_resolution_outcome:not_found",
+            ],
+            "missing": [not_found_reason],
+            "debug": debug,
+        }
+        return None, diagnostics
+
+    def _build_party_role_parent_preview(
+        self,
+        *,
+        item: Mapping[str, Any],
+        text: str,
+        intro_pattern_detected: bool,
+        resolver_considered_usable_intro_text: bool,
+    ) -> PartyRoleParentChunkDebugPreview:
+        normalized = text.strip()
+        lowered = normalized.lower()
+        preview_start = normalized[:PARTY_ROLE_PREVIEW_START_CHARS]
+        preview_end = normalized[-PARTY_ROLE_PREVIEW_END_CHARS:] if normalized else ""
+        return PartyRoleParentChunkDebugPreview(
+            parent_chunk_id=(str(item.get("parent_chunk_id") or "").strip() or None),
+            heading=(str(item.get("heading") or "").strip() or None),
+            source_name=(str(item.get("source_name") or "").strip() or None),
+            document_id=(str(item.get("document_id") or "").strip() or None),
+            text_length_chars=len(normalized),
+            preview_start=preview_start,
+            preview_end=preview_end,
+            contains_between_keyword=bool(re.search(r"\bbetween\b", lowered)),
+            contains_and_keyword=bool(re.search(r"\band\b", lowered)),
+            contains_employer_label=bool(re.search(r"\bemployer\b", lowered)),
+            contains_employee_label=bool(re.search(r"\bemployee\b", lowered)),
+            contains_role_parenthetical=bool(re.search(r"\((?:[^)]*\b(?:employer|employee|company)\b[^)]*)\)", normalized, flags=re.IGNORECASE)),
+            intro_pattern_detected=intro_pattern_detected,
+            resolver_considered_usable_intro_text=resolver_considered_usable_intro_text,
+        )
 
     def _extract_intro_assignment(self, text: str) -> _PartyRoleAssignment | None:
-        lowered = text.lower()
-        has_intro_anchor = bool(
-            re.search(r"\b(this\s+.+?\s+agreement\s+is\s+made(?:\s+effective)?|by\s+and\s+between|between|parties\s+to\s+this\s+agreement\s+are)\b", lowered)
-        )
-        if not has_intro_anchor:
+        parsed = extract_intro_party_role_assignment(text)
+        if parsed is None:
             return None
-
-        employer_label = re.search(r"\bemployer\s*[:\-]\s*([^;\n.]+)", text, flags=re.IGNORECASE)
-        employee_label = re.search(r"\bemployee\s*[:\-]\s*([^;\n.]+)", text, flags=re.IGNORECASE)
-        employer = self._clean_party_name(employer_label.group(1)) if employer_label else None
-        employee = self._clean_party_name(employee_label.group(1)) if employee_label else None
-
-        between_match = re.search(r"\bbetween\s+(.+?)\s+and\s+(.+?)(?:[.;\n]|$)", text, flags=re.IGNORECASE)
-        parties_are_match = re.search(r"\bparties\s+to\s+this\s+agreement\s+are\s+(.+?)\s+and\s+(.+?)(?:[.;\n]|$)", text, flags=re.IGNORECASE)
-        role_source = between_match or parties_are_match
-        parties: list[str] = []
-        if role_source:
-            first = self._clean_party_name(role_source.group(1))
-            second = self._clean_party_name(role_source.group(2))
-            if first:
-                parties.append(first)
-            if second:
-                parties.append(second)
-
-            first_role = self._detect_inline_role(role_source.group(1))
-            second_role = self._detect_inline_role(role_source.group(2))
-            if first_role == "employer":
-                employer = employer or first
-            elif first_role == "employee":
-                employee = employee or first
-            if second_role == "employer":
-                employer = employer or second
-            elif second_role == "employee":
-                employee = employee or second
-
-        if len(parties) >= 2 and (employer is None or employee is None):
-            inferred_employer, inferred_employee = self._infer_employer_employee(parties[0], parties[1], lowered)
-            employer = employer or inferred_employer
-            employee = employee or inferred_employee
-
-        if employer and self._is_placeholder_party(employer):
-            employer = None
-        if employee and self._is_placeholder_party(employee):
-            employee = None
-        parties = [party for party in parties if not self._is_placeholder_party(party)]
-
-        if not parties and employer and employee:
-            parties = [employer, employee]
-
-        if len(parties) < 2:
-            return None
-
         return _PartyRoleAssignment(
-            parties=tuple(parties[:2]),
-            employer=employer,
-            employee=employee,
+            parties=parsed.parties,
+            employer=parsed.employer,
+            employee=parsed.employee,
+            company_side_party=parsed.company_side_party,
+            individual_side_party=parsed.individual_side_party,
         )
 
     def _detect_inline_role(self, value: str) -> str | None:
@@ -2740,6 +2892,7 @@ def assess_answerability(
         matched_headings=coverage.matched_headings,
         evidence_notes=evidence_notes,
         warnings=warnings,
+        party_role_resolution_debug=coverage.party_role_resolution_debug,
     )
     logger.info(
         "assess_answerability_combined coverage_status=%s sufficient_coverage=%s evidence_strength=%s final_support_level=%s sufficient_context=%s should_answer=%s insufficiency_reason=%s",

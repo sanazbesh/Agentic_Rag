@@ -12,9 +12,20 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, Protocol
 
+from agentic_rag.llm import PromptLLMClient, build_local_prompt_llm_from_env, local_llm_config_from_env
 from agentic_rag.tools.evidence_units import EvidenceUnit, build_evidence_units
+from agentic_rag.tools.party_role_resolution import (
+    compare_query_entities_against_extracted_parties,
+    extract_intro_party_role_assignment,
+    has_intro_role_signal,
+    is_usable_party_entity,
+    normalize_party_text,
+    parse_party_verification_query_entities,
+    pick_company_party,
+    pick_individual_party,
+)
 
 @dataclass(slots=True, frozen=True)
 class AnswerCitation:
@@ -41,6 +52,11 @@ class GenerateAnswerResult:
     citations: list[AnswerCitation]
     warnings: list[str]
 
+
+
+
+class AnswerDraftingLLM(Protocol):
+    def complete(self, prompt: str, *, system_prompt: str | None = None) -> str: ...
 
 @dataclass(slots=True)
 class _ChronologyEvent:
@@ -74,6 +90,8 @@ class LegalAnswerSynthesizer:
         "notwithstanding",
         "only if",
     )
+    llm_client: AnswerDraftingLLM | None = None
+    llm_provider_label: str = "deterministic"
 
     def generate(self, context: Sequence[object], query: str) -> GenerateAnswerResult:
         """Generate a grounded legal answer from retrieved context only."""
@@ -172,9 +190,24 @@ class LegalAnswerSynthesizer:
                 + ("\n".join(caveats) if caveats else "- None identified within the retrieved context.")
             )
 
+            llm_warning: str | None = None
+            drafted = self._draft_grounded_answer_with_llm(
+                query=normalized_query,
+                supporting_lines=supporting_lines,
+                caveats=caveats,
+                fallback_answer=answer_text,
+            )
+            if drafted is not None:
+                answer_text = drafted
+                llm_warning = f"answer_synthesis_path:llm:{self.llm_provider_label}"
+            elif self.llm_client is not None:
+                llm_warning = f"answer_synthesis_path:deterministic_fallback:{self.llm_provider_label}"
+
             if not citations:
                 grounded = False
 
+            if llm_warning is not None:
+                warnings.append(llm_warning)
             return GenerateAnswerResult(
                 answer_text=answer_text,
                 grounded=grounded,
@@ -185,6 +218,37 @@ class LegalAnswerSynthesizer:
         except Exception as exc:  # pragma: no cover - exercised in explicit fallback test
             return self._failure_response(str(exc))
 
+    def _draft_grounded_answer_with_llm(
+        self,
+        *,
+        query: str,
+        supporting_lines: Sequence[str],
+        caveats: Sequence[str],
+        fallback_answer: str,
+    ) -> str | None:
+        if self.llm_client is None or not supporting_lines:
+            return None
+        prompt = (
+            "Draft a concise legal answer using ONLY the provided evidence bullets. "
+            "Do not add new facts. Keep caveats explicit. Return plain text only.\n\n"
+            f"QUESTION:\n{query}\n\n"
+            "EVIDENCE BULLETS:\n"
+            + "\n".join(supporting_lines)
+            + "\n\nCAVEATS:\n"
+            + ("\n".join(caveats) if caveats else "- None")
+        )
+        try:
+            drafted = self.llm_client.complete(
+                prompt,
+                system_prompt="You are a grounded legal drafting assistant. Use evidence only.",
+            )
+            cleaned = str(drafted or "").strip()
+            if not cleaned:
+                return None
+            return cleaned
+        except Exception:
+            return None
+
     def _generate_party_role_answer(
         self,
         context: Sequence[dict[str, Any]],
@@ -194,7 +258,7 @@ class LegalAnswerSynthesizer:
         if not self._is_party_role_question(lowered_query):
             return None
 
-        role_assignment = self._resolve_party_roles_from_intro(context)
+        role_assignment, resolution_warnings = self._resolve_party_roles_from_intro(context)
         if role_assignment is None:
             return GenerateAnswerResult(
                 answer_text=(
@@ -208,7 +272,7 @@ class LegalAnswerSynthesizer:
                 grounded=False,
                 sufficient_context=False,
                 citations=[],
-                warnings=["party_role_assignment_unresolved"],
+                warnings=["party_role_assignment_unresolved", *resolution_warnings],
             )
 
         citation = AnswerCitation(
@@ -227,6 +291,7 @@ class LegalAnswerSynthesizer:
                 direct=f"The employer is {role_assignment.employer}.",
                 citation=citation,
                 source_line=source_line,
+                warnings=resolution_warnings,
             )
 
         if "who is the employee" in lowered_query:
@@ -236,25 +301,38 @@ class LegalAnswerSynthesizer:
                 direct=f"The employee is {role_assignment.employee}.",
                 citation=citation,
                 source_line=source_line,
+                warnings=resolution_warnings,
             )
 
-        if "who are the parties" in lowered_query:
+        if self._is_party_set_query(lowered_query):
             if len(role_assignment.parties) < 2:
                 return self._insufficient_party_role_with_citation(citation, source_line)
             return self._party_role_success(
                 direct=f"The parties are {role_assignment.parties[0]} and {role_assignment.parties[1]}.",
                 citation=citation,
                 source_line=source_line,
+                warnings=resolution_warnings,
             )
 
-        if "which company is this agreement for" in lowered_query:
-            company = role_assignment.employer or self._pick_company_party(role_assignment.parties)
+        if self._is_company_side_query(lowered_query):
+            company = role_assignment.company_side_party or role_assignment.employer or self._pick_company_party(role_assignment.parties)
             if not company:
                 return self._insufficient_party_role_with_citation(citation, source_line)
             return self._party_role_success(
                 direct=f"The agreement appears to be for {company}.",
                 citation=citation,
                 source_line=source_line,
+                warnings=resolution_warnings,
+            )
+        if self._is_individual_side_query(lowered_query):
+            individual = role_assignment.individual_side_party or role_assignment.employee or pick_individual_party(role_assignment.parties)
+            if not individual:
+                return self._insufficient_party_role_with_citation(citation, source_line)
+            return self._party_role_success(
+                direct=f"The individual-side party is {individual}.",
+                citation=citation,
+                source_line=source_line,
+                warnings=resolution_warnings,
             )
 
         parsed_verification = self._parse_party_verification_query_entities(lowered_query)
@@ -272,7 +350,13 @@ class LegalAnswerSynthesizer:
                 if comparison["status"] == "matched"
                 else "No, the agreement-introduction evidence does not identify that queried party set."
             )
-            return self._party_role_success(direct=direct, citation=citation, source_line=source_line)
+            return self._party_role_success(
+                direct=direct,
+                citation=citation,
+                source_line=source_line,
+                warnings=resolution_warnings,
+            )
+
 
         return None
 
@@ -320,6 +404,7 @@ class LegalAnswerSynthesizer:
         direct: str,
         citation: AnswerCitation,
         source_line: str,
+        warnings: Sequence[str] | None = None,
     ) -> GenerateAnswerResult:
         return GenerateAnswerResult(
             answer_text=(
@@ -332,7 +417,7 @@ class LegalAnswerSynthesizer:
             grounded=True,
             sufficient_context=True,
             citations=[citation],
-            warnings=[],
+            warnings=list(warnings or []),
         )
 
     def _insufficient_party_role_with_citation(
@@ -359,12 +444,40 @@ class LegalAnswerSynthesizer:
             r"\bwho\s+is\s+the\s+employer\b",
             r"\bwho\s+is\s+the\s+employee\b",
             r"\bwho\s+are\s+the\s+parties\b",
+            r"\bidentify\s+(?:the\s+)?parties\b",
             r"\bwhich\s+company\s+is\s+this\s+agreement\s+for\b",
+            r"\bwho\s+is\s+the\s+hiring\s+company\b",
+            r"\bwhich\s+party\s+is\s+the\s+company\s+side\b",
+            r"\bwhich\s+party\s+is\s+the\s+individual\s+side\b",
             r"\bis\s+this\s+agreement\s+between\b",
             r"\bis\s+(?:this|the)\s+agreement\s+with\b",
             r"\bis\s+(?:this|the)\s+agreement\s+for\b",
         )
         return any(re.search(pattern, lowered_query) for pattern in patterns)
+
+    def _is_party_set_query(self, lowered_query: str) -> bool:
+        patterns = (
+            r"\bwho\s+are\s+the\s+parties\b",
+            r"\bwho\s+are\s+the\s+parties\s+involved\b",
+            r"\bidentify\s+(?:the\s+)?parties\b",
+            r"\bidentify\s+the\s+parties\s+involved\b",
+            r"\bname\s+(?:the\s+)?parties\b",
+            r"\blist\s+(?:the\s+)?parties\b",
+        )
+        return any(re.search(pattern, lowered_query) for pattern in patterns)
+
+    def _is_company_side_query(self, lowered_query: str) -> bool:
+        return any(
+            re.search(pattern, lowered_query)
+            for pattern in (
+                r"\bwhich\s+company\s+is\s+this\s+agreement\s+for\b",
+                r"\bwho\s+is\s+the\s+hiring\s+company\b",
+                r"\bwhich\s+party\s+is\s+the\s+company\s+side\b",
+            )
+        )
+
+    def _is_individual_side_query(self, lowered_query: str) -> bool:
+        return bool(re.search(r"\bwhich\s+party\s+is\s+the\s+individual\s+side\b", lowered_query))
 
     def _extract_party_verification_targets(self, lowered_query: str) -> tuple[str, ...] | None:
         parsed = self._parse_party_verification_query_entities(lowered_query)
@@ -373,22 +486,7 @@ class LegalAnswerSynthesizer:
         return parsed["targets"]
 
     def _parse_party_verification_query_entities(self, lowered_query: str) -> dict[str, Any] | None:
-        between_match = re.search(r"\bis\s+(?:this|the)\s+agreement\s+between\s+(.+?)\s+and\s+(.+?)\??$", lowered_query)
-        if between_match:
-            first = self._normalize_party_text(between_match.group(1))
-            second = self._normalize_party_text(between_match.group(2))
-            ambiguous = (
-                not self._is_usable_party_entity(first)
-                or not self._is_usable_party_entity(second)
-                or first == second
-            )
-            return {"targets": (first, second), "ambiguous": ambiguous}
-
-        single_party_match = re.search(r"\bis\s+(?:this|the)\s+agreement\s+(?:with|for)\s+(.+?)\??$", lowered_query)
-        if single_party_match:
-            target = self._normalize_party_text(single_party_match.group(1))
-            return {"targets": (target,), "ambiguous": not self._is_usable_party_entity(target)}
-        return None
+        return parse_party_verification_query_entities(lowered_query)
 
     def _compare_query_entities_against_extracted_parties(
         self,
@@ -396,22 +494,10 @@ class LegalAnswerSynthesizer:
         verification_targets: tuple[str, ...],
         extracted_parties: Sequence[str],
     ) -> dict[str, str]:
-        normalized_extracted = [
-            self._normalize_party_text(party)
-            for party in extracted_parties
-            if self._is_usable_party_entity(self._normalize_party_text(party))
-        ]
-        extracted_set = set(normalized_extracted)
-        if len(extracted_set) < 2:
-            return {"status": "incomplete_party_set"}
-
-        target_set = set(verification_targets)
-        if len(target_set) != len(verification_targets) or not target_set:
-            return {"status": "query_ambiguous"}
-
-        if all(target in extracted_set for target in verification_targets):
-            return {"status": "matched"}
-        return {"status": "mismatched"}
+        return compare_query_entities_against_extracted_parties(
+            verification_targets=verification_targets,
+            extracted_parties=extracted_parties,
+        )
 
     def _metadata_target(self, lowered_query: str) -> str | None:
         patterns: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -1319,12 +1405,35 @@ class LegalAnswerSynthesizer:
                 values.append(parsed)
         return values
 
-    def _resolve_party_roles_from_intro(self, context: Sequence[dict[str, Any]]) -> "_PartyRoleAssignment | None":
+    def _resolve_party_roles_from_intro(
+        self, context: Sequence[dict[str, Any]]
+    ) -> tuple["_PartyRoleAssignment | None", list[str]]:
+        checked_parent_ids: list[str] = []
+        intro_parent_ids: list[str] = []
         for item in context:
             text = str(item.get("text") or "").strip()
             if not text:
                 continue
-            assignment = self._extract_intro_assignment(text)
+            parent_id = str(item.get("parent_chunk_id") or "").strip()
+            if parent_id:
+                checked_parent_ids.append(parent_id)
+            if has_intro_role_signal(text) and parent_id:
+                intro_parent_ids.append(parent_id)
+            parsed = extract_intro_party_role_assignment(text)
+            if parsed is None:
+                continue
+            assignment = _PartyRoleAssignment(
+                parties=parsed.parties,
+                employer=parsed.employer,
+                employee=parsed.employee,
+                company_side_party=parsed.company_side_party,
+                individual_side_party=parsed.individual_side_party,
+                source_parent_chunk_id="",
+                document_id=None,
+                source_name=None,
+                heading=None,
+                supporting_excerpt="",
+            )
             if assignment is None:
                 continue
             assignment.source_parent_chunk_id = str(item.get("parent_chunk_id") or "")
@@ -1334,66 +1443,37 @@ class LegalAnswerSynthesizer:
             assignment.supporting_excerpt = self._best_excerpt(text, "parties employer employee agreement")
             if not assignment.supporting_excerpt:
                 assignment.supporting_excerpt = text
-            return assignment
-        return None
+            return assignment, [
+                "party_role_resolution_invoked",
+                f"party_role_resolution_checked_parent_chunks:{len(checked_parent_ids)}",
+                f"party_role_resolution_checked_parent_ids:{','.join(checked_parent_ids) or 'none'}",
+                f"party_role_resolution_intro_pattern_parent_ids:{','.join(intro_parent_ids) or 'none'}",
+                "party_role_resolution_outcome:resolved",
+            ]
+        reason = (
+            "party_role_resolution_not_found_reason:intro_text_present_parser_miss"
+            if intro_parent_ids
+            else "party_role_resolution_not_found_reason:intro_text_absent_from_runtime_context"
+        )
+        return None, [
+            "party_role_resolution_invoked",
+            f"party_role_resolution_checked_parent_chunks:{len(checked_parent_ids)}",
+            f"party_role_resolution_checked_parent_ids:{','.join(checked_parent_ids) or 'none'}",
+            f"party_role_resolution_intro_pattern_parent_ids:{','.join(intro_parent_ids) or 'none'}",
+            "party_role_resolution_outcome:not_found",
+            reason,
+        ]
 
     def _extract_intro_assignment(self, text: str) -> "_PartyRoleAssignment | None":
-        lowered = text.lower()
-        has_intro_anchor = bool(
-            re.search(r"\b(this\s+.+?\s+agreement\s+is\s+made(?:\s+effective)?|by\s+and\s+between|between|parties\s+to\s+this\s+agreement\s+are)\b", lowered)
-        )
-        if not has_intro_anchor:
+        parsed = extract_intro_party_role_assignment(text)
+        if parsed is None:
             return None
-
-        employer_label = re.search(r"\bemployer\s*[:\-]\s*([^;\n.]+)", text, flags=re.IGNORECASE)
-        employee_label = re.search(r"\bemployee\s*[:\-]\s*([^;\n.]+)", text, flags=re.IGNORECASE)
-        employer = self._clean_party_name(employer_label.group(1)) if employer_label else None
-        employee = self._clean_party_name(employee_label.group(1)) if employee_label else None
-
-        between_match = re.search(r"\bbetween\s+(.+?)\s+and\s+(.+?)(?:[.;\n]|$)", text, flags=re.IGNORECASE)
-        parties_are_match = re.search(r"\bparties\s+to\s+this\s+agreement\s+are\s+(.+?)\s+and\s+(.+?)(?:[.;\n]|$)", text, flags=re.IGNORECASE)
-        role_source = between_match or parties_are_match
-        parties: list[str] = []
-        if role_source:
-            first = self._clean_party_name(role_source.group(1))
-            second = self._clean_party_name(role_source.group(2))
-            if first:
-                parties.append(first)
-            if second:
-                parties.append(second)
-
-            first_role = self._detect_inline_role(role_source.group(1))
-            second_role = self._detect_inline_role(role_source.group(2))
-            if first_role == "employer":
-                employer = employer or first
-            elif first_role == "employee":
-                employee = employee or first
-            if second_role == "employer":
-                employer = employer or second
-            elif second_role == "employee":
-                employee = employee or second
-
-        if len(parties) >= 2 and (employer is None or employee is None):
-            inferred_employer, inferred_employee = self._infer_employer_employee(parties[0], parties[1], lowered)
-            employer = employer or inferred_employer
-            employee = employee or inferred_employee
-
-        if employer and self._is_placeholder_party(employer):
-            employer = None
-        if employee and self._is_placeholder_party(employee):
-            employee = None
-        parties = [party for party in parties if not self._is_placeholder_party(party)]
-
-        if not parties and employer and employee:
-            parties = [employer, employee]
-
-        if len(parties) < 2:
-            return None
-
         return _PartyRoleAssignment(
-            parties=tuple(parties[:2]),
-            employer=employer,
-            employee=employee,
+            parties=parsed.parties,
+            employer=parsed.employer,
+            employee=parsed.employee,
+            company_side_party=parsed.company_side_party,
+            individual_side_party=parsed.individual_side_party,
             source_parent_chunk_id="",
             document_id=None,
             source_name=None,
@@ -1421,46 +1501,22 @@ class LegalAnswerSynthesizer:
         return second, first
 
     def _pick_company_party(self, parties: Sequence[str]) -> str | None:
-        for party in parties:
-            if self._looks_like_organization(party):
-                return party
-        return None
+        return pick_company_party(parties)
 
     def _looks_like_organization(self, value: str) -> bool:
-        lowered = value.lower()
-        org_markers = ("inc", "llc", "ltd", "limited", "corp", "corporation", "company", "co.", "plc")
-        return any(marker in lowered for marker in org_markers)
+        return bool(pick_company_party([value]))
 
     def _clean_party_name(self, value: str) -> str:
-        cleaned = re.sub(r"\((?:the\s+)?[\"“']?(?:employer|employee|company)[\"”']?\)", "", value, flags=re.IGNORECASE)
-        cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,;.")
-        return cleaned
+        return value.strip()
 
     def _is_placeholder_party(self, value: str) -> bool:
-        normalized = self._normalize_party_text(value)
-        placeholders = {
-            "company",
-            "employee",
-            "employer",
-            "party a",
-            "party b",
-            "first party",
-            "second party",
-        }
-        return normalized in placeholders
+        return not is_usable_party_entity(value)
 
     def _normalize_party_text(self, value: str) -> str:
-        normalized = re.sub(r"[^a-z0-9\s]", " ", (value or "").lower())
-        normalized = re.sub(r"\b(the|this|that|an|a)\b", " ", normalized)
-        return re.sub(r"\s+", " ", normalized).strip()
+        return normalize_party_text(value)
 
     def _is_usable_party_entity(self, value: str) -> bool:
-        normalized = self._normalize_party_text(value)
-        if not normalized:
-            return False
-        if self._is_placeholder_party(normalized):
-            return False
-        return len(normalized) >= 2
+        return is_usable_party_entity(value)
 
     def _rank_relevant_chunks(self, context: Sequence[dict[str, Any]], query: str) -> list[dict[str, Any]]:
         query_terms = _query_terms(query)
@@ -1563,14 +1619,20 @@ class LegalAnswerSynthesizer:
         )
 
 
-_DEFAULT_ANSWER_SYNTHESIZER = LegalAnswerSynthesizer()
+_LOCAL_LLM = local_llm_config_from_env()
+_DEFAULT_ANSWER_SYNTHESIZER = LegalAnswerSynthesizer(
+    llm_client=build_local_prompt_llm_from_env(),
+    llm_provider_label=f"{_LOCAL_LLM.provider}:{_LOCAL_LLM.model_path or 'unset_model_path'}",
+)
 
 
 @dataclass(slots=True)
 class _PartyRoleAssignment:
-    parties: tuple[str, str]
+    parties: tuple[str, ...]
     employer: str | None
     employee: str | None
+    company_side_party: str | None
+    individual_side_party: str | None
     source_parent_chunk_id: str
     document_id: str | None
     source_name: str | None

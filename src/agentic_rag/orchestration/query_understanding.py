@@ -183,7 +183,7 @@ def _is_party_role_entity_query(normalized_query: str) -> bool:
 
     role_markers = ("employer", "employee", "parties", "party", "company", "entity")
     if any(marker in lowered for marker in role_markers):
-        role_intents = ("who is", "who are", "which", "what", "is this agreement", "agreement for")
+        role_intents = ("who is", "who are", "which", "what", "identify", "name", "list", "is this agreement", "agreement for")
         if any(intent in lowered for intent in role_intents):
             return True
 

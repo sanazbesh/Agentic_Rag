@@ -9,10 +9,12 @@ from typing import Any
 import streamlit as st
 
 from ui.backend_adapter import BackendAdapterError, get_available_documents, parse_recent_messages
+from ui.local_backend import effective_local_llm_settings
 from ui.upload_manager import ALLOWED_EXTENSIONS, remove_uploaded_document, save_uploaded_files
 
 DEBUG_SECTIONS = [
     ("adapter_meta", "Adapter Meta"),
+    ("local_llm_runtime", "Local LLM Runtime"),
     ("query_classification", "Query Classification"),
     ("context_resolution", "Conversation Resolution"),
     ("decomposition", "Decomposition Gate"),
@@ -67,6 +69,18 @@ def initialize_session_state() -> None:
         "latest_result": None,
         "latest_debug_payload": None,
         "last_run": None,
+        "local_llm_enabled": False,
+        "local_llm_provider": "llama_cpp",
+        "local_llm_model_path": "",
+        "local_llm_n_ctx": 4096,
+        "local_llm_temperature": 0.0,
+        "local_llm_timeout_seconds": 8.0,
+        "local_llm_max_tokens": 512,
+        "local_llm_n_gpu_layers": 0,
+        "local_llm_threads": 0,
+        "local_llm_stage_rewrite": True,
+        "local_llm_stage_decomposition": True,
+        "local_llm_stage_synthesis": True,
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -159,6 +173,117 @@ def render_sidebar(
 
     st.session_state.use_mock_backend = use_mock_backend
 
+    st.sidebar.subheader("Local LLM Controls")
+    llm_controls_disabled = use_mock_backend
+    if llm_controls_disabled:
+        st.sidebar.caption("Mock backend is active; local LLM settings are ignored for this run.")
+
+    enable_local_llm = st.sidebar.toggle(
+        "Enable local LLM",
+        value=st.session_state.local_llm_enabled,
+        disabled=llm_controls_disabled,
+    )
+    st.session_state.local_llm_enabled = enable_local_llm
+
+    st.sidebar.text_input("Provider", value="llama.cpp (llama-cpp-python)", disabled=True)
+    local_llm_model_path = st.sidebar.text_input(
+        "GGUF model path",
+        value=st.session_state.local_llm_model_path,
+        disabled=llm_controls_disabled,
+    )
+    st.session_state.local_llm_model_path = local_llm_model_path
+
+    with st.sidebar.expander("Advanced local LLM settings", expanded=False):
+        local_llm_n_ctx = st.number_input(
+            "Context window (n_ctx)",
+            min_value=128,
+            max_value=32768,
+            value=int(st.session_state.local_llm_n_ctx),
+            step=128,
+            disabled=llm_controls_disabled,
+        )
+        local_llm_temperature = st.number_input(
+            "Temperature",
+            min_value=0.0,
+            max_value=2.0,
+            value=float(st.session_state.local_llm_temperature),
+            step=0.1,
+            disabled=llm_controls_disabled,
+        )
+        local_llm_timeout_seconds = st.number_input(
+            "Timeout (seconds)",
+            min_value=0.5,
+            max_value=120.0,
+            value=float(st.session_state.local_llm_timeout_seconds),
+            step=0.5,
+            disabled=llm_controls_disabled,
+        )
+        local_llm_max_tokens = st.number_input(
+            "Max tokens",
+            min_value=32,
+            max_value=4096,
+            value=int(st.session_state.local_llm_max_tokens),
+            step=32,
+            disabled=llm_controls_disabled,
+        )
+        local_llm_n_gpu_layers = st.number_input(
+            "n_gpu_layers",
+            min_value=0,
+            max_value=200,
+            value=int(st.session_state.local_llm_n_gpu_layers),
+            step=1,
+            disabled=llm_controls_disabled,
+        )
+        local_llm_threads = st.number_input(
+            "Threads (0 = auto)",
+            min_value=0,
+            max_value=128,
+            value=int(st.session_state.local_llm_threads),
+            step=1,
+            disabled=llm_controls_disabled,
+        )
+        use_llm_rewrite = st.toggle(
+            "Use local LLM for rewrite",
+            value=st.session_state.local_llm_stage_rewrite,
+            disabled=llm_controls_disabled,
+        )
+        use_llm_decomposition = st.toggle(
+            "Use local LLM for decomposition",
+            value=st.session_state.local_llm_stage_decomposition,
+            disabled=llm_controls_disabled,
+        )
+        use_llm_synthesis = st.toggle(
+            "Use local LLM for final synthesis",
+            value=st.session_state.local_llm_stage_synthesis,
+            disabled=llm_controls_disabled,
+        )
+    st.session_state.local_llm_temperature = float(local_llm_temperature)
+    st.session_state.local_llm_timeout_seconds = float(local_llm_timeout_seconds)
+    st.session_state.local_llm_n_ctx = int(local_llm_n_ctx)
+    st.session_state.local_llm_max_tokens = int(local_llm_max_tokens)
+    st.session_state.local_llm_n_gpu_layers = int(local_llm_n_gpu_layers)
+    st.session_state.local_llm_threads = int(local_llm_threads)
+    st.session_state.local_llm_stage_rewrite = use_llm_rewrite
+    st.session_state.local_llm_stage_decomposition = use_llm_decomposition
+    st.session_state.local_llm_stage_synthesis = use_llm_synthesis
+
+    local_llm_settings = effective_local_llm_settings(
+        enable_local_llm=enable_local_llm,
+        provider="llama_cpp",
+        model_path=local_llm_model_path,
+        temperature=float(local_llm_temperature),
+        timeout_seconds=float(local_llm_timeout_seconds),
+        n_ctx=int(local_llm_n_ctx),
+        max_tokens=int(local_llm_max_tokens),
+        n_gpu_layers=int(local_llm_n_gpu_layers),
+        threads=None if int(local_llm_threads) <= 0 else int(local_llm_threads),
+        use_rewrite=use_llm_rewrite,
+        use_decomposition=use_llm_decomposition,
+        use_synthesis=use_llm_synthesis,
+        mock_backend_active=use_mock_backend,
+    )
+    st.session_state.local_llm_effective_settings = local_llm_settings
+
     _render_upload_controls()
 
     available_documents = get_available_documents(
@@ -220,7 +345,26 @@ def render_sidebar(
         "use_mock_backend": use_mock_backend,
         "selected_documents": selected_documents,
         "show_debug": show_debug,
+        "local_llm_settings": local_llm_settings,
     }
+
+
+def render_runtime_mode_status(*, use_mock_backend: bool, debug_payload: dict[str, Any] | None) -> None:
+    payload = debug_payload or {}
+    llm_runtime = payload.get("local_llm_runtime") if isinstance(payload, dict) else None
+    if use_mock_backend:
+        st.info("Runtime mode: Mock backend active — local LLM ignored.")
+        return
+    if not isinstance(llm_runtime, dict):
+        st.caption("Runtime mode: Deterministic mode.")
+        return
+    mode = str(llm_runtime.get("effective_mode") or "deterministic").strip().lower()
+    stages = [stage for stage in list(llm_runtime.get("stages_using_local_llm", [])) if isinstance(stage, str)]
+    if mode == "llama_cpp_assisted":
+        stage_label = ", ".join(stages) if stages else "(none)"
+        st.success(f"Runtime mode: llama.cpp-assisted mode. Stages using llama.cpp: {stage_label}.")
+    else:
+        st.caption("Runtime mode: Deterministic mode.")
 
 
 def render_query_input() -> dict[str, Any]:

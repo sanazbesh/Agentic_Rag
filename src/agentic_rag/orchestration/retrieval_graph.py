@@ -7,6 +7,7 @@ traceable, testable, and bounded.
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Callable, Mapping, Sequence
 import re
@@ -20,8 +21,10 @@ except Exception:  # pragma: no cover - fallback for constrained envs
 
 from agentic_rag.orchestration.decomposition_gate import decide_decomposition_need
 from agentic_rag.orchestration.query_understanding import QueryUnderstandingResult, understand_query
+from agentic_rag.orchestration.tracing import begin_span, end_span
 from agentic_rag.retrieval.parent_child import HybridSearchResult, ParentChunkResult, RerankedChunkResult
 from agentic_rag.tools.context_processing import CompressContextResult, CompressedParentChunk
+from agentic_rag.llm import build_local_prompt_llm_from_env, local_llm_config_from_env
 from agentic_rag.tools.query_intelligence import LegalEntityExtractionResult, QueryRewriteResult
 
 logger = logging.getLogger(__name__)
@@ -151,6 +154,8 @@ class RetrievalStageState(TypedDict):
     use_conversation_context: bool
 
     rewritten_query: str | None
+    rewrite_notes: str | None
+    rewrite_call_outcome: dict[str, Any] | None
     resolved_query: str
     effective_query: str
     query_classification: QueryRoutingDecision | None
@@ -186,6 +191,7 @@ class RetrievalStageState(TypedDict):
     prior_effective_query: str | None
     prior_final_answer: str | None
     prior_citations: list[Mapping[str, Any]]
+    trace: dict[str, Any] | None
 
 
 class QueryClassifier(Protocol):
@@ -223,6 +229,7 @@ class RetrievalDependencies:
     retrieve_parent_chunks: Callable[[Sequence[str]], list[ParentChunkResult]]
     compress_context: Callable[[Sequence[ParentChunkResult]], CompressContextResult]
     classify_query_state: QueryClassifier = field(default_factory=lambda: heuristic_query_classifier)
+    plan_decomposition: Callable[..., DecompositionPlan | None] | None = None
 
 
 def default_retrieval_state(
@@ -244,6 +251,8 @@ def default_retrieval_state(
         selected_documents=list(selected_documents or []),
         use_conversation_context=False,
         rewritten_query=None,
+        rewrite_notes=None,
+        rewrite_call_outcome=None,
         resolved_query=normalized_query,
         effective_query=normalized_query,
         query_classification=None,
@@ -275,6 +284,7 @@ def default_retrieval_state(
         prior_effective_query=None,
         prior_final_answer=None,
         prior_citations=[],
+        trace=None,
     )
 
 
@@ -312,6 +322,28 @@ def _build_merged_candidate(
         ),
         contributing_hits=[hit],
     )
+
+
+def _extract_family_from_routing_notes(notes: Sequence[str]) -> str | None:
+    for note in notes:
+        if isinstance(note, str) and note.startswith("legal_question_family:"):
+            family = note.split(":", 1)[1].strip()
+            if family:
+                return family
+    return None
+
+
+def _is_party_role_entity_family(decision: QueryRoutingDecision | None) -> bool:
+    if not isinstance(decision, QueryRoutingDecision):
+        return False
+    family = _extract_family_from_routing_notes(decision.routing_notes)
+    return family == "party_role_entity"
+
+
+def _build_party_role_intro_retrieval_query(effective_query: str) -> str:
+    base = " ".join((effective_query or "").split())
+    suffix = "agreement preamble intro between and employer employee parties definitions"
+    return f"{base} {suffix}".strip()
 
 
 def _merge_two_candidates(
@@ -676,6 +708,40 @@ def _extract_root_entities(root_question: str) -> list[str]:
     return [entity for entity in entities if entity]
 
 
+
+def _copy_plan_with_notes(plan: DecompositionPlan, note: str) -> DecompositionPlan:
+    payload = plan.model_dump() if hasattr(plan, "model_dump") else {
+        "should_decompose": plan.should_decompose,
+        "root_question": plan.root_question,
+        "strategy": plan.strategy,
+        "subqueries": list(plan.subqueries),
+        "planner_notes": list(plan.planner_notes),
+    }
+    payload["planner_notes"] = [*list(plan.planner_notes), note]
+    return DecompositionPlan(**payload)
+
+
+def _extract_llm_path_metadata(notes: Sequence[str]) -> dict[str, str] | None:
+    """Parse `*_path:*` notes to normalized stage metadata."""
+
+    for note in notes:
+        text = str(note or "").strip()
+        if not text:
+            continue
+        for prefix in ("planner_path:llm:", "planner_path:deterministic_fallback:", "resolved_reference_with_llm:", "llm_failure_fallback_original_query:"):
+            if not text.startswith(prefix):
+                continue
+            remainder = text[len(prefix) :]
+            provider, _, model = remainder.partition(":")
+            if not provider:
+                return None
+            path = "llm" if ":llm:" in prefix else "deterministic_fallback"
+            metadata = {"path": path, "provider": provider}
+            if model:
+                metadata["model"] = model
+            return metadata
+    return None
+
 def validate_decomposition_plan(plan: DecompositionPlan) -> list[str]:
     """Deterministic conservative checks to keep broken plans out of retrieval."""
 
@@ -725,6 +791,77 @@ def validate_decomposition_plan(plan: DecompositionPlan) -> list[str]:
 
     return errors
 
+
+
+
+def llm_assisted_decomposition_plan(
+    *,
+    query: str,
+    needs_decomposition: bool,
+    reasons: Sequence[str],
+    query_classification: QueryRoutingDecision | None,
+    context_resolution: QueryContextResolution | None,
+) -> DecompositionPlan | None:
+    """Attempt local-LLM decomposition planning with deterministic fallback."""
+
+    deterministic = build_decomposition_plan(
+        query=query,
+        needs_decomposition=needs_decomposition,
+        reasons=reasons,
+        query_classification=query_classification,
+        context_resolution=context_resolution,
+    )
+    if deterministic is None:
+        return None
+
+    config = local_llm_config_from_env()
+    client = build_local_prompt_llm_from_env()
+    provider_model = f"{config.provider}:{config.model_path or 'unset_model_path'}"
+    if client is None:
+        return _copy_plan_with_notes(deterministic, f"planner_path:deterministic_fallback:{provider_model}")
+
+    prompt = (
+        "Plan legal retrieval subqueries for the provided root question. "
+        "Return strict JSON only: {\"strategy\":\"...\",\"subqueries\":[{\"id\":\"sq-1\",\"question\":\"...\",\"purpose\":\"...\",\"required\":true,\"expected_answer_type\":\"cross_reference\",\"dependency_ids\":[]}]}\n"
+        "Keep at most 4 subqueries, preserve scope and negation, and avoid broad/vague phrasing.\n\n"
+        f"QUERY: {query}\n"
+        f"REASONS: {','.join(reasons)}\n"
+    )
+    try:
+        raw = client.complete(prompt)
+        payload = json.loads(raw)
+        raw_subqueries = payload.get("subqueries")
+        if not isinstance(raw_subqueries, list):
+            return _copy_plan_with_notes(_copy_plan_with_notes(deterministic, f"planner_path:deterministic_fallback:{provider_model}"), "planner_llm_invalid_payload")
+        subqueries: list[SubQueryPlan] = []
+        for index, item in enumerate(raw_subqueries[:4], start=1):
+            if not isinstance(item, Mapping):
+                continue
+            subqueries.append(
+                SubQueryPlan(
+                    id=str(item.get("id") or f"sq-{index}"),
+                    question=str(item.get("question") or "").strip(),
+                    purpose=str(item.get("purpose") or "Retrieve evidence for this legal sub-question."),
+                    required=bool(item.get("required", True)),
+                    expected_answer_type=(item.get("expected_answer_type") if item.get("expected_answer_type") in {"definition","entity","date","obligation","exception","comparison","condition","cross_reference"} else "cross_reference"),
+                    dependency_ids=[str(dep) for dep in list(item.get("dependency_ids", [])) if str(dep).strip()],
+                )
+            )
+        if not subqueries:
+            return _copy_plan_with_notes(_copy_plan_with_notes(deterministic, f"planner_path:deterministic_fallback:{provider_model}"), "planner_llm_empty_subqueries")
+
+        strategy_value = str(payload.get("strategy") or deterministic.strategy or "conjunctive")
+        strategy = strategy_value if strategy_value in {"conjunctive","comparison","temporal","exception_chain","cross_clause","definition_plus_application","amendment_vs_base"} else (deterministic.strategy or "conjunctive")
+        llm_plan = DecompositionPlan(
+            should_decompose=True,
+            root_question=deterministic.root_question,
+            strategy=strategy,
+            subqueries=subqueries,
+            planner_notes=[*deterministic.planner_notes, f"planner_path:llm:{provider_model}"],
+        )
+        return llm_plan
+    except Exception:
+        return _copy_plan_with_notes(_copy_plan_with_notes(deterministic, f"planner_path:deterministic_fallback:{provider_model}"), "planner_llm_error_fallback")
 
 class RetrievalGraphNodes:
     """Explicit node implementations for a deterministic retrieval workflow graph."""
@@ -825,6 +962,14 @@ class RetrievalGraphNodes:
             len(selected_docs),
             selected_ids,
         )
+        trace = updated.get("trace")
+        if isinstance(trace, dict):
+            begin_span(
+                trace,
+                stage="query_understanding",
+                span_name="Query Understanding",
+                inputs_summary={"query": updated["original_query"]},
+            )
         decision = self.dependencies.classify_query_state(
             updated["original_query"],
             conversation_summary=updated["conversation_summary"],
@@ -845,6 +990,22 @@ class RetrievalGraphNodes:
             decision.question_type,
             decision.answerability_expectation,
         )
+        if isinstance(trace, dict):
+            end_span(
+                trace,
+                stage="query_understanding",
+                status="success",
+                outputs_summary={
+                    "normalized_query": decision.normalized_query,
+                    "question_type": decision.question_type,
+                    "answerability_expectation": decision.answerability_expectation,
+                    "legal_question_family": _extract_family_from_routing_notes(decision.routing_notes),
+                    "is_followup": decision.is_followup,
+                    "is_document_scoped": decision.is_document_scoped,
+                    "may_need_decomposition": decision.may_need_decomposition,
+                },
+                warnings=list(decision.warnings),
+            )
         return cast(RetrievalStageState, updated)
 
     def resolve_query_context(self, state: RetrievalStageState) -> RetrievalStageState:
@@ -894,6 +1055,8 @@ class RetrievalGraphNodes:
             re.search(r"\bis\s+(?:this|the)\s+agreement\s+between\b", lowered_query)
             or re.search(r"\bis\s+(?:this|the)\s+agreement\s+(?:with|for)\b", lowered_query)
         )
+        is_party_role_query = _is_party_role_entity_family(decision)
+        selected_scope_doc_id = selected_doc_ids[0] if len(selected_doc_ids) == 1 else None
 
         if decision.is_context_dependent:
             if decision.refers_to_prior_document_scope and len(candidate_doc_ids) > 1:
@@ -919,10 +1082,16 @@ class RetrievalGraphNodes:
             if used_context and topic_hints and query.lower().startswith("what about"):
                 resolved_query = f"{query} in relation to {topic_hints[0]}"
 
+        selected_scope_bound = False
+        if is_party_role_query and selected_scope_doc_id:
+            candidate_doc_ids = [selected_scope_doc_id]
+            selected_scope_bound = True
+            resolution_notes.append("resolved_document_scope_from_single_selected_document_for_party_role")
+
         resolution = QueryContextResolution(
             resolved_query=resolved_query,
             used_conversation_context=used_context,
-            resolved_document_ids=candidate_doc_ids if used_context else [],
+            resolved_document_ids=candidate_doc_ids if (used_context or selected_scope_bound) else [],
             resolved_topic_hints=topic_hints if used_context else [],
             resolution_notes=resolution_notes,
             unresolved_references=unresolved_references,
@@ -952,6 +1121,27 @@ class RetrievalGraphNodes:
         )
         updated["needs_decomposition"] = needs_decomposition
         updated["decomposition_gate_reasons"] = reasons
+        trace = updated.get("trace")
+        if isinstance(trace, dict):
+            begin_span(
+                trace,
+                stage="decomposition",
+                span_name="Decomposition",
+                inputs_summary={"resolved_query": str(updated.get("resolved_query") or updated.get("original_query") or "")},
+            )
+            if not needs_decomposition:
+                end_span(
+                    trace,
+                    stage="decomposition",
+                    status="success",
+                    outputs_summary={
+                        "needs_decomposition": False,
+                        "decomposition_gate_reasons": list(reasons),
+                        "subquery_count": 0,
+                        "validation_outcome": "not_applicable",
+                        "validation_errors": [],
+                    },
+                )
         logger.info(
             "node_exit name=classify_decomposition_need needs_decomposition=%s reasons=%s",
             needs_decomposition,
@@ -962,7 +1152,8 @@ class RetrievalGraphNodes:
     def maybe_build_decomposition_plan(self, state: RetrievalStageState) -> RetrievalStageState:
         logger.info("node_enter name=maybe_build_decomposition_plan")
         updated = dict(state)
-        plan = build_decomposition_plan(
+        planner = self.dependencies.plan_decomposition or build_decomposition_plan
+        plan = planner(
             query=str(updated.get("resolved_query") or updated.get("original_query") or ""),
             needs_decomposition=bool(updated.get("needs_decomposition")),
             reasons=list(updated.get("decomposition_gate_reasons") or []),
@@ -970,6 +1161,10 @@ class RetrievalGraphNodes:
             context_resolution=updated.get("context_resolution"),
         )
         updated["decomposition_plan"] = plan
+        if plan is not None:
+            llm_metadata = _extract_llm_path_metadata(plan.planner_notes)
+            if llm_metadata is not None:
+                updated["warnings"] = [*updated["warnings"], f"decomposition_path:{llm_metadata['path']}:{llm_metadata['provider']}:{llm_metadata.get('model', '')}".rstrip(":")]
         logger.info(
             "node_exit name=maybe_build_decomposition_plan plan_created=%s subquery_count=%s",
             plan is not None,
@@ -982,9 +1177,23 @@ class RetrievalGraphNodes:
 
         logger.info("node_enter name=validate_decomposition_plan")
         updated = dict(state)
+        trace = updated.get("trace")
         plan = updated.get("decomposition_plan")
         if plan is None:
             updated["decomposition_validation_errors"] = []
+            if isinstance(trace, dict):
+                end_span(
+                    trace,
+                    stage="decomposition",
+                    status="success",
+                    outputs_summary={
+                        "needs_decomposition": bool(updated.get("needs_decomposition", False)),
+                        "decomposition_gate_reasons": list(updated.get("decomposition_gate_reasons", [])),
+                        "subquery_count": 0,
+                        "validation_outcome": "not_applicable",
+                        "validation_errors": [],
+                    },
+                )
             logger.info("node_exit name=validate_decomposition_plan skipped=true")
             return cast(RetrievalStageState, updated)
 
@@ -992,12 +1201,43 @@ class RetrievalGraphNodes:
         updated["decomposition_validation_errors"] = list(errors)
         if errors:
             updated["decomposition_plan"] = None
+            if isinstance(trace, dict):
+                end_span(
+                    trace,
+                    stage="decomposition",
+                    status="partial",
+                    outputs_summary={
+                        "needs_decomposition": bool(updated.get("needs_decomposition", False)),
+                        "decomposition_gate_reasons": list(updated.get("decomposition_gate_reasons", [])),
+                        "subquery_count": len(plan.subqueries),
+                        "validation_outcome": "invalid",
+                        "validation_errors": list(errors),
+                    },
+                    warnings=["decomposition_validation_failed"],
+                )
             logger.info(
                 "node_exit name=validate_decomposition_plan valid=false error_count=%s",
                 len(errors),
             )
             return cast(RetrievalStageState, updated)
 
+        if isinstance(trace, dict):
+            llm_metadata = _extract_llm_path_metadata(plan.planner_notes)
+            end_span(
+                trace,
+                stage="decomposition",
+                status="success",
+                outputs_summary={
+                    "needs_decomposition": bool(updated.get("needs_decomposition", False)),
+                    "decomposition_gate_reasons": list(updated.get("decomposition_gate_reasons", [])),
+                    "subquery_count": len(plan.subqueries),
+                    "validation_outcome": "valid",
+                    "validation_errors": [],
+                    "planner_path": (llm_metadata or {}).get("path", "deterministic"),
+                    "llm_provider": (llm_metadata or {}).get("provider"),
+                    "llm_model": (llm_metadata or {}).get("model"),
+                },
+            )
         logger.info("node_exit name=validate_decomposition_plan valid=true")
         return cast(RetrievalStageState, updated)
 
@@ -1014,12 +1254,71 @@ class RetrievalGraphNodes:
             if updated["use_conversation_context"]:
                 kwargs["conversation_summary"] = updated["conversation_summary"]
                 kwargs["recent_messages"] = updated["recent_messages"]
+            kwargs["force_llm_rewrite_attempt"] = True
             result = self.dependencies.rewrite_query(original_query, **kwargs)
             updated["rewritten_query"] = result.rewritten_query
+            updated["rewrite_notes"] = result.rewrite_notes
+            updated["rewrite_call_outcome"] = dict(result.rewrite_call_outcome) if isinstance(result.rewrite_call_outcome, dict) else None
             updated["effective_query"] = result.rewritten_query or original_query
+            if isinstance(result.rewrite_notes, str) and result.rewrite_notes.startswith("resolved_reference_with_llm"):
+                updated["warnings"] = [*updated["warnings"], f"rewrite_path:llm:{result.rewrite_notes.split(':', 1)[1]}"]
+            if isinstance(result.rewrite_notes, str) and (
+                result.rewrite_notes.startswith("llm_failure_fallback")
+                or result.rewrite_notes.startswith("deterministic_fallback")
+            ):
+                updated["warnings"] = [*updated["warnings"], f"rewrite_path:deterministic_fallback:{result.rewrite_notes.split(':', 1)[1]}"]
+            if isinstance(result.rewrite_notes, str) and result.rewrite_notes.startswith("llm_failure_fallback_original_query:"):
+                reason_marker = "reason="
+                error_marker = ":error="
+                reason_idx = result.rewrite_notes.find(reason_marker)
+                if reason_idx != -1:
+                    reason_start = reason_idx + len(reason_marker)
+                    error_idx = result.rewrite_notes.find(error_marker, reason_start)
+                    reason = (
+                        result.rewrite_notes[reason_start:error_idx]
+                        if error_idx != -1
+                        else result.rewrite_notes[reason_start:]
+                    ).strip()
+                    if reason:
+                        updated["warnings"] = [*updated["warnings"], f"rewrite_failure_reason:{reason}"]
+                error_idx = result.rewrite_notes.find(error_marker)
+                if error_idx != -1:
+                    provider_error = result.rewrite_notes[error_idx + len(error_marker) :].strip()
+                    if provider_error:
+                        updated["warnings"] = [*updated["warnings"], f"rewrite_provider_error:{provider_error}"]
         except Exception as exc:  # pragma: no cover - defensive fallback
-            updated["warnings"] = [*updated["warnings"], f"rewrite_failed:{type(exc).__name__}"]
+            message = str(exc).lower()
+            if isinstance(exc, TimeoutError) or "timeout" in message or "timed out" in message:
+                failure_reason = "timeout"
+            elif isinstance(exc, RuntimeError):
+                failure_reason = "provider_runtime_error"
+            else:
+                failure_reason = "inference_failed"
+            provider_error = f"{type(exc).__name__}:{exc}"
+            updated["warnings"] = [
+                *updated["warnings"],
+                f"rewrite_failed:{type(exc).__name__}",
+                f"rewrite_path:deterministic_fallback:exception:{failure_reason}",
+                f"rewrite_failure_reason:{failure_reason}",
+                f"rewrite_provider_error:{provider_error}",
+            ]
             updated["rewritten_query"] = None
+            updated["rewrite_notes"] = (
+                "llm_failure_fallback_original_query:"
+                f"exception:reason={failure_reason}:error={provider_error}"
+            )
+            updated["rewrite_call_outcome"] = {
+                "provider_call_attempted": True,
+                "provider_call_succeeded": False,
+                "raw_response_present": False,
+                "raw_response_text_length": None,
+                "normalized_rewrite_present": False,
+                "normalized_rewrite_text_length": None,
+                "rewrite_result_type": "failed",
+                "rewrite_failure_stage": "provider_call",
+                "rewrite_fallback_reason": failure_reason,
+                "rewrite_provider_error": provider_error,
+            }
             updated["effective_query"] = original_query
         logger.info(
             "node_exit name=rewrite_query_if_needed rewritten=%s effective_query_length=%s",
@@ -1098,6 +1397,17 @@ class RetrievalGraphNodes:
     def run_hybrid_search(self, state: RetrievalStageState) -> RetrievalStageState:
         logger.info("node_enter name=run_hybrid_search")
         updated = dict(state)
+        trace = updated.get("trace")
+        if isinstance(trace, dict):
+            begin_span(
+                trace,
+                stage="retrieval",
+                span_name="Retrieval",
+                inputs_summary={
+                    "effective_query": updated.get("effective_query"),
+                    "filters": dict(updated.get("filters") or {}),
+                },
+            )
         try:
             results = self.dependencies.hybrid_search(
                 updated["effective_query"],
@@ -1114,6 +1424,23 @@ class RetrievalGraphNodes:
             updated["warnings"] = [*updated["warnings"], f"hybrid_search_failed:{type(exc).__name__}"]
             updated["child_results"] = []
             updated["root_merged_candidates"] = []
+        if isinstance(trace, dict):
+            retrieval_mode = "decomposed" if updated.get("decomposition_plan") is not None else "single_query"
+            top_ids = [item.child_chunk_id for item in updated["child_results"][:5] if item.child_chunk_id]
+            status: Literal["success", "partial"] = "partial" if "no_child_results" in updated["warnings"] else "success"
+            end_span(
+                trace,
+                stage="retrieval",
+                status=status,
+                outputs_summary={
+                    "effective_query": updated.get("effective_query"),
+                    "selected_document_scope": list(updated.get("last_resolved_document_scope", [])),
+                    "retrieval_mode": retrieval_mode,
+                    "retrieved_child_count": len(updated["child_results"]),
+                    "top_child_chunk_ids": top_ids,
+                },
+                warnings=[warning for warning in updated["warnings"] if warning in {"no_child_results"}],
+            )
         logger.info("node_exit name=run_hybrid_search child_count=%s", len(updated["child_results"]))
         return cast(RetrievalStageState, updated)
 
@@ -1202,9 +1529,31 @@ class RetrievalGraphNodes:
             rerank_input = list(updated["child_results"])
             rerank_query = str(updated.get("effective_query") or "")
 
+        trace = updated.get("trace")
+        if isinstance(trace, dict):
+            begin_span(
+                trace,
+                stage="rerank",
+                span_name="Rerank",
+                parent_stage="retrieval",
+                inputs_summary={"candidate_count": len(rerank_input), "query": rerank_query},
+            )
         if not rerank_input:
             updated["reranked_child_results"] = []
             updated["parent_expansion_child_results"] = []
+            if isinstance(trace, dict):
+                end_span(
+                    trace,
+                    stage="rerank",
+                    status="skipped",
+                    outputs_summary={
+                        "input_candidate_count": 0,
+                        "output_candidate_count": 0,
+                        "top_reranked_child_ids": [],
+                        "ranking_source": "not_applicable",
+                    },
+                    warnings=["rerank_skipped"],
+                )
             logger.info("node_exit name=rerank_results skipped=true")
             return cast(RetrievalStageState, updated)
         try:
@@ -1244,6 +1593,21 @@ class RetrievalGraphNodes:
             updated["parent_expansion_child_results"] = list(updated["reranked_child_results"])
         else:
             updated["parent_expansion_child_results"] = []
+        if isinstance(trace, dict):
+            end_span(
+                trace,
+                stage="rerank",
+                status="success",
+                outputs_summary={
+                    "input_candidate_count": len(rerank_input),
+                    "output_candidate_count": len(updated["reranked_child_results"]),
+                    "top_reranked_child_ids": [
+                        item.child_chunk_id for item in updated["reranked_child_results"][:5] if item.child_chunk_id
+                    ],
+                    "ranking_source": "global_merged_rerank" if use_global_merged_pool else "direct_rerank",
+                },
+                warnings=[warning for warning in updated["warnings"] if warning.startswith("rerank_")],
+            )
         logger.info(
             "node_exit name=rerank_results reranked_count=%s parent_expansion_source=%s",
             len(updated["reranked_child_results"]),
@@ -1254,6 +1618,7 @@ class RetrievalGraphNodes:
     def collect_parent_ids(self, state: RetrievalStageState) -> RetrievalStageState:
         logger.info("node_enter name=collect_parent_ids")
         updated = dict(state)
+        trace = updated.get("trace")
         has_valid_decomposition = updated.get("decomposition_plan") is not None
         has_merged_candidates = bool(updated.get("merged_candidates"))
         has_global_reranked_pool = bool(updated.get("parent_expansion_child_results"))
@@ -1264,6 +1629,14 @@ class RetrievalGraphNodes:
         else:
             parent_source = list(updated["reranked_child_results"])
             source_name = "reranked_child_results"
+        if isinstance(trace, dict):
+            begin_span(
+                trace,
+                stage="parent_expansion",
+                span_name="Parent Expansion",
+                parent_stage="retrieval",
+                inputs_summary={"source": source_name, "candidate_count": len(parent_source)},
+            )
 
         seen: set[str] = set()
         parent_ids: list[str] = []
@@ -1273,6 +1646,40 @@ class RetrievalGraphNodes:
                 continue
             seen.add(parent_id)
             parent_ids.append(parent_id)
+
+        decision = updated.get("query_classification")
+        if _is_party_role_entity_family(decision):
+            target_document_ids = {item.document_id for item in parent_source if item.document_id}
+            try:
+                supplemental_hits = self.dependencies.hybrid_search(
+                    _build_party_role_intro_retrieval_query(updated.get("effective_query", "")),
+                    filters=updated.get("filters"),
+                    top_k=max(4, min(8, self.config.hybrid_top_k)),
+                )
+            except Exception as exc:  # pragma: no cover
+                updated["warnings"] = [
+                    *updated["warnings"],
+                    f"party_role_intro_parent_augmentation_failed:{type(exc).__name__}",
+                ]
+                supplemental_hits = []
+
+            supplemental_added = 0
+            for hit in supplemental_hits:
+                parent_id = hit.parent_chunk_id
+                if not parent_id or parent_id in seen:
+                    continue
+                if target_document_ids and hit.document_id not in target_document_ids:
+                    continue
+                seen.add(parent_id)
+                parent_ids.append(parent_id)
+                supplemental_added += 1
+                if supplemental_added >= 2:
+                    break
+            if supplemental_added:
+                updated["warnings"] = [
+                    *updated["warnings"],
+                    f"party_role_intro_parent_augmented:{supplemental_added}",
+                ]
         updated["parent_ids"] = parent_ids
         logger.info("node_exit name=collect_parent_ids source=%s parent_count=%s", source_name, len(parent_ids))
         return cast(RetrievalStageState, updated)
@@ -1280,12 +1687,31 @@ class RetrievalGraphNodes:
     def fetch_parent_chunks(self, state: RetrievalStageState) -> RetrievalStageState:
         logger.info("node_enter name=fetch_parent_chunks parent_id_count=%s", len(state["parent_ids"]))
         updated = dict(state)
+        trace = updated.get("trace")
         try:
             parents = self.dependencies.retrieve_parent_chunks(updated["parent_ids"])
             updated["parent_chunks"] = list(parents)
         except Exception as exc:  # pragma: no cover
             updated["warnings"] = [*updated["warnings"], f"parent_retrieval_failed:{type(exc).__name__}"]
             updated["parent_chunks"] = []
+        if isinstance(trace, dict):
+            traceability = {
+                item.child_chunk_id: item.parent_chunk_id
+                for item in list(updated.get("parent_expansion_child_results", []))[:20]
+                if item.child_chunk_id and item.parent_chunk_id
+            }
+            end_span(
+                trace,
+                stage="parent_expansion",
+                status="success",
+                outputs_summary={
+                    "collected_parent_ids": list(updated.get("parent_ids", [])),
+                    "fetched_parent_count": len(updated["parent_chunks"]),
+                    "child_parent_traceability": traceability,
+                    "ordering_notes": [],
+                },
+                warnings=[warning for warning in updated["warnings"] if warning.startswith("parent_")],
+            )
         logger.info("node_exit name=fetch_parent_chunks parent_chunk_count=%s", len(updated["parent_chunks"]))
         return cast(RetrievalStageState, updated)
 
