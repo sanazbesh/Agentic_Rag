@@ -6,6 +6,8 @@ from typing import Any, Mapping
 
 from evals.runners import run_offline_eval as runner_module
 from evals.runners.run_offline_eval import run_offline_eval
+from ui.local_backend import build_local_backend_dependencies
+from evals.runners.offline_fixture_registry import known_offline_fixture_ids
 
 
 def _write_dataset(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -308,3 +310,50 @@ def test_cli_selected_documents_merges_ids_paths_and_existing_descriptors() -> N
         {"id": "doc-added", "path": "fixtures/added.md"},
         {"path": "fixtures/path_only.md"},
     ]
+
+
+def test_cli_selected_documents_resolves_known_offline_fixture_ids() -> None:
+    assert "doc-employment-master" in known_offline_fixture_ids()
+
+    selected = runner_module._resolve_cli_selected_documents(
+        {
+            "selected_document_ids": ["doc-employment-master", "doc-chronology"],
+        }
+    )
+
+    assert len(selected) == 2
+    assert selected[0]["id"] == "doc-employment-master"
+    assert selected[0]["source"] == "offline_fixture"
+    assert Path(selected[0]["path"]).is_file()
+    assert selected[1]["id"] == "doc-chronology"
+    assert Path(selected[1]["path"]).is_file()
+
+
+def test_cli_selected_documents_raises_clear_error_for_unknown_fixture_id() -> None:
+    try:
+        runner_module._resolve_cli_selected_documents({"selected_document_ids": ["doc-does-not-exist"]})
+    except ValueError as exc:
+        assert str(exc) == "offline_fixture_not_found:doc-does-not-exist"
+    else:
+        raise AssertionError("expected unknown fixture id to raise a clear error")
+
+
+def test_fixture_resolution_populates_local_backend_scope_and_retrieval() -> None:
+    selected = runner_module._resolve_cli_selected_documents(
+        {
+            "selected_document_ids": ["doc-employment-master"],
+        }
+    )
+
+    build = build_local_backend_dependencies(selected)
+
+    assert build.scope_meta["loaded_document_count"] > 0
+    assert build.scope_meta["parent_chunk_count"] > 0
+    assert build.scope_meta["child_chunk_count"] > 0
+
+    hits = build.dependencies.retrieval.hybrid_search(
+        "Who is the employer?",
+        filters={"selected_document_ids": ["doc-employment-master"]},
+        top_k=5,
+    )
+    assert hits
