@@ -23,6 +23,7 @@ def _ensure_src_path_for_local_runs() -> None:
 _ensure_src_path_for_local_runs()
 
 from ui.debug_payload import build_real_debug_payload
+from ui.local_backend import build_local_backend_dependencies
 from agentic_rag.versioning import get_version_attribution, normalize_model_version
 from evals.graders.answerability_checks import evaluate_answerability_checks
 from evals.graders.citation_checks import evaluate_citation_checks
@@ -245,6 +246,74 @@ def _build_default_case_executor(*, dependencies: LegalRagDependencies) -> CaseE
     return _execute
 
 
+def _resolve_recent_messages(eval_case: Mapping[str, Any]) -> list[Mapping[str, Any]] | None:
+    follow_up = eval_case.get("follow_up")
+    if not isinstance(follow_up, Mapping) or follow_up.get("depends_on_prior_turn") is not True:
+        return None
+    prior = follow_up.get("prior_messages")
+    if not isinstance(prior, list):
+        return None
+    return [item for item in prior if isinstance(item, Mapping)]
+
+
+def _resolve_cli_selected_documents(eval_case: Mapping[str, Any]) -> list[dict[str, Any]]:
+    selected_documents_raw = eval_case.get("selected_documents")
+    selected_documents: list[dict[str, Any]] = []
+    if isinstance(selected_documents_raw, list):
+        for item in selected_documents_raw:
+            if isinstance(item, Mapping):
+                selected_documents.append(dict(item))
+
+    selected_ids = [str(item) for item in list(eval_case.get("selected_document_ids") or []) if str(item).strip()]
+    selected_paths = [str(item) for item in list(eval_case.get("selected_document_paths") or []) if str(item).strip()]
+
+    existing_by_id = {str(doc.get("id")): doc for doc in selected_documents if doc.get("id")}
+    existing_paths = {str(doc.get("path")) for doc in selected_documents if doc.get("path")}
+
+    for index, selected_id in enumerate(selected_ids):
+        if selected_id in existing_by_id:
+            continue
+        descriptor: dict[str, Any] = {"id": selected_id}
+        if index < len(selected_paths):
+            descriptor["path"] = selected_paths[index]
+            existing_paths.add(selected_paths[index])
+        selected_documents.append(descriptor)
+
+    for selected_path in selected_paths:
+        if selected_path in existing_paths:
+            continue
+        selected_documents.append({"path": selected_path})
+
+    return selected_documents
+
+
+def _build_cli_case_executor() -> CaseExecutor:
+    if run_legal_rag_turn_with_state is None:
+        raise RuntimeError("run_legal_rag_turn_with_state is unavailable in this environment")
+
+    def _execute(eval_case: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        query = str(eval_case.get("query") or "")
+        selected_documents = _resolve_cli_selected_documents(eval_case)
+        recent_messages = _resolve_recent_messages(eval_case)
+
+        local_backend = build_local_backend_dependencies(selected_documents)
+        final_answer, state = run_legal_rag_turn_with_state(
+            query=query,
+            dependencies=local_backend.dependencies,
+            recent_messages=recent_messages,
+            selected_documents=selected_documents,
+        )
+        state_payload = dict(state)
+        debug_payload = build_real_debug_payload(
+            latest_state=state_payload,
+            selected_documents=selected_documents,
+            scope_meta=local_backend.scope_meta,
+        )
+        return final_answer.model_dump(), debug_payload, state_payload
+
+    return _execute
+
+
 def _run_deterministic_evaluators(
     *,
     eval_case: Mapping[str, Any],
@@ -415,6 +484,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         limit=args.limit,
         run_deterministic_evaluators=not args.skip_deterministic,
         run_model_graders=not args.skip_llm_graders,
+        case_executor=_build_cli_case_executor(),
     )
     return 0
 
