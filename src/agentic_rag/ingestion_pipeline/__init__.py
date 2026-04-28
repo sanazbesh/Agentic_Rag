@@ -7,6 +7,7 @@ from agentic_rag.ingestion_pipeline.document_registry import (
     compute_sha256_from_file_path,
 )
 from agentic_rag.ingestion_pipeline.orchestrator import IngestionOrchestrator, IngestionResult
+from agentic_rag.ingestion_pipeline.chunk_persistence import ChunkPersistenceService
 
 __all__ = [
     "DocumentRegistrationResult",
@@ -15,4 +16,5 @@ __all__ = [
     "compute_sha256_from_file_path",
     "IngestionOrchestrator",
     "IngestionResult",
+    "ChunkPersistenceService",
 ]
