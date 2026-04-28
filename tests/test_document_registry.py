@@ -61,7 +61,7 @@ def test_first_registration_creates_document_and_version(session: Session) -> No
     assert result.document.id
     assert result.version.id
     assert result.version.document_id == result.document.id
-    assert result.document.current_version_id == result.version.id
+    assert result.document.current_version_id is None
 
 
 def test_duplicate_content_does_not_create_duplicate_version(session: Session) -> None:
@@ -103,7 +103,43 @@ def test_changed_content_creates_new_version_and_updates_current_pointer(session
     assert second.created_document is False
     assert second.created_version is True
     assert second.version.id != first.version.id
-    assert second.document.current_version_id == second.version.id
+    assert second.document.current_version_id is None
+
+
+def test_version_helpers_support_ready_promotion_and_ordering(session: Session) -> None:
+    registry = DocumentRegistry(session)
+    first = registry.register_document(source_name="v.pdf", source_type="pdf", content_bytes=b"v1")
+    second = registry.register_document(source_name="v.pdf", source_type="pdf", content_bytes=b"v2")
+
+    registry.update_version_status(first.version.id, LifecycleStatus.READY)
+    registry.promote_ready_version(first.document.id, first.version.id)
+    registry.update_version_status(second.version.id, LifecycleStatus.PROCESSING)
+
+    current_ready = registry.get_current_ready_version(first.document.id)
+    latest = registry.get_latest_version(first.document.id)
+    versions = registry.list_versions_for_document(first.document.id)
+
+    assert current_ready is not None
+    assert current_ready.id == first.version.id
+    assert latest is not None
+    assert latest.id == second.version.id
+    assert [version.id for version in versions] == [second.version.id, first.version.id]
+
+
+def test_promote_ready_version_rejects_processing_and_failed(session: Session) -> None:
+    registry = DocumentRegistry(session)
+    registration = registry.register_document(
+        source_name="promote.pdf",
+        source_type="pdf",
+        content_bytes=b"promote",
+    )
+
+    with pytest.raises(ValueError, match="document_version_not_ready"):
+        registry.promote_ready_version(registration.document.id, registration.version.id)
+
+    registry.update_version_status(registration.version.id, LifecycleStatus.FAILED)
+    with pytest.raises(ValueError, match="document_version_not_ready"):
+        registry.promote_ready_version(registration.document.id, registration.version.id)
 
 
 def test_status_update_works_for_document_and_version(session: Session) -> None:

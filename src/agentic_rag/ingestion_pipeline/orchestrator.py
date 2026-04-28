@@ -102,8 +102,9 @@ class IngestionOrchestrator:
             )
             chunking_result = self._chunk_documents(parsed_documents)
 
-            self._registry.update_document_status(registration.document.id, LifecycleStatus.READY)
             self._registry.update_version_status(registration.version.id, LifecycleStatus.READY)
+            self._registry.promote_ready_version(registration.document.id, registration.version.id)
+            self._registry.update_document_status(registration.document.id, LifecycleStatus.READY)
             self._job_service.mark_ready(job)
             self._session.commit()
             return IngestionResult(
@@ -118,8 +119,10 @@ class IngestionOrchestrator:
                 chunking_result=chunking_result,
             )
         except Exception as exc:
-            self._registry.update_document_status(registration.document.id, LifecycleStatus.FAILED)
             self._registry.update_version_status(registration.version.id, LifecycleStatus.FAILED)
+            current_ready = self._registry.get_current_ready_version(registration.document.id)
+            next_document_status = LifecycleStatus.READY if current_ready is not None else LifecycleStatus.FAILED
+            self._registry.update_document_status(registration.document.id, next_document_status)
             self._job_service.mark_failed(job, error_message=str(exc))
             self._session.commit()
             return IngestionResult(
@@ -176,8 +179,9 @@ class IngestionOrchestrator:
                 storage_path=storage_path,
             )
             chunking_result = self._chunk_documents(parsed_documents)
-            self._registry.update_document_status(document.id, LifecycleStatus.READY)
             self._registry.update_version_status(version.id, LifecycleStatus.READY)
+            self._registry.promote_ready_version(document.id, version.id)
+            self._registry.update_document_status(document.id, LifecycleStatus.READY)
             self._job_service.mark_ready(job)
             self._session.commit()
             return IngestionResult(
@@ -192,8 +196,10 @@ class IngestionOrchestrator:
                 chunking_result=chunking_result,
             )
         except Exception as exc:
-            self._registry.update_document_status(document.id, LifecycleStatus.FAILED)
             self._registry.update_version_status(version.id, LifecycleStatus.FAILED)
+            current_ready = self._registry.get_current_ready_version(document.id)
+            next_document_status = LifecycleStatus.READY if current_ready is not None else LifecycleStatus.FAILED
+            self._registry.update_document_status(document.id, next_document_status)
             self._job_service.mark_failed(job, error_message=str(exc))
             self._session.commit()
             return IngestionResult(

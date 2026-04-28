@@ -84,9 +84,6 @@ class DocumentRegistry:
             content_hash=resolved_content_hash,
         )
         if existing_version is not None:
-            if document.current_version_id is None:
-                document.current_version_id = existing_version.id
-                self._session.flush()
             return DocumentRegistrationResult(
                 document=document,
                 version=existing_version,
@@ -105,9 +102,6 @@ class DocumentRegistry:
             status=status,
         )
         self._session.add(new_version)
-        self._session.flush()
-
-        document.current_version_id = new_version.id
         self._session.flush()
 
         return DocumentRegistrationResult(
@@ -161,6 +155,50 @@ class DocumentRegistry:
             raise ValueError(f"document_version_not_found: {version_id}")
 
         version.status = status
+        self._session.flush()
+        return version
+
+    def list_versions_for_document(self, document_id: str) -> list[DocumentVersion]:
+        """List document versions newest-first by create timestamp."""
+
+        query = (
+            select(DocumentVersion)
+            .where(DocumentVersion.document_id == document_id)
+            .order_by(DocumentVersion.created_at.desc(), DocumentVersion.id.desc())
+        )
+        return list(self._session.execute(query).scalars().all())
+
+    def get_current_ready_version(self, document_id: str) -> DocumentVersion | None:
+        """Return current version when it exists and is READY."""
+
+        document = self.get_document_by_id(document_id)
+        if document is None or document.current_version_id is None:
+            return None
+        version = self.get_version_by_id(document.current_version_id)
+        if version is None or version.status != LifecycleStatus.READY:
+            return None
+        return version
+
+    def get_latest_version(self, document_id: str) -> DocumentVersion | None:
+        """Return latest version regardless of lifecycle status."""
+
+        versions = self.list_versions_for_document(document_id)
+        return versions[0] if versions else None
+
+    def promote_ready_version(self, document_id: str, version_id: str) -> DocumentVersion:
+        """Promote a READY version to document.current_version_id."""
+
+        document = self.get_document_by_id(document_id)
+        if document is None:
+            raise ValueError(f"document_not_found: {document_id}")
+
+        version = self.get_version_by_id(version_id)
+        if version is None or version.document_id != document_id:
+            raise ValueError(f"document_version_not_found_for_document: {version_id}")
+        if version.status != LifecycleStatus.READY:
+            raise ValueError(f"document_version_not_ready: {version_id}")
+
+        document.current_version_id = version.id
         self._session.flush()
         return version
 
