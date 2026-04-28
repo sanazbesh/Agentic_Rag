@@ -1,5 +1,10 @@
 """Storage integrations for persistence backends."""
 
+from .document_store import (
+    DocumentStorageConfig,
+    LocalDocumentStore,
+    document_storage_config_from_env,
+)
 from .postgres import (
     PostgresConfig,
     get_postgres_engine,
@@ -9,6 +14,9 @@ from .postgres import (
 )
 
 __all__ = [
+    "DocumentStorageConfig",
+    "LocalDocumentStore",
+    "document_storage_config_from_env",
     "PostgresConfig",
     "get_postgres_engine",
     "get_postgres_session_factory",
