@@ -199,3 +199,31 @@ def test_retry_failed_document_version_records_new_error(session: Session, tmp_p
     job = session.get(IngestionJob, failed.job_id)
     assert job is not None
     assert job.error_message == "chunking exploded"
+
+
+def test_failed_new_version_does_not_replace_current_ready_version(session: Session, tmp_path) -> None:
+    source_file = tmp_path / "uploads" / "versioned.md"
+    source_file.parent.mkdir(parents=True)
+    source_file.write_text("# Ready v1", encoding="utf-8")
+
+    store = LocalDocumentStore(tmp_path / "documents")
+    registry = DocumentRegistry(session)
+    ok_orchestrator = IngestionOrchestrator(session=session, registry=registry, document_store=store)
+
+    first = ok_orchestrator.ingest_file(source_file, source_type="upload")
+    assert first.status == LifecycleStatus.READY
+
+    source_file.write_text("# Broken v2", encoding="utf-8")
+    failing_orchestrator = IngestionOrchestrator(
+        session=session,
+        registry=registry,
+        document_store=store,
+        chunker=FailingChunker(),
+    )
+    second = failing_orchestrator.ingest_file(source_file, source_type="upload")
+
+    persisted_document = session.get(Document, first.document_id)
+    assert persisted_document is not None
+    assert second.status == LifecycleStatus.FAILED
+    assert persisted_document.current_version_id == first.document_version_id
+    assert persisted_document.status == LifecycleStatus.READY
