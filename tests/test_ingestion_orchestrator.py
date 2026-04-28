@@ -29,6 +29,17 @@ class FailingChunker(Chunker):
         raise RuntimeError("chunking exploded")
 
 
+class RecoveringChunker(Chunker):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def chunk(self, document: IngestedDocument) -> ChunkingResult:
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError("first attempt failed")
+        return ChunkingResult(parent_chunks=[], child_chunks=[])
+
+
 def test_successful_orchestration_registers_and_stores_file(session: Session, tmp_path) -> None:
     source_file = tmp_path / "uploads" / "policy.md"
     source_file.parent.mkdir(parents=True)
@@ -122,3 +133,69 @@ def test_failure_marks_job_document_and_version_failed(session: Session, tmp_pat
     assert persisted_document.status == LifecycleStatus.FAILED
     assert persisted_version is not None
     assert persisted_version.status == LifecycleStatus.FAILED
+
+
+def test_retry_only_allowed_for_failed_jobs(session: Session, tmp_path) -> None:
+    source_file = tmp_path / "uploads" / "ok.md"
+    source_file.parent.mkdir(parents=True)
+    source_file.write_text("# Success", encoding="utf-8")
+
+    store = LocalDocumentStore(tmp_path / "documents")
+    registry = DocumentRegistry(session)
+    orchestrator = IngestionOrchestrator(session=session, registry=registry, document_store=store)
+    result = orchestrator.ingest_file(source_file, source_type="upload")
+
+    with pytest.raises(ValueError, match="Retry is only allowed for FAILED jobs"):
+        orchestrator.retry_failed_job(result.job_id)
+
+
+def test_retry_failed_job_reuses_storage_path_and_resets_error(session: Session, tmp_path) -> None:
+    source_file = tmp_path / "uploads" / "retry.md"
+    source_file.parent.mkdir(parents=True)
+    source_file.write_text("# Retry me", encoding="utf-8")
+
+    chunker = RecoveringChunker()
+    store = LocalDocumentStore(tmp_path / "documents")
+    registry = DocumentRegistry(session)
+    orchestrator = IngestionOrchestrator(session=session, registry=registry, document_store=store, chunker=chunker)
+
+    failed = orchestrator.ingest_file(source_file, source_type="upload")
+    assert failed.status == LifecycleStatus.FAILED
+
+    retry = orchestrator.retry_failed_job(failed.job_id)
+    assert retry.status == LifecycleStatus.READY
+    assert retry.storage_path == failed.storage_path
+
+    version = session.get(DocumentVersion, failed.document_version_id)
+    assert version is not None
+    assert version.storage_path == failed.storage_path
+    assert version.status == LifecycleStatus.READY
+
+    job = session.get(IngestionJob, failed.job_id)
+    assert job is not None
+    assert job.status == LifecycleStatus.READY
+    assert job.error_message is None
+
+
+def test_retry_failed_document_version_records_new_error(session: Session, tmp_path) -> None:
+    source_file = tmp_path / "uploads" / "retry-fail.md"
+    source_file.parent.mkdir(parents=True)
+    source_file.write_text("# Still failing", encoding="utf-8")
+
+    store = LocalDocumentStore(tmp_path / "documents")
+    registry = DocumentRegistry(session)
+    orchestrator = IngestionOrchestrator(
+        session=session,
+        registry=registry,
+        document_store=store,
+        chunker=FailingChunker(),
+    )
+
+    failed = orchestrator.ingest_file(source_file, source_type="upload")
+    retried = orchestrator.retry_failed_document_version(failed.document_version_id)
+
+    assert retried.status == LifecycleStatus.FAILED
+    assert retried.error_message == "chunking exploded"
+    job = session.get(IngestionJob, failed.job_id)
+    assert job is not None
+    assert job.error_message == "chunking exploded"

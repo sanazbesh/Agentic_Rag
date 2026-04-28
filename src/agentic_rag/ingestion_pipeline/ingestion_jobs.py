@@ -30,6 +30,18 @@ class IngestionJobService:
         self._session.flush()
         return job
 
+    def get_job(self, job_id: str) -> IngestionJob | None:
+        return self._session.get(IngestionJob, job_id)
+
+    def get_latest_job_for_document_version(self, document_version_id: str) -> IngestionJob | None:
+        stmt: Select[tuple[IngestionJob]] = (
+            select(IngestionJob)
+            .where(IngestionJob.document_version_id == document_version_id)
+            .order_by(IngestionJob.created_at.desc())
+            .limit(1)
+        )
+        return self._session.execute(stmt).scalar_one_or_none()
+
     def mark_pending(self, job: IngestionJob) -> IngestionJob:
         job.status = LifecycleStatus.PENDING
         job.error_message = None
