@@ -9,18 +9,10 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy.orm import Session
-
-from agentic_rag.ingestion_pipeline import DocumentRegistry, IngestionOrchestrator
-from agentic_rag.storage import (
-    LocalDocumentStore,
-    document_storage_config_from_env,
-    get_postgres_engine,
-    get_postgres_session_factory,
-    postgres_config_from_env,
-)
-from agentic_rag.storage.models import Base, IngestionJob, LifecycleStatus
 from ui.upload_manager import is_allowed_extension, sanitize_filename
+
+
+FAILED_STATUS = "FAILED"
 
 
 @dataclass(slots=True, frozen=True)
@@ -47,6 +39,14 @@ class IngestionRuntime:
 def build_ingestion_runtime_from_env() -> IngestionRuntime:
     """Build DB session factory and document store root using existing config patterns."""
 
+    from agentic_rag.storage import (
+        document_storage_config_from_env,
+        get_postgres_engine,
+        get_postgres_session_factory,
+        postgres_config_from_env,
+    )
+    from agentic_rag.storage.models import Base
+
     postgres_config = postgres_config_from_env()
     if not postgres_config.enabled:
         raise RuntimeError("DATABASE_URL is required for persistent ingestion UI.")
@@ -70,56 +70,26 @@ def ingest_uploaded_document(
 
     raw_name = getattr(uploaded_file, "name", "")
     if not raw_name:
-        return IngestionUIResult(
-            document_id=None,
-            document_version_id=None,
-            ingestion_job_id=None,
-            status=LifecycleStatus.FAILED.value,
-            error_message="Upload filename metadata is missing.",
-            duplicate_document=False,
-            status_from_database=False,
-        )
+        return IngestionUIResult(None, None, None, FAILED_STATUS, "Upload filename metadata is missing.", False, False)
 
     safe_name = sanitize_filename(raw_name)
     if not is_allowed_extension(safe_name):
-        return IngestionUIResult(
-            document_id=None,
-            document_version_id=None,
-            ingestion_job_id=None,
-            status=LifecycleStatus.FAILED.value,
-            error_message="Unsupported file type. Allowed: pdf, md, txt.",
-            duplicate_document=False,
-            status_from_database=False,
-        )
+        return IngestionUIResult(None, None, None, FAILED_STATUS, "Unsupported file type. Allowed: pdf, md, txt.", False, False)
 
     try:
         content = uploaded_file.getvalue()
     except Exception as exc:
-        return IngestionUIResult(
-            document_id=None,
-            document_version_id=None,
-            ingestion_job_id=None,
-            status=LifecycleStatus.FAILED.value,
-            error_message=f"Failed to read uploaded file: {type(exc).__name__}.",
-            duplicate_document=False,
-            status_from_database=False,
-        )
+        return IngestionUIResult(None, None, None, FAILED_STATUS, f"Failed to read uploaded file: {type(exc).__name__}.", False, False)
 
     if not content:
-        return IngestionUIResult(
-            document_id=None,
-            document_version_id=None,
-            ingestion_job_id=None,
-            status=LifecycleStatus.FAILED.value,
-            error_message="Uploaded file is empty.",
-            duplicate_document=False,
-            status_from_database=False,
-        )
+        return IngestionUIResult(None, None, None, FAILED_STATUS, "Uploaded file is empty.", False, False)
 
     suffix = Path(safe_name).suffix.lower()
     temp_path = _write_temp_upload(content=content, suffix=suffix)
 
     try:
+        from agentic_rag.storage.models import IngestionJob
+
         with runtime.session_factory() as session:
             result = _run_ingestion(
                 session=session,
@@ -156,12 +126,15 @@ def _write_temp_upload(*, content: bytes, suffix: str) -> Path:
 
 def _run_ingestion(
     *,
-    session: Session,
+    session: Any,
     temp_path: Path,
     source_name: str,
     source_type: str,
     document_store_root: Path,
 ):
+    from agentic_rag.ingestion_pipeline import DocumentRegistry, IngestionOrchestrator
+    from agentic_rag.storage import LocalDocumentStore
+
     registry = DocumentRegistry(session)
     document_store = LocalDocumentStore(document_store_root)
     orchestrator = IngestionOrchestrator(

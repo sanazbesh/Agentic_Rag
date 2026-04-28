@@ -10,7 +10,6 @@ import streamlit as st
 
 from ui.backend_adapter import BackendAdapterError, get_available_documents, parse_recent_messages
 from ui.local_backend import effective_local_llm_settings
-from ui.persistent_ingestion import build_ingestion_runtime_from_env, ingest_uploaded_document
 from ui.upload_manager import ALLOWED_EXTENSIONS, remove_uploaded_document, save_uploaded_files
 
 DEBUG_SECTIONS = [
@@ -92,6 +91,7 @@ def _render_upload_controls() -> None:
     """Render local upload controls and update uploaded-document session registry."""
 
     st.sidebar.subheader("Persistent ingestion")
+    build_runtime, ingest_uploaded, ingestion_dependency_error = _load_persistent_ingestion_dependencies()
     persistent_upload = st.sidebar.file_uploader(
         "Upload for persistent ingestion (.pdf, .md, .txt)",
         type=sorted(ALLOWED_EXTENSIONS),
@@ -99,10 +99,16 @@ def _render_upload_controls() -> None:
         key="persistent_ingestion_upload",
         help="This stores files in the persistent document store via IngestionOrchestrator.",
     )
-    if st.sidebar.button("Ingest uploaded document", use_container_width=True, disabled=persistent_upload is None):
+    if ingestion_dependency_error:
+        st.sidebar.info(ingestion_dependency_error)
+    if st.sidebar.button(
+        "Ingest uploaded document",
+        use_container_width=True,
+        disabled=persistent_upload is None or ingestion_dependency_error is not None,
+    ):
         try:
-            runtime = build_ingestion_runtime_from_env()
-            ingestion_result = ingest_uploaded_document(persistent_upload, runtime=runtime)
+            runtime = build_runtime()
+            ingestion_result = ingest_uploaded(persistent_upload, runtime=runtime)
             st.session_state.latest_ingestion_result = ingestion_result
             if ingestion_result.error_message:
                 st.sidebar.error(f"Ingestion failed: {ingestion_result.error_message}")
@@ -189,6 +195,23 @@ def _render_upload_controls() -> None:
         ]
         st.sidebar.success("Cleared uploaded document list.")
         st.rerun()
+
+
+def _load_persistent_ingestion_dependencies() -> tuple[Any | None, Any | None, str | None]:
+    """Load persistent ingestion dependencies lazily for optional SQLAlchemy environments."""
+
+    try:
+        from ui.persistent_ingestion import build_ingestion_runtime_from_env, ingest_uploaded_document
+    except ModuleNotFoundError as exc:
+        dependency_name = exc.name or "optional dependency"
+        return None, None, (
+            "Persistent ingestion is unavailable in this environment. "
+            f"Missing dependency: {dependency_name}."
+        )
+    except Exception as exc:  # pragma: no cover - defensive import guardrail
+        return None, None, f"Persistent ingestion is unavailable: {type(exc).__name__}: {exc}"
+
+    return build_ingestion_runtime_from_env, ingest_uploaded_document, None
 
 
 def render_sidebar(
