@@ -63,6 +63,8 @@ def initialize_session_state() -> None:
         "conversation_history": [],
         "selected_document_ids": [],
         "selected_documents": [],
+        "selected_persisted_document_ids": [],
+        "selected_persisted_document_version_ids": [],
         "uploaded_documents": [],
         "use_mock_backend": True,
         "show_debug": True,
@@ -214,6 +216,33 @@ def _load_persistent_ingestion_dependencies() -> tuple[Any | None, Any | None, s
     return build_ingestion_runtime_from_env, ingest_uploaded_document, None
 
 
+def _load_persisted_document_dependencies() -> tuple[Any | None, Any | None, Any | None, str | None]:
+    """Load persisted document listing dependencies lazily for optional SQLAlchemy environments."""
+
+    try:
+        from ui.persisted_documents import (
+            PersistedDocumentServiceError,
+            list_persisted_documents,
+            ready_persisted_documents,
+            to_document_descriptor,
+        )
+    except ModuleNotFoundError as exc:
+        dependency_name = exc.name or "optional dependency"
+        return None, None, None, (
+            "Persisted document selection is unavailable in this environment. "
+            f"Missing dependency: {dependency_name}."
+        )
+    except Exception as exc:  # pragma: no cover - defensive import guardrail
+        return None, None, None, f"Persisted document selection is unavailable: {type(exc).__name__}: {exc}"
+
+    return (
+        list_persisted_documents,
+        ready_persisted_documents,
+        to_document_descriptor,
+        None,
+    )
+
+
 def render_sidebar(
     *,
     real_backend_available: bool,
@@ -350,6 +379,57 @@ def render_sidebar(
 
     _render_upload_controls()
 
+    persisted_document_descriptors: list[dict[str, Any]] = []
+    list_persisted_documents, ready_persisted_documents, to_document_descriptor, persisted_dependency_error = (
+        _load_persisted_document_dependencies()
+    )
+    if persisted_dependency_error:
+        st.sidebar.info(persisted_dependency_error)
+    else:
+        try:
+            persisted_documents = list_persisted_documents()
+            if not persisted_documents:
+                st.sidebar.caption("No persisted documents found.")
+            else:
+                ready_rows = ready_persisted_documents(persisted_documents)
+                if not ready_rows:
+                    st.sidebar.caption("No READY documents available.")
+                else:
+                    ready_options = [row.document_id for row in ready_rows]
+                    ready_map = {row.document_id: row for row in ready_rows}
+                    default_ready_ids = [
+                        doc_id
+                        for doc_id in st.session_state.selected_persisted_document_ids
+                        if doc_id in ready_map
+                    ]
+                    selected_ready_ids = st.sidebar.multiselect(
+                        "Persisted READY documents",
+                        options=ready_options,
+                        default=default_ready_ids,
+                        format_func=lambda doc_id: (
+                            f"{ready_map[doc_id].source_name} "
+                            f"[{ready_map[doc_id].source_type}:{ready_map[doc_id].status}] "
+                            f"v={ready_map[doc_id].current_version_id or 'none'}"
+                        ),
+                        help="Select READY persisted documents loaded from Postgres.",
+                    )
+                    st.session_state.selected_persisted_document_ids = selected_ready_ids
+                    st.session_state.selected_persisted_document_version_ids = [
+                        ready_map[doc_id].current_version_id
+                        for doc_id in selected_ready_ids
+                        if ready_map[doc_id].current_version_id
+                    ]
+                    persisted_document_descriptors = [
+                        to_document_descriptor(ready_map[doc_id]) for doc_id in selected_ready_ids
+                    ]
+        except Exception as exc:
+            error_type = type(exc).__name__
+            message = str(exc)
+            if error_type == "PersistedDocumentServiceError" and "Database unavailable:" in message:
+                st.sidebar.error(message)
+            else:
+                st.sidebar.error(f"Failed to load persisted documents: {error_type}: {message}")
+
     available_documents = get_available_documents(
         use_mock_backend=use_mock_backend,
         uploaded_documents=st.session_state.uploaded_documents,
@@ -377,7 +457,7 @@ def render_sidebar(
         ),
     )
 
-    selected_documents = [document_options[doc_id] for doc_id in selected_document_ids]
+    selected_documents = [document_options[doc_id] for doc_id in selected_document_ids] + persisted_document_descriptors
     st.session_state.selected_document_ids = selected_document_ids
     st.session_state.selected_documents = selected_documents
 
