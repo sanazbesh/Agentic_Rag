@@ -26,6 +26,12 @@ from .parent_child import (
 )
 from .sparse import SparseSearchResult, SparseSearchService, search_child_chunks_sparse
 
+try:
+    from .postgres_chunk_repository import PersistedChunk, PostgresChunkRepository
+except Exception:  # pragma: no cover - optional SQLAlchemy dependency in some test envs
+    PersistedChunk = None  # type: ignore[assignment]
+    PostgresChunkRepository = None  # type: ignore[assignment]
+
 __all__ = [
     "QueryRewriter",
     "Retriever",
@@ -55,3 +61,6 @@ __all__ = [
     "SparseSearchService",
     "search_child_chunks_sparse",
 ]
+
+if PersistedChunk is not None and PostgresChunkRepository is not None:
+    __all__.extend(["PersistedChunk", "PostgresChunkRepository"])
