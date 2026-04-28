@@ -6,10 +6,13 @@ from agentic_rag.ingestion_pipeline.document_registry import (
     compute_sha256_from_bytes,
     compute_sha256_from_file_path,
 )
+from agentic_rag.ingestion_pipeline.orchestrator import IngestionOrchestrator, IngestionResult
 
 __all__ = [
     "DocumentRegistrationResult",
     "DocumentRegistry",
     "compute_sha256_from_bytes",
     "compute_sha256_from_file_path",
+    "IngestionOrchestrator",
+    "IngestionResult",
 ]
