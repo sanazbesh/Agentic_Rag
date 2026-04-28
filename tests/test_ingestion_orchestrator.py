@@ -47,7 +47,7 @@ def test_successful_orchestration_registers_and_stores_file(session: Session, tm
     assert result.document_id
     assert result.document_version_id
     assert result.job_id
-    assert result.status == LifecycleStatus.PROCESSING
+    assert result.status == LifecycleStatus.READY
     assert store.exists(result.storage_path) is True
     assert result.parsed_documents
     assert result.chunking_result is not None
@@ -57,11 +57,13 @@ def test_successful_orchestration_registers_and_stores_file(session: Session, tm
     persisted_version = session.get(DocumentVersion, result.document_version_id)
 
     assert persisted_job is not None
-    assert persisted_job.status == LifecycleStatus.PROCESSING
+    assert persisted_job.status == LifecycleStatus.READY
+    assert persisted_job.started_at is not None
+    assert persisted_job.finished_at is not None
     assert persisted_document is not None
-    assert persisted_document.status == LifecycleStatus.PROCESSING
+    assert persisted_document.status == LifecycleStatus.READY
     assert persisted_version is not None
-    assert persisted_version.status == LifecycleStatus.PROCESSING
+    assert persisted_version.status == LifecycleStatus.READY
 
 
 def test_duplicate_content_reuses_existing_document_version(session: Session, tmp_path) -> None:
@@ -113,6 +115,8 @@ def test_failure_marks_job_document_and_version_failed(session: Session, tmp_pat
 
     assert persisted_job is not None
     assert persisted_job.status == LifecycleStatus.FAILED
+    assert persisted_job.started_at is not None
+    assert persisted_job.finished_at is not None
     assert persisted_job.error_message == "chunking exploded"
     assert persisted_document is not None
     assert persisted_document.status == LifecycleStatus.FAILED
