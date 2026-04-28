@@ -81,6 +81,7 @@ def initialize_session_state() -> None:
         "local_llm_stage_rewrite": True,
         "local_llm_stage_decomposition": True,
         "local_llm_stage_synthesis": True,
+        "latest_ingestion_result": None,
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -89,6 +90,52 @@ def initialize_session_state() -> None:
 def _render_upload_controls() -> None:
     """Render local upload controls and update uploaded-document session registry."""
 
+    st.sidebar.subheader("Persistent ingestion")
+    build_runtime, ingest_uploaded, ingestion_dependency_error = _load_persistent_ingestion_dependencies()
+    persistent_upload = st.sidebar.file_uploader(
+        "Upload for persistent ingestion (.pdf, .md, .txt)",
+        type=sorted(ALLOWED_EXTENSIONS),
+        accept_multiple_files=False,
+        key="persistent_ingestion_upload",
+        help="This stores files in the persistent document store via IngestionOrchestrator.",
+    )
+    if ingestion_dependency_error:
+        st.sidebar.info(ingestion_dependency_error)
+    if st.sidebar.button(
+        "Ingest uploaded document",
+        use_container_width=True,
+        disabled=persistent_upload is None or ingestion_dependency_error is not None,
+    ):
+        try:
+            runtime = build_runtime()
+            ingestion_result = ingest_uploaded(persistent_upload, runtime=runtime)
+            st.session_state.latest_ingestion_result = ingestion_result
+            if ingestion_result.error_message:
+                st.sidebar.error(f"Ingestion failed: {ingestion_result.error_message}")
+            elif ingestion_result.duplicate_document:
+                st.sidebar.warning("Duplicate document detected. Existing document version was reused.")
+            else:
+                st.sidebar.success("Document ingested successfully.")
+            st.rerun()
+        except Exception as exc:  # pragma: no cover - defensive UI error handling
+            st.sidebar.error(f"Persistent ingestion failed: {type(exc).__name__}: {exc}")
+
+    latest_ingestion_result = st.session_state.get("latest_ingestion_result")
+    if latest_ingestion_result is not None:
+        st.sidebar.markdown("**Latest ingestion result**")
+        st.sidebar.json(
+            {
+                "document_id": latest_ingestion_result.document_id,
+                "document_version_id": latest_ingestion_result.document_version_id,
+                "ingestion_job_id": latest_ingestion_result.ingestion_job_id,
+                "status": latest_ingestion_result.status,
+                "error_message": latest_ingestion_result.error_message,
+                "status_from_database": latest_ingestion_result.status_from_database,
+            },
+            expanded=False,
+        )
+
+    st.sidebar.divider()
     st.sidebar.subheader("Upload legal documents")
     uploaded_files = st.sidebar.file_uploader(
         "Upload .pdf, .md, or .txt files",
@@ -148,6 +195,23 @@ def _render_upload_controls() -> None:
         ]
         st.sidebar.success("Cleared uploaded document list.")
         st.rerun()
+
+
+def _load_persistent_ingestion_dependencies() -> tuple[Any | None, Any | None, str | None]:
+    """Load persistent ingestion dependencies lazily for optional SQLAlchemy environments."""
+
+    try:
+        from ui.persistent_ingestion import build_ingestion_runtime_from_env, ingest_uploaded_document
+    except ModuleNotFoundError as exc:
+        dependency_name = exc.name or "optional dependency"
+        return None, None, (
+            "Persistent ingestion is unavailable in this environment. "
+            f"Missing dependency: {dependency_name}."
+        )
+    except Exception as exc:  # pragma: no cover - defensive import guardrail
+        return None, None, f"Persistent ingestion is unavailable: {type(exc).__name__}: {exc}"
+
+    return build_ingestion_runtime_from_env, ingest_uploaded_document, None
 
 
 def render_sidebar(
