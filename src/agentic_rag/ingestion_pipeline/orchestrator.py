@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
-from uuid import uuid4
 
 from sqlalchemy.orm import Session
 
@@ -16,11 +14,9 @@ from agentic_rag.ingestion.document_ingestors import MarkdownDocumentIngestor, P
 from agentic_rag.ingestion.interfaces import DocumentIngestor
 from agentic_rag.ingestion_pipeline.document_registry import DocumentRegistry
 from agentic_rag.storage.document_store import LocalDocumentStore
-from agentic_rag.storage.models import IngestionJob, LifecycleStatus
+from agentic_rag.ingestion_pipeline.ingestion_jobs import IngestionJobService
+from agentic_rag.storage.models import LifecycleStatus
 from agentic_rag.types import Document
-
-
-JOB_ID_PREFIX = "job_"
 
 
 @dataclass(slots=True, frozen=True)
@@ -58,6 +54,7 @@ class IngestionOrchestrator:
         self._markdown_ingestor = markdown_ingestor or MarkdownDocumentIngestor()
         self._pdf_ingestor = pdf_ingestor or PDFDocumentIngestor()
         self._chunker = chunker or MarkdownParentChildChunker()
+        self._job_service = IngestionJobService(session)
 
     def ingest_file(
         self,
@@ -86,16 +83,15 @@ class IngestionOrchestrator:
         )
         registration.version.storage_path = storage_path
 
-        job = self._create_ingestion_job(
+        job = self._job_service.create_job(
             document_id=registration.document.id,
             document_version_id=registration.version.id,
         )
+        self._job_service.mark_pending(job)
 
         self._registry.update_document_status(registration.document.id, LifecycleStatus.PROCESSING)
         self._registry.update_version_status(registration.version.id, LifecycleStatus.PROCESSING)
-        job.status = LifecycleStatus.PROCESSING
-        job.started_at = datetime.now(timezone.utc)
-        self._session.flush()
+        self._job_service.mark_processing(job)
 
         try:
             parsed_documents = self._parse_content(
@@ -106,15 +102,15 @@ class IngestionOrchestrator:
             )
             chunking_result = self._chunk_documents(parsed_documents)
 
-            # TODO(ticket-3.2+): persist chunk rows for this version once chunk storage service lands.
-            # TODO(ticket-3.3+): upsert child chunk vectors into Qdrant once indexing adapter lands.
-            # We intentionally leave status as PROCESSING because downstream persistent steps are incomplete.
+            self._registry.update_document_status(registration.document.id, LifecycleStatus.READY)
+            self._registry.update_version_status(registration.version.id, LifecycleStatus.READY)
+            self._job_service.mark_ready(job)
             self._session.commit()
             return IngestionResult(
                 document_id=registration.document.id,
                 document_version_id=registration.version.id,
                 job_id=job.id,
-                status=LifecycleStatus.PROCESSING,
+                status=LifecycleStatus.READY,
                 created_document=registration.created_document,
                 created_version=registration.created_version,
                 storage_path=storage_path,
@@ -124,9 +120,7 @@ class IngestionOrchestrator:
         except Exception as exc:
             self._registry.update_document_status(registration.document.id, LifecycleStatus.FAILED)
             self._registry.update_version_status(registration.version.id, LifecycleStatus.FAILED)
-            job.status = LifecycleStatus.FAILED
-            job.error_message = str(exc)
-            job.finished_at = datetime.now(timezone.utc)
+            self._job_service.mark_failed(job, error_message=str(exc))
             self._session.commit()
             return IngestionResult(
                 document_id=registration.document.id,
@@ -138,17 +132,6 @@ class IngestionOrchestrator:
                 storage_path=storage_path,
                 error_message=str(exc),
             )
-
-    def _create_ingestion_job(self, *, document_id: str, document_version_id: str) -> IngestionJob:
-        job = IngestionJob(
-            id=f"{JOB_ID_PREFIX}{uuid4().hex}",
-            document_id=document_id,
-            document_version_id=document_version_id,
-            status=LifecycleStatus.PENDING,
-        )
-        self._session.add(job)
-        self._session.flush()
-        return job
 
     def _parse_content(
         self,
