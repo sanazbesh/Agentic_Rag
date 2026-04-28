@@ -13,9 +13,11 @@ from agentic_rag.chunking.models import ChunkingResult
 from agentic_rag.ingestion.document_ingestors import MarkdownDocumentIngestor, PDFDocumentIngestor
 from agentic_rag.ingestion.interfaces import DocumentIngestor
 from agentic_rag.ingestion_pipeline.document_registry import DocumentRegistry
+from agentic_rag.ingestion_pipeline.chunk_persistence import ChunkPersistenceService
 from agentic_rag.storage.document_store import LocalDocumentStore
 from agentic_rag.ingestion_pipeline.ingestion_jobs import IngestionJobService
-from agentic_rag.storage.models import IngestionJob, LifecycleStatus
+from agentic_rag.ingestion_pipeline.vector_indexing import ChildChunkVectorIndexingService
+from agentic_rag.storage.models import DocumentVersion, IngestionJob, LifecycleStatus
 from agentic_rag.types import Document
 
 
@@ -47,6 +49,8 @@ class IngestionOrchestrator:
         markdown_ingestor: DocumentIngestor | None = None,
         pdf_ingestor: DocumentIngestor | None = None,
         chunker: Chunker | None = None,
+        chunk_persistence_service: ChunkPersistenceService | None = None,
+        vector_indexing_service: ChildChunkVectorIndexingService | None = None,
     ) -> None:
         self._session = session
         self._registry = registry
@@ -55,6 +59,90 @@ class IngestionOrchestrator:
         self._pdf_ingestor = pdf_ingestor or PDFDocumentIngestor()
         self._chunker = chunker or MarkdownParentChildChunker()
         self._job_service = IngestionJobService(session)
+        self._chunk_persistence_service = chunk_persistence_service
+        self._vector_indexing_service = vector_indexing_service
+
+    def reindex_document(self, document_id: str) -> IngestionResult:
+        version = self._registry.get_current_ready_version(document_id)
+        if version is None:
+            raise ValueError(f"No READY document version found for document: {document_id}")
+        return self.reindex_document_version(version.id)
+
+    def reindex_document_version(self, document_version_id: str) -> IngestionResult:
+        version = self._session.get(DocumentVersion, document_version_id)
+        if version is None:
+            raise ValueError(f"Document version not found: {document_version_id}")
+        if version.storage_path is None:
+            raise ValueError(f"Document version {document_version_id} has no storage_path to reindex")
+
+        document = version.document
+        source_path = Path(version.storage_path)
+        content_bytes = source_path.read_bytes()
+
+        job = self._job_service.create_job(document_id=document.id, document_version_id=version.id)
+        self._job_service.mark_pending(job)
+        self._registry.update_document_status(document.id, LifecycleStatus.PROCESSING)
+        self._registry.update_version_status(version.id, LifecycleStatus.PROCESSING)
+        self._job_service.mark_processing(job)
+
+        try:
+            parsed_documents = self._parse_content(
+                content_bytes=content_bytes,
+                source_name=document.source_name,
+                source_type=document.source_type,
+                storage_path=version.storage_path,
+            )
+            chunking_result = self._chunk_documents(parsed_documents)
+            if chunking_result is None:
+                raise RuntimeError("No parsed documents were available for chunking")
+
+            if self._chunk_persistence_service is not None:
+                self._chunk_persistence_service.persist_chunks(
+                    document_id=document.id,
+                    document_version_id=version.id,
+                    chunking_result=chunking_result,
+                )
+            if self._vector_indexing_service is not None:
+                self._vector_indexing_service.index_document_version(document_version_id=version.id)
+
+            version.parser_version = self._ingestor_version_for_source(document.source_name)
+            version.chunker_version = self._version_string(self._chunker)
+            if self._vector_indexing_service is not None:
+                version.embedding_model = self._embedding_model_name()
+
+            self._registry.update_version_status(version.id, LifecycleStatus.READY)
+            self._registry.promote_ready_version(document.id, version.id)
+            self._registry.update_document_status(document.id, LifecycleStatus.READY)
+            self._job_service.mark_ready(job)
+            self._session.commit()
+            return IngestionResult(
+                document_id=document.id,
+                document_version_id=version.id,
+                job_id=job.id,
+                status=LifecycleStatus.READY,
+                created_document=False,
+                created_version=False,
+                storage_path=version.storage_path,
+                parsed_documents=parsed_documents,
+                chunking_result=chunking_result,
+            )
+        except Exception as exc:
+            self._registry.update_version_status(version.id, LifecycleStatus.FAILED)
+            current_ready = self._registry.get_current_ready_version(document.id)
+            next_document_status = LifecycleStatus.READY if current_ready is not None else LifecycleStatus.FAILED
+            self._registry.update_document_status(document.id, next_document_status)
+            self._job_service.mark_failed(job, error_message=str(exc))
+            self._session.commit()
+            return IngestionResult(
+                document_id=document.id,
+                document_version_id=version.id,
+                job_id=job.id,
+                status=LifecycleStatus.FAILED,
+                created_document=False,
+                created_version=False,
+                storage_path=version.storage_path,
+                error_message=str(exc),
+            )
 
     def ingest_file(
         self,
@@ -252,6 +340,18 @@ class IngestionOrchestrator:
             return "pdf"
         suffix = path.suffix.lower().lstrip(".")
         return suffix or "file"
+
+    def _version_string(self, obj: object) -> str:
+        return obj.__class__.__name__
+
+    def _ingestor_version_for_source(self, source_name: str) -> str:
+        return self._version_string(self._resolve_ingestor(source_name))
+
+    def _embedding_model_name(self) -> str:
+        service = self._vector_indexing_service
+        if service is None:
+            return ""
+        return service.embedding_service.config.model_name
 
 
 __all__ = ["IngestionOrchestrator", "IngestionResult"]
