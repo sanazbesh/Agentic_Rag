@@ -25,6 +25,11 @@ from .parent_child import (
     hybrid_search,
 )
 from .sparse import SparseSearchResult, SparseSearchService, search_child_chunks_sparse
+from .qdrant_postgres_resolver import (
+    PostgresResolvedQdrantChildRepository,
+    QdrantResultResolver,
+    QdrantSearchBackend,
+)
 
 try:
     from .postgres_chunk_repository import PersistedChunk, PostgresChunkRepository
@@ -60,6 +65,9 @@ __all__ = [
     "SparseSearchResult",
     "SparseSearchService",
     "search_child_chunks_sparse",
+    "QdrantSearchBackend",
+    "QdrantResultResolver",
+    "PostgresResolvedQdrantChildRepository",
 ]
 
 if PersistedChunk is not None and PostgresChunkRepository is not None:
