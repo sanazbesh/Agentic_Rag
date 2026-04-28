@@ -100,3 +100,20 @@ def test_list_recent_jobs_filters_by_document_version_and_status(session: Sessio
     assert {job.id for job in by_document} == {job_a.id, job_b.id}
     assert {job.id for job in by_version} == {job_a.id, job_b.id}
     assert [job.id for job in by_status] == [job_b.id]
+
+
+def test_getters_return_jobs_by_id_and_latest_for_document_version(session: Session) -> None:
+    document_id, version_id = _seed_document(session)
+    service = IngestionJobService(session)
+
+    first = service.create_job(document_id=document_id, document_version_id=version_id)
+    service.mark_failed(first, error_message="first")
+    second = service.create_job(document_id=document_id, document_version_id=version_id)
+
+    by_id = service.get_job(second.id)
+    latest = service.get_latest_job_for_document_version(version_id)
+
+    assert by_id is not None
+    assert by_id.id == second.id
+    assert latest is not None
+    assert latest.id == second.id

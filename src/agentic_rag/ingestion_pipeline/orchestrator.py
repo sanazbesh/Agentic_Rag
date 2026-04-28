@@ -15,7 +15,7 @@ from agentic_rag.ingestion.interfaces import DocumentIngestor
 from agentic_rag.ingestion_pipeline.document_registry import DocumentRegistry
 from agentic_rag.storage.document_store import LocalDocumentStore
 from agentic_rag.ingestion_pipeline.ingestion_jobs import IngestionJobService
-from agentic_rag.storage.models import LifecycleStatus
+from agentic_rag.storage.models import IngestionJob, LifecycleStatus
 from agentic_rag.types import Document
 
 
@@ -129,6 +129,80 @@ class IngestionOrchestrator:
                 status=LifecycleStatus.FAILED,
                 created_document=registration.created_document,
                 created_version=registration.created_version,
+                storage_path=storage_path,
+                error_message=str(exc),
+            )
+
+    def retry_failed_job(self, job_id: str) -> IngestionResult:
+        job = self._job_service.get_job(job_id)
+        if job is None:
+            raise ValueError(f"Ingestion job not found: {job_id}")
+        return self._retry_failed_job(job=job)
+
+    def retry_failed_document_version(self, document_version_id: str) -> IngestionResult:
+        job = self._job_service.get_latest_job_for_document_version(document_version_id)
+        if job is None:
+            raise ValueError(f"No ingestion job found for document version: {document_version_id}")
+        return self._retry_failed_job(job=job)
+
+    def _retry_failed_job(self, *, job: IngestionJob) -> IngestionResult:
+        if job.status != LifecycleStatus.FAILED:
+            raise ValueError(f"Retry is only allowed for FAILED jobs. job_id={job.id} status={job.status.value}")
+
+        document = job.document
+        version = job.document_version
+        storage_path = version.storage_path
+        if storage_path is None:
+            raise ValueError(f"Document version {version.id} has no storage_path to retry")
+
+        source_path = Path(storage_path)
+        content_bytes = source_path.read_bytes()
+        source_name = document.source_name
+        source_type = document.source_type
+
+        self._job_service.mark_pending(job)
+        self._registry.update_document_status(document.id, LifecycleStatus.PENDING)
+        self._registry.update_version_status(version.id, LifecycleStatus.PENDING)
+
+        self._registry.update_document_status(document.id, LifecycleStatus.PROCESSING)
+        self._registry.update_version_status(version.id, LifecycleStatus.PROCESSING)
+        self._job_service.mark_processing(job)
+
+        try:
+            parsed_documents = self._parse_content(
+                content_bytes=content_bytes,
+                source_name=source_name,
+                source_type=source_type,
+                storage_path=storage_path,
+            )
+            chunking_result = self._chunk_documents(parsed_documents)
+            self._registry.update_document_status(document.id, LifecycleStatus.READY)
+            self._registry.update_version_status(version.id, LifecycleStatus.READY)
+            self._job_service.mark_ready(job)
+            self._session.commit()
+            return IngestionResult(
+                document_id=document.id,
+                document_version_id=version.id,
+                job_id=job.id,
+                status=LifecycleStatus.READY,
+                created_document=False,
+                created_version=False,
+                storage_path=storage_path,
+                parsed_documents=parsed_documents,
+                chunking_result=chunking_result,
+            )
+        except Exception as exc:
+            self._registry.update_document_status(document.id, LifecycleStatus.FAILED)
+            self._registry.update_version_status(version.id, LifecycleStatus.FAILED)
+            self._job_service.mark_failed(job, error_message=str(exc))
+            self._session.commit()
+            return IngestionResult(
+                document_id=document.id,
+                document_version_id=version.id,
+                job_id=job.id,
+                status=LifecycleStatus.FAILED,
+                created_document=False,
+                created_version=False,
                 storage_path=storage_path,
                 error_message=str(exc),
             )
