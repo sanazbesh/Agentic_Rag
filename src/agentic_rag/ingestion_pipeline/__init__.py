@@ -10,6 +10,11 @@ from agentic_rag.ingestion_pipeline.orchestrator import IngestionOrchestrator, I
 from agentic_rag.ingestion_pipeline.chunk_persistence import ChunkPersistenceService
 from agentic_rag.ingestion_pipeline.ingestion_jobs import IngestionJobService
 from agentic_rag.ingestion_pipeline.vector_indexing import ChildChunkVectorIndexingService, VectorIndexingResult
+from agentic_rag.ingestion_pipeline.document_deletion import (
+    DocumentDeletionError,
+    DocumentDeletionResult,
+    DocumentDeletionService,
+)
 
 __all__ = [
     "DocumentRegistrationResult",
@@ -22,4 +27,7 @@ __all__ = [
     "IngestionJobService",
     "ChildChunkVectorIndexingService",
     "VectorIndexingResult",
+    "DocumentDeletionError",
+    "DocumentDeletionResult",
+    "DocumentDeletionService",
 ]

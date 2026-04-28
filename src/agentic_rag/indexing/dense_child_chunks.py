@@ -46,6 +46,8 @@ class QdrantClientLike(Protocol):
 
     def retrieve(self, collection_name: str, *, ids: Sequence[str]) -> list[dict[str, Any]]: ...
 
+    def delete(self, collection_name: str, *, points_selector: dict[str, Any]) -> None: ...
+
 
 @dataclass(slots=True, frozen=True)
 class DenseEmbeddingConfig:
@@ -203,6 +205,14 @@ class QdrantChildChunkStore:
     def get_by_child_chunk_id(self, child_chunk_id: str) -> dict[str, Any] | None:
         points = self.client.retrieve(self.collection_name, ids=[stable_qdrant_point_id(child_chunk_id)])
         return points[0] if points else None
+
+    def delete_points(self, point_ids: Sequence[str]) -> None:
+        if not point_ids:
+            return
+        self.client.delete(
+            self.collection_name,
+            points_selector={"points": list(point_ids)},
+        )
 
 
 @dataclass(slots=True)
