@@ -10,6 +10,7 @@ import streamlit as st
 
 from ui.backend_adapter import BackendAdapterError, get_available_documents, parse_recent_messages
 from ui.local_backend import effective_local_llm_settings
+from ui.persistent_ingestion import build_ingestion_runtime_from_env, ingest_uploaded_document
 from ui.upload_manager import ALLOWED_EXTENSIONS, remove_uploaded_document, save_uploaded_files
 
 DEBUG_SECTIONS = [
@@ -81,6 +82,7 @@ def initialize_session_state() -> None:
         "local_llm_stage_rewrite": True,
         "local_llm_stage_decomposition": True,
         "local_llm_stage_synthesis": True,
+        "latest_ingestion_result": None,
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -89,6 +91,45 @@ def initialize_session_state() -> None:
 def _render_upload_controls() -> None:
     """Render local upload controls and update uploaded-document session registry."""
 
+    st.sidebar.subheader("Persistent ingestion")
+    persistent_upload = st.sidebar.file_uploader(
+        "Upload for persistent ingestion (.pdf, .md, .txt)",
+        type=sorted(ALLOWED_EXTENSIONS),
+        accept_multiple_files=False,
+        key="persistent_ingestion_upload",
+        help="This stores files in the persistent document store via IngestionOrchestrator.",
+    )
+    if st.sidebar.button("Ingest uploaded document", use_container_width=True, disabled=persistent_upload is None):
+        try:
+            runtime = build_ingestion_runtime_from_env()
+            ingestion_result = ingest_uploaded_document(persistent_upload, runtime=runtime)
+            st.session_state.latest_ingestion_result = ingestion_result
+            if ingestion_result.error_message:
+                st.sidebar.error(f"Ingestion failed: {ingestion_result.error_message}")
+            elif ingestion_result.duplicate_document:
+                st.sidebar.warning("Duplicate document detected. Existing document version was reused.")
+            else:
+                st.sidebar.success("Document ingested successfully.")
+            st.rerun()
+        except Exception as exc:  # pragma: no cover - defensive UI error handling
+            st.sidebar.error(f"Persistent ingestion failed: {type(exc).__name__}: {exc}")
+
+    latest_ingestion_result = st.session_state.get("latest_ingestion_result")
+    if latest_ingestion_result is not None:
+        st.sidebar.markdown("**Latest ingestion result**")
+        st.sidebar.json(
+            {
+                "document_id": latest_ingestion_result.document_id,
+                "document_version_id": latest_ingestion_result.document_version_id,
+                "ingestion_job_id": latest_ingestion_result.ingestion_job_id,
+                "status": latest_ingestion_result.status,
+                "error_message": latest_ingestion_result.error_message,
+                "status_from_database": latest_ingestion_result.status_from_database,
+            },
+            expanded=False,
+        )
+
+    st.sidebar.divider()
     st.sidebar.subheader("Upload legal documents")
     uploaded_files = st.sidebar.file_uploader(
         "Upload .pdf, .md, or .txt files",
