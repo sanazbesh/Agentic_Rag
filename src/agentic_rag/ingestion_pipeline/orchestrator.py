@@ -16,7 +16,8 @@ from agentic_rag.ingestion_pipeline.document_registry import DocumentRegistry
 from agentic_rag.ingestion_pipeline.chunk_persistence import ChunkPersistenceService
 from agentic_rag.storage.document_store import LocalDocumentStore
 from agentic_rag.ingestion_pipeline.ingestion_jobs import IngestionJobService
-from agentic_rag.ingestion_pipeline.vector_indexing import ChildChunkVectorIndexingService
+from agentic_rag.ingestion_pipeline.vector_indexing import ChildChunkVectorIndexingService, VectorIndexingResult
+from agentic_rag.ingestion_pipeline.validation import IngestionValidationService
 from agentic_rag.storage.models import DocumentVersion, IngestionJob, LifecycleStatus
 from agentic_rag.types import Document
 
@@ -51,6 +52,7 @@ class IngestionOrchestrator:
         chunker: Chunker | None = None,
         chunk_persistence_service: ChunkPersistenceService | None = None,
         vector_indexing_service: ChildChunkVectorIndexingService | None = None,
+        validation_service: IngestionValidationService | None = None,
     ) -> None:
         self._session = session
         self._registry = registry
@@ -61,6 +63,7 @@ class IngestionOrchestrator:
         self._job_service = IngestionJobService(session)
         self._chunk_persistence_service = chunk_persistence_service
         self._vector_indexing_service = vector_indexing_service
+        self._validation_service = validation_service or IngestionValidationService()
 
     def reindex_document(self, document_id: str) -> IngestionResult:
         version = self._registry.get_current_ready_version(document_id)
@@ -96,14 +99,26 @@ class IngestionOrchestrator:
             if chunking_result is None:
                 raise RuntimeError("No parsed documents were available for chunking")
 
+            persisted_chunks = None
             if self._chunk_persistence_service is not None:
-                self._chunk_persistence_service.persist_chunks(
+                persisted_chunks = self._chunk_persistence_service.persist_chunks(
                     document_id=document.id,
                     document_version_id=version.id,
                     chunking_result=chunking_result,
                 )
+            indexing_result: VectorIndexingResult | None = None
             if self._vector_indexing_service is not None:
-                self._vector_indexing_service.index_document_version(document_version_id=version.id)
+                indexing_result = self._vector_indexing_service.index_document_version(document_version_id=version.id)
+
+            validation_result = self._validation_service.validate(
+                document_version=version,
+                parsed_documents=parsed_documents,
+                chunking_result=chunking_result,
+                persisted_chunks=persisted_chunks,
+                indexing_result=indexing_result,
+            )
+            if not validation_result.is_valid:
+                raise RuntimeError(validation_result.error_message or "Validation failed")
 
             version.parser_version = self._ingestor_version_for_source(document.source_name)
             version.chunker_version = self._version_string(self._chunker)
@@ -189,6 +204,28 @@ class IngestionOrchestrator:
                 storage_path=storage_path,
             )
             chunking_result = self._chunk_documents(parsed_documents)
+            persisted_chunks = None
+            if self._chunk_persistence_service is not None:
+                persisted_chunks = self._chunk_persistence_service.persist_chunks(
+                    document_id=registration.document.id,
+                    document_version_id=registration.version.id,
+                    chunking_result=chunking_result,
+                )
+            indexing_result: VectorIndexingResult | None = None
+            if self._vector_indexing_service is not None:
+                indexing_result = self._vector_indexing_service.index_document_version(
+                    document_version_id=registration.version.id,
+                )
+
+            validation_result = self._validation_service.validate(
+                document_version=registration.version,
+                parsed_documents=parsed_documents,
+                chunking_result=chunking_result,
+                persisted_chunks=persisted_chunks,
+                indexing_result=indexing_result,
+            )
+            if not validation_result.is_valid:
+                raise RuntimeError(validation_result.error_message or "Validation failed")
 
             self._registry.update_version_status(registration.version.id, LifecycleStatus.READY)
             self._registry.promote_ready_version(registration.document.id, registration.version.id)
@@ -267,6 +304,26 @@ class IngestionOrchestrator:
                 storage_path=storage_path,
             )
             chunking_result = self._chunk_documents(parsed_documents)
+            persisted_chunks = None
+            if self._chunk_persistence_service is not None:
+                persisted_chunks = self._chunk_persistence_service.persist_chunks(
+                    document_id=document.id,
+                    document_version_id=version.id,
+                    chunking_result=chunking_result,
+                )
+            indexing_result: VectorIndexingResult | None = None
+            if self._vector_indexing_service is not None:
+                indexing_result = self._vector_indexing_service.index_document_version(document_version_id=version.id)
+
+            validation_result = self._validation_service.validate(
+                document_version=version,
+                parsed_documents=parsed_documents,
+                chunking_result=chunking_result,
+                persisted_chunks=persisted_chunks,
+                indexing_result=indexing_result,
+            )
+            if not validation_result.is_valid:
+                raise RuntimeError(validation_result.error_message or "Validation failed")
             self._registry.update_version_status(version.id, LifecycleStatus.READY)
             self._registry.promote_ready_version(document.id, version.id)
             self._registry.update_document_status(document.id, LifecycleStatus.READY)
