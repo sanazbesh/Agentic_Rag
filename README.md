@@ -66,3 +66,42 @@ Persistent named volumes:
 - `postgres_data`
 - `qdrant_data`
 - `documents_data`
+
+## Backup and restore (local persistent RAG state)
+
+Ticket 10.2 adds local scripts to back up and restore the persisted RAG knowledge-base state used by Docker Compose.
+
+What is included in backups:
+- Postgres database dump (`agentic_rag`).
+- Qdrant collection snapshots when available (with raw Qdrant storage export fallback).
+- Stored document files from `DOCUMENT_STORAGE_PATH` (`/app/data/documents` in Compose).
+
+Create a timestamped backup:
+
+```bash
+./scripts/backup_rag_state.sh
+```
+
+Optional backup root folder (default is `./backups`):
+
+```bash
+./scripts/backup_rag_state.sh /path/to/backups
+```
+
+The script creates `backups/YYYYMMDD_HHMMSS/` and fails clearly if required Docker services are not running.
+
+Restore from a specific backup folder:
+
+```bash
+./scripts/restore_rag_state.sh backups/YYYYMMDD_HHMMSS
+```
+
+Restore behavior:
+- Restores Postgres schema/data from the backup dump.
+- Restores Qdrant from snapshots when present, otherwise restores raw Qdrant storage export.
+- Restores stored document files.
+
+Safety checks:
+- Fails if Docker services (`postgres`, `qdrant`, `app`) are not running.
+- Fails if the provided restore backup path does not exist.
+- Backup script avoids overwriting existing timestamped backup folders.
