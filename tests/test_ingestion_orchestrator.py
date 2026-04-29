@@ -7,7 +7,7 @@ create_engine = sqlalchemy.create_engine
 Session = pytest.importorskip("sqlalchemy.orm").Session
 
 from agentic_rag.chunking.interfaces import Chunker
-from agentic_rag.chunking.models import ChunkingResult
+from agentic_rag.chunking.models import ChildChunk, ChunkingResult, ParentChunk
 from agentic_rag.ingestion_pipeline.document_registry import DocumentRegistry
 from agentic_rag.ingestion_pipeline.orchestrator import IngestionOrchestrator
 from agentic_rag.storage.document_store import LocalDocumentStore
@@ -37,7 +37,29 @@ class RecoveringChunker(Chunker):
         self.calls += 1
         if self.calls == 1:
             raise RuntimeError("first attempt failed")
-        return ChunkingResult(parent_chunks=[], child_chunks=[])
+        return ChunkingResult(
+            parent_chunks=[
+                ParentChunk(
+                    parent_chunk_id="parent-1",
+                    document_id=document.metadata.get("document_id", "doc"),
+                    source=document.metadata.get("source", "memory"),
+                    source_name=document.metadata.get("source_name", "retry.md"),
+                    text="Retry parent text",
+                )
+            ],
+            child_chunks=[
+                ChildChunk(
+                    child_chunk_id="child-1",
+                    parent_chunk_id="parent-1",
+                    document_id=document.metadata.get("document_id", "doc"),
+                    source=document.metadata.get("source", "memory"),
+                    source_name=document.metadata.get("source_name", "retry.md"),
+                    text="Retry child text",
+                    child_order=0,
+                    token_count=3,
+                )
+            ],
+        )
 
 
 def test_successful_orchestration_registers_and_stores_file(session: Session, tmp_path) -> None:
