@@ -42,3 +42,27 @@ For upcoming persistent ingestion pipeline work, Postgres connection settings ar
 - `DATABASE_URL` (required to initialize engine/session factory)
 - `AGENTIC_RAG_DB_ECHO` (optional; `true/false`, default `false`)
 
+
+## Docker Compose local stack
+
+For a local production-like setup (app + Postgres + Qdrant), run:
+
+```bash
+docker compose up --build
+```
+
+Services and local defaults:
+- `app` (Streamlit UI on `http://localhost:8501`)
+- `postgres` (`postgres:16`)
+- `qdrant` (`qdrant/qdrant`)
+
+Configured environment variables in Compose:
+- `DATABASE_URL`
+- `QDRANT_URL`
+- `QDRANT_COLLECTION_NAME`
+- `DOCUMENT_STORAGE_PATH`
+
+Persistent named volumes:
+- `postgres_data`
+- `qdrant_data`
+- `documents_data`
