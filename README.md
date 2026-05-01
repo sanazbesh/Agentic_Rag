@@ -21,6 +21,78 @@ ui/
 
 Each module currently includes abstract base interfaces to help you plug in concrete implementations incrementally.
 
+
+## Legal RAG architecture and persistent data pipeline
+
+### Overview
+This repository implements a hybrid, local-first legal RAG system using explicit orchestration graphs rather than a free-form agent loop. Retrieval and answer generation are deterministic stage flows with typed state, with optional local LLM calls used inside bounded graph nodes.
+
+Persistent ingestion is a core part of the design: document state is stored and versioned across runs, instead of relying on session-only indexing. This keeps retrieval reproducible, enables re-indexing and deletion workflows, and supports traceable evaluation.
+
+### High-level architecture (layered)
+- **UI layer (Streamlit multi-page app):** inspection and operations surfaces (query inspection, dashboards, trace/debug views, triage/review workflows).
+- **Backend adapter:** strict UI/backend boundary with mock vs real backend wiring, plus enforced final answer schema for stable rendering contracts.
+- **Orchestration graphs:**
+  - retrieval-stage graph with typed retrieval state
+  - answer-stage graph that extends retrieval state
+  - explicit path: query understanding → retrieval → answerability gate → synthesis
+- **Ingestion/data pipeline:** offline ingestion orchestration for registration, parsing, chunking, persistence, indexing, validation, lifecycle status changes, and job tracking.
+- **Storage layer:** Postgres (structured ingestion/retrieval state), Qdrant (dense vectors), and local file storage (raw source files).
+- **Observability/evaluation layer:** structured stage spans, metrics, offline eval pipelines, CI gating, and failure triage workflows.
+
+### Ingestion and persistent data pipeline
+The persistent ingestion flow is coordinated by `IngestionOrchestrator` and related services:
+
+1. Upload document.
+2. Store raw file in local document storage (`LocalDocumentStore`).
+3. Register document identity and create/reuse a document version in Postgres (`DocumentRegistry`, hash-based).
+4. Parse the file (format-specific ingestors).
+5. Create parent/child chunks.
+6. Persist chunks in Postgres.
+7. Embed child chunks.
+8. Upsert child vectors into Qdrant.
+9. Run ingestion validation checks.
+10. Mark the version `READY` and promote it as current only after validation succeeds.
+
+This ingestion path is separate from the online query path: ingestion writes/updates persistent state; query execution reads from that state.
+
+### Storage responsibilities
+- **Postgres:** source-of-truth structured state (`documents`, `document_versions`, `chunks`, `ingestion_jobs`, plus ingestion metadata and lifecycle statuses).
+- **Qdrant:** dense vector index for child chunks and vector payload metadata used during retrieval.
+- **Local file storage:** persisted raw uploaded files used for ingestion, re-indexing, and recovery operations.
+
+### Runtime query flow
+At runtime, query orchestration follows a graph-based retrieval/answer pipeline:
+
+1. Query input.
+2. Query understanding/routing (with optional rewrite/entity extraction).
+3. Hybrid retrieval (dense + sparse/BM25) and reranking.
+4. Qdrant returns child hits (point payload/IDs).
+5. Resolve child chunks from Postgres (Qdrant → Postgres resolver).
+6. Parent expansion for broader legal context.
+7. Context compression when context size thresholds are exceeded.
+8. Answerability/sufficiency gate.
+9. Grounded answer generation with citations.
+
+### Reliability and production-oriented design
+The system includes production-oriented reliability features:
+- idempotent ingestion via content hashing
+- document versioning with explicit lifecycle states
+- ingestion job tracking and retry support
+- re-indexing existing document versions
+- safe deletion workflows
+- ingestion validation before a version can be marked `READY`
+- trace metadata and stage-level spans for reproducibility/debugging
+- strict separation of offline ingestion from online query execution
+
+### Local development
+Use Docker Compose for local development with persistent services:
+- app
+- Postgres
+- Qdrant
+
+The Compose stack uses persistent volumes so database state, vectors, and stored documents survive container restarts.
+
 ## Streamlit legal RAG test UI
 
 A local-first inspection dashboard is available for testing the legal RAG pipeline:
