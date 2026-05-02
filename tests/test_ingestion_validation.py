@@ -32,7 +32,7 @@ def session() -> Session:
 
 class EmptyTextIngestor(DocumentIngestor):
     def ingest(self, records):
-        return [IngestedDocument(page_content="   ", metadata={"source": "x", "source_name": "x"})]
+        return [IngestedDocument(id="empty", text="   ", metadata={"source": "x", "source_name": "x"})]
 
 
 class NoChunksChunker(Chunker):

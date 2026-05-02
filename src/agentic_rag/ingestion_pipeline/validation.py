@@ -29,7 +29,7 @@ class IngestionValidationService:
         persisted_chunks: list[Chunk] | None,
         indexing_result: VectorIndexingResult | None,
     ) -> ValidationResult:
-        parsed_text = "\n".join(document.page_content for document in parsed_documents).strip()
+        parsed_text = "\n".join(document.text for document in parsed_documents).strip()
         if not parsed_text:
             return ValidationResult(is_valid=False, error_message="Validation failed: parsed text is empty")
 
