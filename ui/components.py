@@ -664,14 +664,25 @@ def render_download_button(final_result: dict[str, Any], debug_payload: dict[str
         use_container_width=False,
     )
 def _file_uploader_types() -> list[str]:
-    """Return Streamlit-safe upload extension list.
+    """Return Streamlit-safe upload extension list."""
 
-    Streamlit's ``file_uploader(..., type=...)`` calls ``len(type)`` internally,
-    so passing a Python ``type`` object crashes with
-    ``TypeError: object of type 'type' has no len()``.
-    """
-
+    fallback = ["md", "pdf", "txt"]
     configured = ALLOWED_EXTENSIONS
     if isinstance(configured, type):
-        return ["md", "pdf", "txt"]
-    return sorted(str(ext).lstrip(".") for ext in configured)
+        return fallback
+
+    try:
+        candidates = list(configured)
+    except TypeError:
+        return fallback
+
+    cleaned: list[str] = []
+    for ext in candidates:
+        if not isinstance(ext, str):
+            return fallback
+        normalized = ext.lstrip(".").strip().lower()
+        if not normalized:
+            return fallback
+        cleaned.append(normalized)
+
+    return sorted(set(cleaned)) or fallback
