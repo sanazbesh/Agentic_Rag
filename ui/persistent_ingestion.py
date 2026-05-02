@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import os
 import tempfile
 from pathlib import Path
+from types import GenericAlias
 from typing import Any
 
 from ui.upload_manager import is_allowed_extension, sanitize_filename
@@ -80,6 +81,20 @@ def ingest_uploaded_document(
         content = uploaded_file.getvalue()
     except Exception as exc:
         return IngestionUIResult(None, None, None, FAILED_STATUS, f"Failed to read uploaded file: {type(exc).__name__}.", False, False)
+
+    if isinstance(content, (type, GenericAlias)) or not isinstance(content, (bytes, bytearray, memoryview)):
+        return IngestionUIResult(
+            None,
+            None,
+            None,
+            FAILED_STATUS,
+            "Uploaded file payload is invalid. Expected bytes content.",
+            False,
+            False,
+        )
+
+    if isinstance(content, (bytearray, memoryview)):
+        content = bytes(content)
 
     if not content:
         return IngestionUIResult(None, None, None, FAILED_STATUS, "Uploaded file is empty.", False, False)
