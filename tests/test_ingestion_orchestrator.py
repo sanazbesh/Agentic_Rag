@@ -10,6 +10,9 @@ from agentic_rag.chunking.interfaces import Chunker
 from agentic_rag.chunking.models import ChildChunk, ChunkingResult, ParentChunk
 from agentic_rag.ingestion_pipeline.document_registry import DocumentRegistry
 from agentic_rag.ingestion_pipeline.orchestrator import IngestionOrchestrator
+from agentic_rag.ingestion_pipeline.chunk_persistence import ChunkPersistenceService
+from agentic_rag.ingestion_pipeline.vector_indexing import ChildChunkVectorIndexingService
+from agentic_rag.indexing.dense_child_chunks import DenseEmbeddingConfig, DenseEmbeddingService, QdrantChildChunkStore
 from agentic_rag.storage.document_store import LocalDocumentStore
 from agentic_rag.storage.models import Base, Document, DocumentVersion, IngestionJob, LifecycleStatus
 from agentic_rag.types import Document as IngestedDocument
@@ -23,6 +26,37 @@ def session() -> Session:
     with Session(bind=engine) as db_session:
         yield db_session
 
+
+
+
+class RecordingEmbeddingBackend:
+    @property
+    def dimension(self) -> int:
+        return 3
+
+    def encode(self, texts, *, batch_size: int):
+        return [[1.0, 2.0, 3.0] for _ in texts]
+
+
+class NoopQdrantClient:
+    def collection_exists(self, collection_name: str) -> bool:
+        return True
+
+    def create_collection(self, collection_name: str, *, vectors_config: dict[str, object]) -> None:
+        return None
+
+    def get_collection(self, collection_name: str) -> dict[str, object]:
+        return {"size": 3, "distance": "Cosine"}
+
+    def upsert(self, collection_name: str, *, points):
+        return None
+
+
+def _persistent_orchestrator(*, session: Session, document_store: LocalDocumentStore, registry: DocumentRegistry, chunker: Chunker | None = None) -> IngestionOrchestrator:
+    chunk_service = ChunkPersistenceService(session=session)
+    embedding = DenseEmbeddingService(config=DenseEmbeddingConfig(model_name="test", batch_size=8), backend=RecordingEmbeddingBackend())
+    vector_service = ChildChunkVectorIndexingService(session=session, embedding_service=embedding, store=QdrantChildChunkStore(client=NoopQdrantClient(), collection_name="test"))
+    return IngestionOrchestrator(session=session, registry=registry, document_store=document_store, chunker=chunker, chunk_persistence_service=chunk_service, vector_indexing_service=vector_service)
 
 class FailingChunker(Chunker):
     def chunk(self, document: IngestedDocument) -> ChunkingResult:
@@ -69,11 +103,7 @@ def test_successful_orchestration_registers_and_stores_file(session: Session, tm
 
     store = LocalDocumentStore(tmp_path / "documents")
     registry = DocumentRegistry(session)
-    orchestrator = IngestionOrchestrator(
-        session=session,
-        registry=registry,
-        document_store=store,
-    )
+    orchestrator = _persistent_orchestrator(session=session, registry=registry, document_store=store)
 
     result = orchestrator.ingest_file(source_file, source_type="upload")
 
@@ -106,11 +136,7 @@ def test_txt_ingestion_does_not_fail_on_page_content_lookup(session: Session, tm
 
     store = LocalDocumentStore(tmp_path / "documents")
     registry = DocumentRegistry(session)
-    orchestrator = IngestionOrchestrator(
-        session=session,
-        registry=registry,
-        document_store=store,
-    )
+    orchestrator = _persistent_orchestrator(session=session, registry=registry, document_store=store)
 
     result = orchestrator.ingest_file(source_file)
 
@@ -124,11 +150,7 @@ def test_duplicate_content_reuses_existing_document_version(session: Session, tm
 
     store = LocalDocumentStore(tmp_path / "documents")
     registry = DocumentRegistry(session)
-    orchestrator = IngestionOrchestrator(
-        session=session,
-        registry=registry,
-        document_store=store,
-    )
+    orchestrator = _persistent_orchestrator(session=session, registry=registry, document_store=store)
 
     first = orchestrator.ingest_file(source_file, source_type="upload")
     second = orchestrator.ingest_file(source_file, source_type="upload")
@@ -148,12 +170,7 @@ def test_failure_marks_job_document_and_version_failed(session: Session, tmp_pat
 
     store = LocalDocumentStore(tmp_path / "documents")
     registry = DocumentRegistry(session)
-    orchestrator = IngestionOrchestrator(
-        session=session,
-        registry=registry,
-        document_store=store,
-        chunker=FailingChunker(),
-    )
+    orchestrator = _persistent_orchestrator(session=session, registry=registry, document_store=store, chunker=FailingChunker())
 
     result = orchestrator.ingest_file(source_file, source_type="upload")
 
@@ -182,7 +199,7 @@ def test_retry_only_allowed_for_failed_jobs(session: Session, tmp_path) -> None:
 
     store = LocalDocumentStore(tmp_path / "documents")
     registry = DocumentRegistry(session)
-    orchestrator = IngestionOrchestrator(session=session, registry=registry, document_store=store)
+    orchestrator = _persistent_orchestrator(session=session, registry=registry, document_store=store)
     result = orchestrator.ingest_file(source_file, source_type="upload")
 
     with pytest.raises(ValueError, match="Retry is only allowed for FAILED jobs"):
@@ -197,7 +214,7 @@ def test_retry_failed_job_reuses_storage_path_and_resets_error(session: Session,
     chunker = RecoveringChunker()
     store = LocalDocumentStore(tmp_path / "documents")
     registry = DocumentRegistry(session)
-    orchestrator = IngestionOrchestrator(session=session, registry=registry, document_store=store, chunker=chunker)
+    orchestrator = _persistent_orchestrator(session=session, registry=registry, document_store=store, chunker=chunker)
 
     failed = orchestrator.ingest_file(source_file, source_type="upload")
     assert failed.status == LifecycleStatus.FAILED
@@ -224,12 +241,7 @@ def test_retry_failed_document_version_records_new_error(session: Session, tmp_p
 
     store = LocalDocumentStore(tmp_path / "documents")
     registry = DocumentRegistry(session)
-    orchestrator = IngestionOrchestrator(
-        session=session,
-        registry=registry,
-        document_store=store,
-        chunker=FailingChunker(),
-    )
+    orchestrator = _persistent_orchestrator(session=session, registry=registry, document_store=store, chunker=FailingChunker())
 
     failed = orchestrator.ingest_file(source_file, source_type="upload")
     retried = orchestrator.retry_failed_document_version(failed.document_version_id)
@@ -248,18 +260,13 @@ def test_failed_new_version_does_not_replace_current_ready_version(session: Sess
 
     store = LocalDocumentStore(tmp_path / "documents")
     registry = DocumentRegistry(session)
-    ok_orchestrator = IngestionOrchestrator(session=session, registry=registry, document_store=store)
+    ok_orchestrator = _persistent_orchestrator(session=session, registry=registry, document_store=store)
 
     first = ok_orchestrator.ingest_file(source_file, source_type="upload")
     assert first.status == LifecycleStatus.READY
 
     source_file.write_text("# Broken v2", encoding="utf-8")
-    failing_orchestrator = IngestionOrchestrator(
-        session=session,
-        registry=registry,
-        document_store=store,
-        chunker=FailingChunker(),
-    )
+    failing_orchestrator = _persistent_orchestrator(session=session, registry=registry, document_store=store, chunker=FailingChunker())
     second = failing_orchestrator.ingest_file(source_file, source_type="upload")
 
     persisted_document = session.get(Document, first.document_id)
