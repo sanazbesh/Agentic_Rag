@@ -189,6 +189,11 @@ def build_real_backend_runners() -> tuple[Callable[..., Any] | None, Callable[..
         selected_docs = [doc for doc in (selected_documents or []) if isinstance(doc, dict)]
         selected_ids = [str(doc.get("id")) for doc in selected_docs if doc.get("id")]
         selected_paths = [str(doc.get("path")) for doc in selected_docs if doc.get("path")]
+        selected_persisted_document_ids = [
+            str(doc.get("document_id"))
+            for doc in selected_docs
+            if str(doc.get("source", "")) == "persisted" and doc.get("document_id")
+        ]
 
         active_dependencies = dependencies
         local_scope_meta: dict[str, Any] | None = None
@@ -209,8 +214,9 @@ def build_real_backend_runners() -> tuple[Callable[..., Any] | None, Callable[..
 
         def hybrid_search_with_selected_docs(user_query: str, *, filters: dict[str, Any] | None, top_k: int) -> Any:
             merged_filters = dict(filters or {})
-            if selected_ids:
-                merged_filters["selected_document_ids"] = selected_ids
+            effective_selected_ids = selected_persisted_document_ids or selected_ids
+            if effective_selected_ids:
+                merged_filters["selected_document_ids"] = effective_selected_ids
             selected_version_ids = [str(doc.get("document_version_id")) for doc in selected_docs if doc.get("document_version_id")]
             if selected_version_ids:
                 merged_filters["selected_document_version_ids"] = selected_version_ids
@@ -218,7 +224,7 @@ def build_real_backend_runners() -> tuple[Callable[..., Any] | None, Callable[..
                 merged_filters["selected_document_paths"] = selected_paths
             logger.info(
                 "real_backend_hybrid_search selected_document_ids=%s selected_document_paths=%s",
-                selected_ids,
+                merged_filters.get("selected_document_ids", []),
                 selected_paths,
             )
             return base_hybrid_search(user_query, filters=merged_filters or None, top_k=top_k)
@@ -244,6 +250,7 @@ def build_real_backend_runners() -> tuple[Callable[..., Any] | None, Callable[..
             "selected_document_ids": selected_ids,
             "selected_document_paths": selected_paths,
             "local_llm_ui_enabled": bool(local_llm_settings and local_llm_settings.ui_enabled),
+            "retrieval_source": "persistent" if (local_scope_meta or {}).get("backend") == "persistent_postgres_qdrant" else "local",
         }
         if local_scope_meta:
             scope_meta.update(local_scope_meta)
