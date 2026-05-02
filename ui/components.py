@@ -134,7 +134,10 @@ def _render_upload_controls() -> None:
             else:
                 st.sidebar.success("Document ingested successfully.")
             st.rerun()
-        except Exception:  # pragma: no cover - defensive UI error handling
+        except Exception as exc:  # pragma: no cover - defensive UI error handling
+            if type(exc).__name__ == "PersistentIngestionSetupError":
+                st.sidebar.info(str(exc))
+                return
             import traceback
 
             st.sidebar.error("Persistent ingestion failed")

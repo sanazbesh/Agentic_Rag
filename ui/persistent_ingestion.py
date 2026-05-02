@@ -14,6 +14,13 @@ from ui.upload_manager import is_allowed_extension, sanitize_filename
 
 
 FAILED_STATUS = "FAILED"
+MISSING_DATABASE_URL_MESSAGE = (
+    "Persistent ingestion requires DATABASE_URL. Set DATABASE_URL or run the Docker Compose stack."
+)
+
+
+class PersistentIngestionSetupError(RuntimeError):
+    """Expected setup/configuration error for persistent ingestion UI."""
 
 
 @dataclass(slots=True, frozen=True)
@@ -50,7 +57,7 @@ def build_ingestion_runtime_from_env() -> IngestionRuntime:
 
     postgres_config = postgres_config_from_env()
     if not postgres_config.enabled:
-        raise RuntimeError("DATABASE_URL is required for persistent ingestion UI.")
+        raise PersistentIngestionSetupError(MISSING_DATABASE_URL_MESSAGE)
 
     engine = get_postgres_engine(postgres_config)
     Base.metadata.create_all(engine)
