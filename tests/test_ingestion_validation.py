@@ -17,7 +17,7 @@ from agentic_rag.ingestion_pipeline.document_registry import DocumentRegistry
 from agentic_rag.ingestion_pipeline.orchestrator import IngestionOrchestrator
 from agentic_rag.ingestion_pipeline.vector_indexing import ChildChunkVectorIndexingService
 from agentic_rag.storage.document_store import LocalDocumentStore
-from agentic_rag.storage.models import Base, Document
+from agentic_rag.storage.models import Base, Chunk, Document
 from agentic_rag.storage.models import LifecycleStatus
 from agentic_rag.types import Document as IngestedDocument
 
@@ -79,11 +79,18 @@ class NoopQdrantClient:
         return None
 
 
-def _build(session: Session, tmp_path, *, chunker: Chunker, markdown_ingestor: DocumentIngestor | None = None, with_vector: bool = False) -> IngestionOrchestrator:
+def _build(
+    session: Session,
+    tmp_path,
+    *,
+    chunker: Chunker,
+    markdown_ingestor: DocumentIngestor | None = None,
+    with_vector: bool = False,
+    disable_chunk_persistence: bool = False,
+) -> IngestionOrchestrator:
     vector_service = None
-    chunk_service = None
+    chunk_service = None if disable_chunk_persistence else ChunkPersistenceService(session=session)
     if with_vector:
-        chunk_service = ChunkPersistenceService(session=session)
         embedding = DenseEmbeddingService(config=DenseEmbeddingConfig(model_name="test", batch_size=8), backend=RecordingEmbeddingBackend())
         store = QdrantChildChunkStore(client=NoopQdrantClient(), collection_name="test")
         vector_service = ChildChunkVectorIndexingService(session=session, embedding_service=embedding, store=store)
@@ -139,14 +146,29 @@ def test_successful_ingestion_passes_validation(session: Session, tmp_path) -> N
     assert result.parent_chunk_count == 1
     assert result.child_chunk_count == 1
     assert result.indexed_vector_count == 1
+    assert result.parent_chunks_persisted == 1
+    assert result.child_chunks_persisted == 1
 
 
 def test_missing_persisted_chunks_fails_validation(session: Session, tmp_path) -> None:
     source = tmp_path / "g.md"
     source.write_text("# H\n\nBody", encoding="utf-8")
-    result = _build(session, tmp_path, chunker=GoodChunker()).ingest_file(source)
+    result = _build(session, tmp_path, chunker=GoodChunker(), disable_chunk_persistence=True).ingest_file(source)
     assert result.status == LifecycleStatus.FAILED
     assert "no persisted chunks" in (result.error_message or "")
+
+
+def test_txt_ingestion_persists_parent_and_child_chunks(session: Session, tmp_path) -> None:
+    source = tmp_path / "small.txt"
+    source.write_text("Heading\n\nBody text for chunking.", encoding="utf-8")
+    result = _build(session, tmp_path, chunker=GoodChunker(), with_vector=True).ingest_file(source)
+    assert result.status == LifecycleStatus.READY
+
+    persisted = session.query(Chunk).filter(Chunk.document_version_id == result.document_version_id).all()
+    parents = [chunk for chunk in persisted if chunk.chunk_type == "parent"]
+    children = [chunk for chunk in persisted if chunk.chunk_type == "child"]
+    assert len(parents) == 1
+    assert len(children) == 1
 
 
 def test_failed_validation_prevents_ready_promotion(session: Session, tmp_path) -> None:

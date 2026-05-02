@@ -38,6 +38,12 @@ class IngestionResult:
     parent_chunk_count: int = 0
     child_chunk_count: int = 0
     indexed_vector_count: int = 0
+    parsed_text_length: int = 0
+    parent_chunks_created: int = 0
+    child_chunks_created: int = 0
+    parent_chunks_persisted: int = 0
+    child_chunks_persisted: int = 0
+    vectors_indexed: int = 0
     error_message: str | None = None
 
 
@@ -64,7 +70,7 @@ class IngestionOrchestrator:
         self._pdf_ingestor = pdf_ingestor or PDFDocumentIngestor()
         self._chunker = chunker or MarkdownParentChildChunker()
         self._job_service = IngestionJobService(session)
-        self._chunk_persistence_service = chunk_persistence_service
+        self._chunk_persistence_service = chunk_persistence_service or ChunkPersistenceService(session=session)
         self._vector_indexing_service = vector_indexing_service
         self._validation_service = validation_service or IngestionValidationService(session)
 
@@ -101,14 +107,18 @@ class IngestionOrchestrator:
             chunking_result = self._chunk_documents(parsed_documents)
             if chunking_result is None:
                 raise RuntimeError("No parsed documents were available for chunking")
+            parsed_text_length = len("\n".join(document.text for document in parsed_documents).strip())
+            parent_chunks_created = len(chunking_result.parent_chunks)
+            child_chunks_created = len(chunking_result.child_chunks)
 
             persisted_chunks = None
-            if self._chunk_persistence_service is not None:
-                persisted_chunks = self._chunk_persistence_service.persist_chunks(
-                    document_id=document.id,
-                    document_version_id=version.id,
-                    chunking_result=chunking_result,
-                )
+            persisted_chunks = self._chunk_persistence_service.persist_chunks(
+                document_id=document.id,
+                document_version_id=version.id,
+                chunking_result=chunking_result,
+            )
+            parent_chunks_persisted = len([chunk for chunk in persisted_chunks if chunk.chunk_type == "parent"])
+            child_chunks_persisted = len([chunk for chunk in persisted_chunks if chunk.chunk_type == "child"])
             indexing_result: VectorIndexingResult | None = None
             if self._vector_indexing_service is not None:
                 indexing_result = self._vector_indexing_service.index_document_version(document_version_id=version.id)
@@ -146,6 +156,12 @@ class IngestionOrchestrator:
                 parent_chunk_count=len(chunking_result.parent_chunks),
                 child_chunk_count=len(chunking_result.child_chunks),
                 indexed_vector_count=(indexing_result.upserted_child_chunks if indexing_result is not None else 0),
+                parsed_text_length=parsed_text_length,
+                parent_chunks_created=parent_chunks_created,
+                child_chunks_created=child_chunks_created,
+                parent_chunks_persisted=parent_chunks_persisted,
+                child_chunks_persisted=child_chunks_persisted,
+                vectors_indexed=(indexing_result.upserted_child_chunks if indexing_result is not None else 0),
             )
         except Exception as exc:
             self._registry.update_version_status(version.id, LifecycleStatus.FAILED)
@@ -210,13 +226,19 @@ class IngestionOrchestrator:
                 storage_path=storage_path,
             )
             chunking_result = self._chunk_documents(parsed_documents)
+            if chunking_result is None:
+                raise RuntimeError("No parsed documents were available for chunking")
+            parsed_text_length = len("\n".join(document.text for document in parsed_documents).strip())
+            parent_chunks_created = len(chunking_result.parent_chunks)
+            child_chunks_created = len(chunking_result.child_chunks)
             persisted_chunks = None
-            if self._chunk_persistence_service is not None:
-                persisted_chunks = self._chunk_persistence_service.persist_chunks(
-                    document_id=registration.document.id,
-                    document_version_id=registration.version.id,
-                    chunking_result=chunking_result,
-                )
+            persisted_chunks = self._chunk_persistence_service.persist_chunks(
+                document_id=registration.document.id,
+                document_version_id=registration.version.id,
+                chunking_result=chunking_result,
+            )
+            parent_chunks_persisted = len([chunk for chunk in persisted_chunks if chunk.chunk_type == "parent"])
+            child_chunks_persisted = len([chunk for chunk in persisted_chunks if chunk.chunk_type == "child"])
             indexing_result: VectorIndexingResult | None = None
             if self._vector_indexing_service is not None:
                 indexing_result = self._vector_indexing_service.index_document_version(
@@ -251,6 +273,12 @@ class IngestionOrchestrator:
                 parent_chunk_count=len(chunking_result.parent_chunks),
                 child_chunk_count=len(chunking_result.child_chunks),
                 indexed_vector_count=(indexing_result.upserted_child_chunks if indexing_result is not None else 0),
+                parsed_text_length=parsed_text_length,
+                parent_chunks_created=parent_chunks_created,
+                child_chunks_created=child_chunks_created,
+                parent_chunks_persisted=parent_chunks_persisted,
+                child_chunks_persisted=child_chunks_persisted,
+                vectors_indexed=(indexing_result.upserted_child_chunks if indexing_result is not None else 0),
             )
         except Exception as exc:
             self._registry.update_version_status(registration.version.id, LifecycleStatus.FAILED)
@@ -313,13 +341,19 @@ class IngestionOrchestrator:
                 storage_path=storage_path,
             )
             chunking_result = self._chunk_documents(parsed_documents)
+            if chunking_result is None:
+                raise RuntimeError("No parsed documents were available for chunking")
+            parsed_text_length = len("\n".join(document.text for document in parsed_documents).strip())
+            parent_chunks_created = len(chunking_result.parent_chunks)
+            child_chunks_created = len(chunking_result.child_chunks)
             persisted_chunks = None
-            if self._chunk_persistence_service is not None:
-                persisted_chunks = self._chunk_persistence_service.persist_chunks(
-                    document_id=document.id,
-                    document_version_id=version.id,
-                    chunking_result=chunking_result,
-                )
+            persisted_chunks = self._chunk_persistence_service.persist_chunks(
+                document_id=document.id,
+                document_version_id=version.id,
+                chunking_result=chunking_result,
+            )
+            parent_chunks_persisted = len([chunk for chunk in persisted_chunks if chunk.chunk_type == "parent"])
+            child_chunks_persisted = len([chunk for chunk in persisted_chunks if chunk.chunk_type == "child"])
             indexing_result: VectorIndexingResult | None = None
             if self._vector_indexing_service is not None:
                 indexing_result = self._vector_indexing_service.index_document_version(document_version_id=version.id)
@@ -351,6 +385,12 @@ class IngestionOrchestrator:
                 parent_chunk_count=len(chunking_result.parent_chunks),
                 child_chunk_count=len(chunking_result.child_chunks),
                 indexed_vector_count=(indexing_result.upserted_child_chunks if indexing_result is not None else 0),
+                parsed_text_length=parsed_text_length,
+                parent_chunks_created=parent_chunks_created,
+                child_chunks_created=child_chunks_created,
+                parent_chunks_persisted=parent_chunks_persisted,
+                child_chunks_persisted=child_chunks_persisted,
+                vectors_indexed=(indexing_result.upserted_child_chunks if indexing_result is not None else 0),
             )
         except Exception as exc:
             self._registry.update_version_status(version.id, LifecycleStatus.FAILED)
