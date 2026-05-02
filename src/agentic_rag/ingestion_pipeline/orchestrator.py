@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import logging
 from pathlib import Path
 
 from sqlalchemy.orm import Session
@@ -20,6 +21,9 @@ from agentic_rag.ingestion_pipeline.vector_indexing import ChildChunkVectorIndex
 from agentic_rag.ingestion_pipeline.validation import IngestionValidationService
 from agentic_rag.storage.models import DocumentVersion, IngestionJob, LifecycleStatus
 from agentic_rag.types import Document
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True, frozen=True)
@@ -110,8 +114,10 @@ class IngestionOrchestrator:
             parsed_text_length = len("\n".join(document.text for document in parsed_documents).strip())
             parent_chunks_created = len(chunking_result.parent_chunks)
             child_chunks_created = len(chunking_result.child_chunks)
+            logger.info("ingestion_chunk_debug parsed_text_length=%s parent_chunks_created=%s child_chunks_created=%s", parsed_text_length, parent_chunks_created, child_chunks_created)
 
             persisted_chunks = None
+            logger.info("ingestion_chunk_debug calling_persistence=True document_id=%s document_version_id=%s", document.id, version.id)
             persisted_chunks = self._chunk_persistence_service.persist_chunks(
                 document_id=document.id,
                 document_version_id=version.id,
@@ -119,6 +125,7 @@ class IngestionOrchestrator:
             )
             parent_chunks_persisted = len([chunk for chunk in persisted_chunks if chunk.chunk_type == "parent"])
             child_chunks_persisted = len([chunk for chunk in persisted_chunks if chunk.chunk_type == "child"])
+            logger.info("ingestion_chunk_debug chunks_inserted=%s", len(persisted_chunks))
             indexing_result: VectorIndexingResult | None = None
             if self._vector_indexing_service is not None:
                 indexing_result = self._vector_indexing_service.index_document_version(document_version_id=version.id)
@@ -231,7 +238,9 @@ class IngestionOrchestrator:
             parsed_text_length = len("\n".join(document.text for document in parsed_documents).strip())
             parent_chunks_created = len(chunking_result.parent_chunks)
             child_chunks_created = len(chunking_result.child_chunks)
+            logger.info("ingestion_chunk_debug parsed_text_length=%s parent_chunks_created=%s child_chunks_created=%s", parsed_text_length, parent_chunks_created, child_chunks_created)
             persisted_chunks = None
+            logger.info("ingestion_chunk_debug calling_persistence=True document_id=%s document_version_id=%s", registration.document.id, registration.version.id)
             persisted_chunks = self._chunk_persistence_service.persist_chunks(
                 document_id=registration.document.id,
                 document_version_id=registration.version.id,
@@ -239,6 +248,7 @@ class IngestionOrchestrator:
             )
             parent_chunks_persisted = len([chunk for chunk in persisted_chunks if chunk.chunk_type == "parent"])
             child_chunks_persisted = len([chunk for chunk in persisted_chunks if chunk.chunk_type == "child"])
+            logger.info("ingestion_chunk_debug chunks_inserted=%s", len(persisted_chunks))
             indexing_result: VectorIndexingResult | None = None
             if self._vector_indexing_service is not None:
                 indexing_result = self._vector_indexing_service.index_document_version(
@@ -346,7 +356,9 @@ class IngestionOrchestrator:
             parsed_text_length = len("\n".join(document.text for document in parsed_documents).strip())
             parent_chunks_created = len(chunking_result.parent_chunks)
             child_chunks_created = len(chunking_result.child_chunks)
+            logger.info("ingestion_chunk_debug parsed_text_length=%s parent_chunks_created=%s child_chunks_created=%s", parsed_text_length, parent_chunks_created, child_chunks_created)
             persisted_chunks = None
+            logger.info("ingestion_chunk_debug calling_persistence=True document_id=%s document_version_id=%s", document.id, version.id)
             persisted_chunks = self._chunk_persistence_service.persist_chunks(
                 document_id=document.id,
                 document_version_id=version.id,
@@ -354,6 +366,7 @@ class IngestionOrchestrator:
             )
             parent_chunks_persisted = len([chunk for chunk in persisted_chunks if chunk.chunk_type == "parent"])
             child_chunks_persisted = len([chunk for chunk in persisted_chunks if chunk.chunk_type == "child"])
+            logger.info("ingestion_chunk_debug chunks_inserted=%s", len(persisted_chunks))
             indexing_result: VectorIndexingResult | None = None
             if self._vector_indexing_service is not None:
                 indexing_result = self._vector_indexing_service.index_document_version(document_version_id=version.id)

@@ -171,6 +171,16 @@ def test_txt_ingestion_persists_parent_and_child_chunks(session: Session, tmp_pa
     assert len(children) == 1
 
 
+
+def test_validation_uses_provided_persisted_chunks_when_available(session: Session, tmp_path) -> None:
+    source = tmp_path / "h.md"
+    source.write_text("# H\n\nBody", encoding="utf-8")
+    orchestrator = _build(session, tmp_path, chunker=GoodChunker(), with_vector=True)
+    result = orchestrator.ingest_file(source)
+    assert result.status == LifecycleStatus.READY
+    assert result.parent_chunks_persisted == 1
+    assert result.child_chunks_persisted == 1
+
 def test_failed_validation_prevents_ready_promotion(session: Session, tmp_path) -> None:
     source = tmp_path / "f.md"
     source.write_text("# V1\n\nBody", encoding="utf-8")
