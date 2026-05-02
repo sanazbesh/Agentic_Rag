@@ -84,3 +84,12 @@ def test_file_uploader_extensions_guard_against_type_object(monkeypatch) -> None
     monkeypatch.setattr(components, "ALLOWED_EXTENSIONS", type)
 
     assert components._file_uploader_types() == ["md", "pdf", "txt"]
+
+
+def test_file_uploader_extensions_guard_against_type_members(monkeypatch) -> None:
+    _install_streamlit_stub()
+    import ui.components as components
+
+    monkeypatch.setattr(components, "ALLOWED_EXTENSIONS", ["pdf", type])
+
+    assert components._file_uploader_types() == ["md", "pdf", "txt"]
