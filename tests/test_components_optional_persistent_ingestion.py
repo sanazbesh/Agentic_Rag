@@ -36,6 +36,10 @@ def test_ui_components_imports_when_sqlalchemy_missing(monkeypatch) -> None:
 def test_persistent_ingestion_dependency_error_is_reported(monkeypatch) -> None:
     _install_streamlit_stub()
     import ui.components as components
+    class SessionState(dict):
+        __getattr__ = dict.get
+        def __setattr__(self, key, value):
+            self[key] = value
 
     original_import = builtins.__import__
 
@@ -93,3 +97,51 @@ def test_file_uploader_extensions_guard_against_type_members(monkeypatch) -> Non
     monkeypatch.setattr(components, "ALLOWED_EXTENSIONS", ["pdf", type])
 
     assert components._file_uploader_types() == ["md", "pdf", "txt"]
+
+
+def test_persistent_ingestion_exception_renders_traceback_in_ui(monkeypatch) -> None:
+    _install_streamlit_stub()
+    import ui.components as components
+    class SessionState(dict):
+        __getattr__ = dict.get
+
+        def __setattr__(self, key, value):
+            self[key] = value
+
+    class SidebarStub:
+        def __init__(self) -> None:
+            self.errors: list[str] = []
+            self.codes: list[str] = []
+
+        def subheader(self, *_args, **_kwargs): pass
+        def file_uploader(self, *_args, **kwargs):
+            return None if kwargs.get("accept_multiple_files") else object()
+        def info(self, *_args, **_kwargs): pass
+        def button(self, label: str, *_args, **_kwargs): return label == "Ingest uploaded document"
+        def error(self, message: str): self.errors.append(message)
+        def code(self, message: str): self.codes.append(message)
+        def markdown(self, *_args, **_kwargs): pass
+        def json(self, *_args, **_kwargs): pass
+        def divider(self): pass
+        def caption(self, *_args, **_kwargs): pass
+        def success(self, *_args, **_kwargs): pass
+        def warning(self, *_args, **_kwargs): pass
+
+    sidebar = SidebarStub()
+    monkeypatch.setattr(components.st, "sidebar", sidebar)
+    monkeypatch.setattr(components.st, "session_state", SessionState(uploaded_documents=[]))
+    monkeypatch.setattr(components.st, "rerun", lambda: None, raising=False)
+
+    def explode_runtime():
+        raise TypeError("object of type 'type' has no len()")
+
+    monkeypatch.setattr(
+        components,
+        "_load_persistent_ingestion_dependencies",
+        lambda: (explode_runtime, lambda *_a, **_k: None, None),
+    )
+
+    components._render_upload_controls()
+
+    assert sidebar.errors == ["Persistent ingestion failed"]
+    assert sidebar.codes and "TypeError: object of type 'type' has no len()" in sidebar.codes[0]

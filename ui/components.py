@@ -134,11 +134,11 @@ def _render_upload_controls() -> None:
             else:
                 st.sidebar.success("Document ingested successfully.")
             st.rerun()
-        except Exception as exc:  # pragma: no cover - defensive UI error handling
-            st.sidebar.error(f"Persistent ingestion failed: {type(exc).__name__}: {exc}")
-            if st.session_state.get("show_debug", False):
-                import traceback
-                st.code(traceback.format_exc())
+        except Exception:  # pragma: no cover - defensive UI error handling
+            import traceback
+
+            st.sidebar.error("Persistent ingestion failed")
+            st.sidebar.code(traceback.format_exc())
 
     latest_ingestion_result = st.session_state.get("latest_ingestion_result")
     if latest_ingestion_result is not None:
@@ -438,16 +438,11 @@ def render_sidebar(
                     persisted_document_descriptors = [
                         to_document_descriptor(ready_map[doc_id]) for doc_id in selected_ready_ids
                     ]
-        except Exception as exc:
-            error_type = type(exc).__name__
-            message = str(exc)
-            if error_type == "PersistedDocumentServiceError" and "Database unavailable:" in message:
-                st.sidebar.error(message)
-            else:
-                st.sidebar.error(f"Failed to load persisted documents: {error_type}: {message}")
-            if st.session_state.get("show_debug", False):
-                import traceback
-                st.code(traceback.format_exc())
+        except Exception:
+            import traceback
+
+            st.sidebar.error("Failed to load persisted documents")
+            st.sidebar.code(traceback.format_exc())
 
     available_documents = get_available_documents(
         use_mock_backend=use_mock_backend,
