@@ -96,7 +96,7 @@ def _render_upload_controls() -> None:
     build_runtime, ingest_uploaded, ingestion_dependency_error = _load_persistent_ingestion_dependencies()
     persistent_upload = st.sidebar.file_uploader(
         "Upload for persistent ingestion (.pdf, .md, .txt)",
-        type=sorted(ALLOWED_EXTENSIONS),
+        type=_file_uploader_types(),
         accept_multiple_files=False,
         key="persistent_ingestion_upload",
         help="This stores files in the persistent document store via IngestionOrchestrator.",
@@ -141,7 +141,7 @@ def _render_upload_controls() -> None:
     st.sidebar.subheader("Upload legal documents")
     uploaded_files = st.sidebar.file_uploader(
         "Upload .pdf, .md, or .txt files",
-        type=sorted(ALLOWED_EXTENSIONS),
+        type=_file_uploader_types(),
         accept_multiple_files=True,
         help="Files are stored locally in data/uploads for this test UI.",
     )
@@ -663,3 +663,15 @@ def render_download_button(final_result: dict[str, Any], debug_payload: dict[str
         mime="application/json",
         use_container_width=False,
     )
+def _file_uploader_types() -> list[str]:
+    """Return Streamlit-safe upload extension list.
+
+    Streamlit's ``file_uploader(..., type=...)`` calls ``len(type)`` internally,
+    so passing a Python ``type`` object crashes with
+    ``TypeError: object of type 'type' has no len()``.
+    """
+
+    configured = ALLOWED_EXTENSIONS
+    if isinstance(configured, type):
+        return ["md", "pdf", "txt"]
+    return sorted(str(ext).lstrip(".") for ext in configured)
