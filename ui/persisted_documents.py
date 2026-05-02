@@ -7,6 +7,8 @@ from datetime import datetime
 from types import GenericAlias
 from typing import Any
 
+from ui.status_utils import normalize_status
+
 
 @dataclass(slots=True, frozen=True)
 class PersistedDocumentRow:
@@ -59,7 +61,7 @@ def list_persisted_documents() -> list[PersistedDocumentRow]:
             document_id=row.id,
             source_name=row.source_name,
             source_type=row.source_type,
-            status=row.status.value if hasattr(row.status, "value") else str(row.status),
+            status=normalize_status(row.status) or "",
             current_version_id=row.current_version_id,
             updated_at=row.updated_at,
         )

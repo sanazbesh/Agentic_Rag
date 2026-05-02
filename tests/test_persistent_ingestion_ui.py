@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -10,6 +11,7 @@ sessionmaker = pytest.importorskip("sqlalchemy.orm").sessionmaker
 
 from agentic_rag.storage.models import Base, LifecycleStatus
 from ui.persistent_ingestion import IngestionRuntime, ingest_uploaded_document
+from ui.status_utils import normalize_status
 
 
 class DummyUploadedFile:
@@ -70,3 +72,50 @@ def test_ingest_uploaded_document_marks_duplicate_versions(tmp_path: Path) -> No
     assert first.document_version_id == second.document_version_id
     assert second.duplicate_document is True
     assert second.status_from_database is True
+
+
+def test_normalize_status_handles_enum_string_and_none() -> None:
+    assert normalize_status(LifecycleStatus.PROCESSING) == "PROCESSING"
+    assert normalize_status("READY") == "READY"
+    assert normalize_status(None) is None
+
+
+def test_ingest_uploaded_document_accepts_string_job_status(monkeypatch, tmp_path: Path) -> None:
+    from ui import persistent_ingestion as module
+
+    class DummySession:
+        def get(self, _model, _job_id):
+            return SimpleNamespace(status="PROCESSING", error_message=None)
+
+    class DummySessionFactory:
+        def __call__(self):
+            return self
+
+        def __enter__(self):
+            return DummySession()
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    runtime = IngestionRuntime(
+        session_factory=DummySessionFactory(),
+        document_store_root=tmp_path / "documents",
+    )
+
+    monkeypatch.setattr(
+        module,
+        "_run_ingestion",
+        lambda **_: SimpleNamespace(
+            document_id="doc-1",
+            document_version_id="ver-1",
+            job_id="job-1",
+            status=LifecycleStatus.PROCESSING,
+            error_message=None,
+            created_version=True,
+        ),
+    )
+
+    result = ingest_uploaded_document(DummyUploadedFile("policy.md", b"# Policy"), runtime=runtime)
+
+    assert result.status == "PROCESSING"
+    assert result.ingestion_job_id == "job-1"
