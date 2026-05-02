@@ -195,3 +195,17 @@ def test_failed_validation_prevents_ready_promotion(session: Session, tmp_path) 
     assert persisted_document is not None
     assert persisted_document.current_version_id == ok.document_version_id
     assert persisted_document.status == LifecycleStatus.READY
+
+
+def test_ingestion_debug_fields_report_chunk_persistence(session: Session, tmp_path) -> None:
+    source = tmp_path / "debug.txt"
+    source.write_text("Heading\n\nBody", encoding="utf-8")
+    result = _build(session, tmp_path, chunker=GoodChunker(), with_vector=True).ingest_file(source)
+
+    assert result.parsed_text_length > 0
+    assert result.parent_chunks_created == 1
+    assert result.child_chunks_created == 1
+    assert result.chunk_persistence_called is True
+    assert result.parent_chunks_persisted == 1
+    assert result.child_chunks_persisted == 1
+    assert result.vectors_indexed == 1
