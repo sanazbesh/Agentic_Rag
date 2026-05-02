@@ -89,6 +89,21 @@ def initialize_session_state() -> None:
         st.session_state.setdefault(key, value)
 
 
+
+
+def _safe_session_list(value: Any) -> list[Any]:
+    """Normalize session-state list-like values and guard against type objects."""
+
+    if isinstance(value, type):
+        return []
+    if isinstance(value, list):
+        return value
+    try:
+        return list(value)
+    except TypeError:
+        return []
+
+
 def _render_upload_controls() -> None:
     """Render local upload controls and update uploaded-document session registry."""
 
@@ -121,6 +136,9 @@ def _render_upload_controls() -> None:
             st.rerun()
         except Exception as exc:  # pragma: no cover - defensive UI error handling
             st.sidebar.error(f"Persistent ingestion failed: {type(exc).__name__}: {exc}")
+            if st.session_state.get("show_debug", False):
+                import traceback
+                st.code(traceback.format_exc())
 
     latest_ingestion_result = st.session_state.get("latest_ingestion_result")
     if latest_ingestion_result is not None:
@@ -397,11 +415,9 @@ def render_sidebar(
                 else:
                     ready_options = [row.document_id for row in ready_rows]
                     ready_map = {row.document_id: row for row in ready_rows}
-                    default_ready_ids = [
-                        doc_id
-                        for doc_id in st.session_state.selected_persisted_document_ids
-                        if doc_id in ready_map
-                    ]
+                    selected_persisted_ids = _safe_session_list(st.session_state.get("selected_persisted_document_ids", []))
+                    st.session_state.selected_persisted_document_ids = selected_persisted_ids
+                    default_ready_ids = [doc_id for doc_id in selected_persisted_ids if doc_id in ready_map]
                     selected_ready_ids = st.sidebar.multiselect(
                         "Persisted READY documents",
                         options=ready_options,
@@ -429,6 +445,9 @@ def render_sidebar(
                 st.sidebar.error(message)
             else:
                 st.sidebar.error(f"Failed to load persisted documents: {error_type}: {message}")
+            if st.session_state.get("show_debug", False):
+                import traceback
+                st.code(traceback.format_exc())
 
     available_documents = get_available_documents(
         use_mock_backend=use_mock_backend,
@@ -436,11 +455,13 @@ def render_sidebar(
     )
     document_options = {doc["id"]: doc for doc in available_documents}
 
-    valid_defaults = [doc_id for doc_id in st.session_state.selected_document_ids if doc_id in document_options]
+    selected_document_ids_state = _safe_session_list(st.session_state.get("selected_document_ids", []))
+    st.session_state.selected_document_ids = selected_document_ids_state
+    valid_defaults = [doc_id for doc_id in selected_document_ids_state if doc_id in document_options]
     if not valid_defaults and st.session_state.uploaded_documents:
         uploaded_ids = [str(doc.get("id")) for doc in st.session_state.uploaded_documents if doc.get("id")]
         valid_defaults = [doc_id for doc_id in uploaded_ids if doc_id in document_options]
-    if len(valid_defaults) != len(st.session_state.selected_document_ids):
+    if len(valid_defaults) != len(selected_document_ids_state):
         st.session_state.selected_document_ids = valid_defaults
 
     selected_document_ids = st.sidebar.multiselect(
