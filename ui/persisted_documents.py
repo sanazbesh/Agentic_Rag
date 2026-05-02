@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from types import GenericAlias
 from typing import Any
 
 
@@ -19,6 +20,13 @@ class PersistedDocumentRow:
 
 class PersistedDocumentServiceError(RuntimeError):
     """Raised when persisted document listing cannot be completed."""
+
+
+def _raise_if_type_object(value: Any, *, label: str) -> None:
+    if isinstance(value, (type, GenericAlias)):
+        raise PersistedDocumentServiceError(
+            f"Invalid {label}: expected iterable/instances, got type object {value!r}."
+        )
 
 
 def list_persisted_documents() -> list[PersistedDocumentRow]:
@@ -39,8 +47,10 @@ def list_persisted_documents() -> list[PersistedDocumentRow]:
     try:
         engine = get_postgres_engine(postgres_config)
         session_factory = get_postgres_session_factory(engine)
+        _raise_if_type_object(session_factory, label="session factory")
         with session_factory() as session:
             rows = session.execute(select(Document).order_by(Document.updated_at.desc())).scalars().all()
+            _raise_if_type_object(rows, label="document query result")
     except Exception as exc:  # pragma: no cover - defensive runtime guard
         raise PersistedDocumentServiceError(f"Database unavailable: {type(exc).__name__}: {exc}") from exc
 
@@ -58,6 +68,7 @@ def list_persisted_documents() -> list[PersistedDocumentRow]:
 
 
 def ready_persisted_documents(rows: list[PersistedDocumentRow]) -> list[PersistedDocumentRow]:
+    _raise_if_type_object(rows, label="persisted document rows")
     return [row for row in rows if row.status == "READY"]
 
 
