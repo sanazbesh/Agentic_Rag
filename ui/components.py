@@ -124,6 +124,8 @@ def _render_upload_controls() -> None:
         disabled=persistent_upload is None or ingestion_dependency_error is not None,
     ):
         try:
+            from ui.persistent_ingestion import PersistentIngestionSetupError
+
             runtime = build_runtime()
             ingestion_result = ingest_uploaded(persistent_upload, runtime=runtime)
             st.session_state.latest_ingestion_result = ingestion_result
@@ -134,6 +136,8 @@ def _render_upload_controls() -> None:
             else:
                 st.sidebar.success("Document ingested successfully.")
             st.rerun()
+        except PersistentIngestionSetupError as exc:
+            st.sidebar.info(str(exc))
         except Exception:  # pragma: no cover - defensive UI error handling
             import traceback
 
