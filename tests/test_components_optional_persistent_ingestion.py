@@ -75,3 +75,12 @@ def test_persisted_document_dependency_error_is_reported(monkeypatch) -> None:
     assert to_descriptor is None
     assert error_message is not None
     assert "Persisted document selection is unavailable" in error_message
+
+
+def test_file_uploader_extensions_guard_against_type_object(monkeypatch) -> None:
+    _install_streamlit_stub()
+    import ui.components as components
+
+    monkeypatch.setattr(components, "ALLOWED_EXTENSIONS", type)
+
+    assert components._file_uploader_types() == ["md", "pdf", "txt"]
