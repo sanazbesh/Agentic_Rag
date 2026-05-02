@@ -57,6 +57,94 @@ from ui.review_queue_dashboard import render_review_queue_dashboard
 from ui.debug_payload import build_real_debug_payload
 
 
+def _has_persisted_selection(selected_docs: list[dict[str, Any]]) -> bool:
+    return any(str(doc.get("source", "")) == "persisted" and doc.get("document_id") for doc in selected_docs)
+
+
+def _build_persistent_backend_dependencies(selected_docs: list[dict[str, Any]]) -> tuple[Any | None, dict[str, Any], str | None]:
+    """Build retrieval dependencies for persisted Postgres+Qdrant docs only."""
+
+    persisted_docs = [doc for doc in selected_docs if str(doc.get("source", "")) == "persisted" and doc.get("document_id")]
+    if not persisted_docs:
+        return None, {}, None
+    try:
+        from sqlalchemy import func, select
+        from qdrant_client import QdrantClient
+
+        from agentic_rag.ingestion_pipeline.vector_indexing import qdrant_config_from_env
+        from agentic_rag.indexing.dense_child_chunks import DEFAULT_COLLECTION_NAME
+        from agentic_rag.orchestration.legal_rag_graph import LegalRagDependencies
+        from agentic_rag.orchestration.retrieval_graph import RetrievalDependencies, llm_assisted_decomposition_plan
+        from agentic_rag.retrieval import (
+            ChildChunkSearcher,
+            ChunkReranker,
+            KeywordSearchService,
+            ParentChildRetrievalTools,
+            ParentChunkStore,
+            PostgresChunkRepository,
+            PostgresResolvedQdrantChildRepository,
+            QdrantResultResolver,
+        )
+        from agentic_rag.storage import get_postgres_engine, get_postgres_session_factory, postgres_config_from_env
+        from agentic_rag.storage.models import Chunk
+        from agentic_rag.tools import LegalAnswerSynthesizer, compress_context, extract_legal_entities
+        from agentic_rag.tools.query_intelligence import QueryTransformationService
+    except Exception as exc:
+        return None, {}, f"Persistent backend unavailable: {type(exc).__name__}: {exc}"
+
+    class _QdrantDenseSearch:
+        def __init__(self, client: Any, collection_name: str) -> None:
+            self.client = client
+            self.collection_name = collection_name
+
+        def search(self, query: str, *, filters: dict[str, Any] | None = None, limit: int = 10) -> list[dict[str, Any]]:
+            points = self.client.query_points(collection_name=self.collection_name, query=query, limit=limit).points
+            return [{"id": str(point.id), "score": point.score, "payload": dict(point.payload or {})} for point in points]
+
+    class _EmptyKeywordRepository:
+        def search_keyword(self, query: str, *, filters: dict[str, Any] | None = None, limit: int = 10) -> list[Any]:
+            del query, filters, limit
+            return []
+
+    postgres_config = postgres_config_from_env()
+    engine = get_postgres_engine(postgres_config)
+    session_factory = get_postgres_session_factory(engine)
+    session = session_factory()
+    chunk_repo = PostgresChunkRepository(session=session)
+    qdrant = QdrantClient(url=qdrant_config_from_env().url)
+    child_repo = PostgresResolvedQdrantChildRepository(
+        qdrant_backend=_QdrantDenseSearch(qdrant, DEFAULT_COLLECTION_NAME),
+        resolver=QdrantResultResolver(chunk_repository=chunk_repo),
+    )
+    retrieval_tools = ParentChildRetrievalTools(
+        child_searcher=ChildChunkSearcher(repository=child_repo, default_limit=20),
+        parent_store=ParentChunkStore(repository=chunk_repo),
+        keyword_search_service=KeywordSearchService(repository=_EmptyKeywordRepository(), default_limit=20),
+        chunk_reranker=ChunkReranker(),
+    )
+    rewrite_service = QueryTransformationService()
+    retrieval_dependencies = RetrievalDependencies(
+        rewrite_query=rewrite_service.rewrite_query,
+        extract_legal_entities=extract_legal_entities,
+        hybrid_search=retrieval_tools.hybrid_search,
+        rerank_chunks=retrieval_tools.rerank_chunks,
+        retrieve_parent_chunks=retrieval_tools.retrieve_parent_chunks,
+        compress_context=compress_context,
+        plan_decomposition=llm_assisted_decomposition_plan,
+    )
+    persisted_doc_ids = [str(doc["document_id"]) for doc in persisted_docs]
+    persisted_ver_ids = [str(doc.get("document_version_id")) for doc in persisted_docs if doc.get("document_version_id")]
+    child_count = session.execute(select(func.count(Chunk.id)).where(Chunk.document_id.in_(persisted_doc_ids), Chunk.chunk_type == "child")).scalar_one()
+    deps = LegalRagDependencies(retrieval=retrieval_dependencies, generate_grounded_answer=LegalAnswerSynthesizer().generate)
+    return deps, {
+        "backend": "persistent_postgres_qdrant",
+        "persisted_document_count": len(persisted_docs),
+        "persisted_child_chunk_count": int(child_count),
+        "selected_document_ids": persisted_doc_ids,
+        "selected_document_version_ids": persisted_ver_ids,
+    }, None
+
+
 st.set_page_config(page_title="Legal RAG Test UI", layout="wide")
 
 
@@ -106,9 +194,16 @@ def build_real_backend_runners() -> tuple[Callable[..., Any] | None, Callable[..
         local_scope_meta: dict[str, Any] | None = None
 
         if active_dependencies is None:
-            local_backend = build_local_backend_dependencies(selected_docs, local_llm_settings=local_llm_settings)
-            active_dependencies = local_backend.dependencies
-            local_scope_meta = dict(local_backend.scope_meta)
+            persistent_dependencies, persistent_scope_meta, persistent_error = _build_persistent_backend_dependencies(selected_docs)
+            if persistent_dependencies is not None:
+                active_dependencies = persistent_dependencies
+                local_scope_meta = dict(persistent_scope_meta)
+            else:
+                if persistent_error and _has_persisted_selection(selected_docs):
+                    logger.warning("persistent_backend_fallback_to_local reason=%s", persistent_error)
+                local_backend = build_local_backend_dependencies(selected_docs, local_llm_settings=local_llm_settings)
+                active_dependencies = local_backend.dependencies
+                local_scope_meta = dict(local_backend.scope_meta)
 
         base_hybrid_search = active_dependencies.retrieval.hybrid_search
 
@@ -116,6 +211,9 @@ def build_real_backend_runners() -> tuple[Callable[..., Any] | None, Callable[..
             merged_filters = dict(filters or {})
             if selected_ids:
                 merged_filters["selected_document_ids"] = selected_ids
+            selected_version_ids = [str(doc.get("document_version_id")) for doc in selected_docs if doc.get("document_version_id")]
+            if selected_version_ids:
+                merged_filters["selected_document_version_ids"] = selected_version_ids
             if selected_paths:
                 merged_filters["selected_document_paths"] = selected_paths
             logger.info(
