@@ -43,6 +43,22 @@ def test_ingest_uploaded_document_rejects_unsupported_type(tmp_path: Path) -> No
     assert result.ingestion_job_id is None
 
 
+
+
+def test_ingest_uploaded_document_rejects_type_payload(tmp_path: Path) -> None:
+    class InvalidPayloadUpload:
+        name = "bad.md"
+
+        @staticmethod
+        def getvalue():
+            return type
+
+    result = ingest_uploaded_document(InvalidPayloadUpload(), runtime=_runtime(tmp_path))
+
+    assert result.status == LifecycleStatus.FAILED.value
+    assert result.error_message == "Uploaded file payload is invalid. Expected bytes content."
+    assert result.document_id is None
+    assert result.ingestion_job_id is None
 def test_ingest_uploaded_document_marks_duplicate_versions(tmp_path: Path) -> None:
     runtime = _runtime(tmp_path)
     first = ingest_uploaded_document(DummyUploadedFile("policy.md", b"# Policy\n\nBody"), runtime=runtime)
