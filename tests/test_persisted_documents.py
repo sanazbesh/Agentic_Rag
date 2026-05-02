@@ -47,3 +47,19 @@ def test_ready_persisted_documents_filters_non_ready() -> None:
     ]
     ready = ready_persisted_documents(rows)
     assert [row.document_id for row in ready] == ["1"]
+
+
+def test_ready_persisted_documents_rejects_type_input() -> None:
+    with pytest.raises(Exception, match="expected iterable/instances, got type object"):
+        ready_persisted_documents(PersistedDocumentRow)
+
+
+def test_list_persisted_documents_rejects_type_session_factory(monkeypatch) -> None:
+    import agentic_rag.storage as storage
+
+    monkeypatch.setattr(storage, "postgres_config_from_env", lambda: type("C", (), {"enabled": True})())
+    monkeypatch.setattr(storage, "get_postgres_engine", lambda config: object())
+    monkeypatch.setattr(storage, "get_postgres_session_factory", lambda _engine: type)
+
+    with pytest.raises(Exception, match="Invalid session factory"):
+        list_persisted_documents()
