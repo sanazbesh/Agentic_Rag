@@ -99,6 +99,24 @@ def test_successful_orchestration_registers_and_stores_file(session: Session, tm
     assert persisted_version.status == LifecycleStatus.READY
 
 
+def test_txt_ingestion_does_not_fail_on_page_content_lookup(session: Session, tmp_path) -> None:
+    source_file = tmp_path / "uploads" / "notes.txt"
+    source_file.parent.mkdir(parents=True)
+    source_file.write_text("Plain text body for ingestion.", encoding="utf-8")
+
+    store = LocalDocumentStore(tmp_path / "documents")
+    registry = DocumentRegistry(session)
+    orchestrator = IngestionOrchestrator(
+        session=session,
+        registry=registry,
+        document_store=store,
+    )
+
+    result = orchestrator.ingest_file(source_file)
+
+    assert result.status == LifecycleStatus.READY
+    assert result.error_message is None
+
 def test_duplicate_content_reuses_existing_document_version(session: Session, tmp_path) -> None:
     source_file = tmp_path / "uploads" / "dup.md"
     source_file.parent.mkdir(parents=True)
