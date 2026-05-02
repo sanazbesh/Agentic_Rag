@@ -134,8 +134,19 @@ def test_missing_qdrant_point_id_fails_validation_after_indexing(session: Sessio
 def test_successful_ingestion_passes_validation(session: Session, tmp_path) -> None:
     source = tmp_path / "e.md"
     source.write_text("# H\n\nBody", encoding="utf-8")
-    result = _build(session, tmp_path, chunker=GoodChunker()).ingest_file(source)
+    result = _build(session, tmp_path, chunker=GoodChunker(), with_vector=True).ingest_file(source)
     assert result.status == LifecycleStatus.READY
+    assert result.parent_chunk_count == 1
+    assert result.child_chunk_count == 1
+    assert result.indexed_vector_count == 1
+
+
+def test_missing_persisted_chunks_fails_validation(session: Session, tmp_path) -> None:
+    source = tmp_path / "g.md"
+    source.write_text("# H\n\nBody", encoding="utf-8")
+    result = _build(session, tmp_path, chunker=GoodChunker()).ingest_file(source)
+    assert result.status == LifecycleStatus.FAILED
+    assert "no persisted chunks" in (result.error_message or "")
 
 
 def test_failed_validation_prevents_ready_promotion(session: Session, tmp_path) -> None:

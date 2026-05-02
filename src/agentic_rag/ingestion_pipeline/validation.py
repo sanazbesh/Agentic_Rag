@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
 from agentic_rag.chunking.models import ChunkingResult
 from agentic_rag.ingestion_pipeline.chunk_persistence import CHILD_CHUNK_TYPE, PARENT_CHUNK_TYPE
 from agentic_rag.ingestion_pipeline.vector_indexing import VectorIndexingResult
@@ -19,6 +22,8 @@ class ValidationResult:
 
 class IngestionValidationService:
     """Run deterministic quality gates prior to READY status transitions."""
+    def __init__(self, session: Session) -> None:
+        self._session = session
 
     def validate(
         self,
@@ -49,34 +54,47 @@ class IngestionValidationService:
         if invalid_child is not None:
             return ValidationResult(is_valid=False, error_message=f"Validation failed: child chunk {invalid_child.child_chunk_id} has empty text")
 
-        if persisted_chunks is not None:
-            persisted_children = [chunk for chunk in persisted_chunks if chunk.chunk_type == CHILD_CHUNK_TYPE]
-            persisted_parents = [chunk for chunk in persisted_chunks if chunk.chunk_type == PARENT_CHUNK_TYPE]
-            if not persisted_parents:
-                return ValidationResult(is_valid=False, error_message="Validation failed: no persisted parent chunks found")
-            if not persisted_children:
-                return ValidationResult(is_valid=False, error_message="Validation failed: no persisted child chunks found")
+        persisted = self._persisted_chunks_for_version(document_version.id)
+        if not persisted:
+            return ValidationResult(is_valid=False, error_message="Validation failed: no persisted chunks found")
 
-            empty_child = next((chunk for chunk in persisted_children if not chunk.text.strip()), None)
-            if empty_child is not None:
-                return ValidationResult(is_valid=False, error_message=f"Validation failed: persisted child chunk {empty_child.id} has empty text")
+        persisted_children = [chunk for chunk in persisted if chunk.chunk_type == CHILD_CHUNK_TYPE]
+        persisted_parents = [chunk for chunk in persisted if chunk.chunk_type == PARENT_CHUNK_TYPE]
+        if not persisted_parents:
+            return ValidationResult(is_valid=False, error_message="Validation failed: no persisted parent chunks found")
+        if not persisted_children:
+            return ValidationResult(is_valid=False, error_message="Validation failed: no persisted child chunks found")
 
-            if indexing_result is not None:
-                missing_point = next((chunk for chunk in persisted_children if not chunk.qdrant_point_id), None)
-                if missing_point is not None:
-                    return ValidationResult(is_valid=False, error_message=f"Validation failed: child chunk {missing_point.id} is missing qdrant_point_id")
+        empty_child = next((chunk for chunk in persisted_children if not chunk.text.strip()), None)
+        if empty_child is not None:
+            return ValidationResult(is_valid=False, error_message=f"Validation failed: persisted child chunk {empty_child.id} has empty text")
 
-                expected_indexed = len(persisted_children)
-                if indexing_result.upserted_child_chunks != expected_indexed:
-                    return ValidationResult(
-                        is_valid=False,
-                        error_message=(
-                            "Validation failed: vector upsert count mismatch "
-                            f"(upserted={indexing_result.upserted_child_chunks}, expected={expected_indexed})"
-                        ),
-                    )
+        missing_point = next((chunk for chunk in persisted_children if not chunk.qdrant_point_id), None)
+        if missing_point is not None:
+            return ValidationResult(is_valid=False, error_message=f"Validation failed: child chunk {missing_point.id} is missing qdrant_point_id")
+
+        if indexing_result is None:
+            return ValidationResult(is_valid=False, error_message="Validation failed: vector indexing did not run")
+
+        expected_indexed = len(persisted_children)
+        if indexing_result.upserted_child_chunks != expected_indexed:
+            return ValidationResult(
+                is_valid=False,
+                error_message=(
+                    "Validation failed: vector upsert count mismatch "
+                    f"(upserted={indexing_result.upserted_child_chunks}, expected={expected_indexed})"
+                ),
+            )
 
         return ValidationResult(is_valid=True)
+
+    def _persisted_chunks_for_version(self, document_version_id: str) -> list[Chunk]:
+        query = (
+            select(Chunk)
+            .where(Chunk.document_version_id == document_version_id)
+            .order_by(Chunk.chunk_type.asc(), Chunk.id.asc())
+        )
+        return list(self._session.execute(query).scalars().all())
 
 
 __all__ = ["IngestionValidationService", "ValidationResult"]

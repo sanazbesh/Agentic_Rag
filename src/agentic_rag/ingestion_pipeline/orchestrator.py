@@ -35,6 +35,9 @@ class IngestionResult:
     storage_path: str
     parsed_documents: list[Document] = field(default_factory=list)
     chunking_result: ChunkingResult | None = None
+    parent_chunk_count: int = 0
+    child_chunk_count: int = 0
+    indexed_vector_count: int = 0
     error_message: str | None = None
 
 
@@ -63,7 +66,7 @@ class IngestionOrchestrator:
         self._job_service = IngestionJobService(session)
         self._chunk_persistence_service = chunk_persistence_service
         self._vector_indexing_service = vector_indexing_service
-        self._validation_service = validation_service or IngestionValidationService()
+        self._validation_service = validation_service or IngestionValidationService(session)
 
     def reindex_document(self, document_id: str) -> IngestionResult:
         version = self._registry.get_current_ready_version(document_id)
@@ -140,6 +143,9 @@ class IngestionOrchestrator:
                 storage_path=version.storage_path,
                 parsed_documents=parsed_documents,
                 chunking_result=chunking_result,
+                parent_chunk_count=len(chunking_result.parent_chunks),
+                child_chunk_count=len(chunking_result.child_chunks),
+                indexed_vector_count=(indexing_result.upserted_child_chunks if indexing_result is not None else 0),
             )
         except Exception as exc:
             self._registry.update_version_status(version.id, LifecycleStatus.FAILED)
@@ -242,6 +248,9 @@ class IngestionOrchestrator:
                 storage_path=storage_path,
                 parsed_documents=parsed_documents,
                 chunking_result=chunking_result,
+                parent_chunk_count=len(chunking_result.parent_chunks),
+                child_chunk_count=len(chunking_result.child_chunks),
+                indexed_vector_count=(indexing_result.upserted_child_chunks if indexing_result is not None else 0),
             )
         except Exception as exc:
             self._registry.update_version_status(registration.version.id, LifecycleStatus.FAILED)
@@ -339,6 +348,9 @@ class IngestionOrchestrator:
                 storage_path=storage_path,
                 parsed_documents=parsed_documents,
                 chunking_result=chunking_result,
+                parent_chunk_count=len(chunking_result.parent_chunks),
+                child_chunk_count=len(chunking_result.child_chunks),
+                indexed_vector_count=(indexing_result.upserted_child_chunks if indexing_result is not None else 0),
             )
         except Exception as exc:
             self._registry.update_version_status(version.id, LifecycleStatus.FAILED)
