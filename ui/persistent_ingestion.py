@@ -11,6 +11,7 @@ from types import GenericAlias
 from typing import Any
 
 from ui.upload_manager import is_allowed_extension, sanitize_filename
+from ui.status_utils import normalize_status
 
 
 FAILED_STATUS = "FAILED"
@@ -122,7 +123,7 @@ def ingest_uploaded_document(
             )
 
             job = session.get(IngestionJob, result.job_id)
-            status = (job.status if job is not None else result.status).value
+            status = normalize_status(job.status if job is not None else result.status) or FAILED_STATUS
             error_message = job.error_message if job is not None else result.error_message
             return IngestionUIResult(
                 document_id=result.document_id,
