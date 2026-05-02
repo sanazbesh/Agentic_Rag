@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 from datetime import datetime
-from enum import Enum
+from enum import Enum as PyEnum
 from typing import Any
 
-from sqlalchemy import DateTime, Enum, ForeignKey, Index, String, Text, func
+from sqlalchemy import DateTime, Enum as SAEnum, ForeignKey, Index, String, Text, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.types import JSON
 
 
-class LifecycleStatus(str, Enum):
+class LifecycleStatus(str, PyEnum):
     """Canonical lifecycle statuses for documents, versions, and jobs."""
 
     PENDING = "PENDING"
@@ -25,8 +25,12 @@ class Base(DeclarativeBase):
     """Base declarative class for Agentic RAG storage models."""
 
 
-_LIFECYCLE_ENUM = Enum(
-    LifecycleStatus,
+_LIFECYCLE_ENUM = SAEnum(
+    "PENDING",
+    "PROCESSING",
+    "READY",
+    "FAILED",
+    "SKIPPED_DUPLICATE",
     name="lifecycle_status",
     native_enum=False,
     validate_strings=True,
