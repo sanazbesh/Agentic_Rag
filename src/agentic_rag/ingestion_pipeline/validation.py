@@ -54,7 +54,7 @@ class IngestionValidationService:
         if invalid_child is not None:
             return ValidationResult(is_valid=False, error_message=f"Validation failed: child chunk {invalid_child.child_chunk_id} has empty text")
 
-        persisted = self._persisted_chunks_for_version(document_version.id)
+        persisted = list(persisted_chunks) if persisted_chunks is not None else self._persisted_chunks_for_version(document_version.id)
         if not persisted:
             return ValidationResult(is_valid=False, error_message="Validation failed: no persisted chunks found")
 
