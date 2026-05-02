@@ -45,6 +45,7 @@ class IngestionResult:
     parsed_text_length: int = 0
     parent_chunks_created: int = 0
     child_chunks_created: int = 0
+    chunk_persistence_called: bool = False
     parent_chunks_persisted: int = 0
     child_chunks_persisted: int = 0
     vectors_indexed: int = 0
@@ -101,6 +102,14 @@ class IngestionOrchestrator:
         self._registry.update_version_status(version.id, LifecycleStatus.PROCESSING)
         self._job_service.mark_processing(job)
 
+        parsed_text_length = 0
+        parent_chunks_created = 0
+        child_chunks_created = 0
+        chunk_persistence_called = False
+        parent_chunks_persisted = 0
+        child_chunks_persisted = 0
+        vectors_indexed = 0
+
         try:
             parsed_documents = self._parse_content(
                 content_bytes=content_bytes,
@@ -117,6 +126,7 @@ class IngestionOrchestrator:
             logger.info("ingestion_chunk_debug parsed_text_length=%s parent_chunks_created=%s child_chunks_created=%s", parsed_text_length, parent_chunks_created, child_chunks_created)
 
             persisted_chunks = None
+            chunk_persistence_called = True
             logger.info("ingestion_chunk_debug calling_persistence=True document_id=%s document_version_id=%s", document.id, version.id)
             persisted_chunks = self._chunk_persistence_service.persist_chunks(
                 document_id=document.id,
@@ -129,6 +139,7 @@ class IngestionOrchestrator:
             indexing_result: VectorIndexingResult | None = None
             if self._vector_indexing_service is not None:
                 indexing_result = self._vector_indexing_service.index_document_version(document_version_id=version.id)
+                vectors_indexed = indexing_result.upserted_child_chunks
 
             validation_result = self._validation_service.validate(
                 document_version=version,
@@ -166,9 +177,10 @@ class IngestionOrchestrator:
                 parsed_text_length=parsed_text_length,
                 parent_chunks_created=parent_chunks_created,
                 child_chunks_created=child_chunks_created,
+                chunk_persistence_called=chunk_persistence_called,
                 parent_chunks_persisted=parent_chunks_persisted,
                 child_chunks_persisted=child_chunks_persisted,
-                vectors_indexed=(indexing_result.upserted_child_chunks if indexing_result is not None else 0),
+                vectors_indexed=vectors_indexed,
             )
         except Exception as exc:
             self._registry.update_version_status(version.id, LifecycleStatus.FAILED)
@@ -185,6 +197,13 @@ class IngestionOrchestrator:
                 created_document=False,
                 created_version=False,
                 storage_path=version.storage_path,
+                parsed_text_length=parsed_text_length,
+                parent_chunks_created=parent_chunks_created,
+                child_chunks_created=child_chunks_created,
+                chunk_persistence_called=chunk_persistence_called,
+                parent_chunks_persisted=parent_chunks_persisted,
+                child_chunks_persisted=child_chunks_persisted,
+                vectors_indexed=vectors_indexed,
                 error_message=str(exc),
             )
 
@@ -225,6 +244,14 @@ class IngestionOrchestrator:
         self._registry.update_version_status(registration.version.id, LifecycleStatus.PROCESSING)
         self._job_service.mark_processing(job)
 
+        parsed_text_length = 0
+        parent_chunks_created = 0
+        child_chunks_created = 0
+        chunk_persistence_called = False
+        parent_chunks_persisted = 0
+        child_chunks_persisted = 0
+        vectors_indexed = 0
+
         try:
             parsed_documents = self._parse_content(
                 content_bytes=content_bytes,
@@ -240,6 +267,7 @@ class IngestionOrchestrator:
             child_chunks_created = len(chunking_result.child_chunks)
             logger.info("ingestion_chunk_debug parsed_text_length=%s parent_chunks_created=%s child_chunks_created=%s", parsed_text_length, parent_chunks_created, child_chunks_created)
             persisted_chunks = None
+            chunk_persistence_called = True
             logger.info("ingestion_chunk_debug calling_persistence=True document_id=%s document_version_id=%s", registration.document.id, registration.version.id)
             persisted_chunks = self._chunk_persistence_service.persist_chunks(
                 document_id=registration.document.id,
@@ -254,6 +282,7 @@ class IngestionOrchestrator:
                 indexing_result = self._vector_indexing_service.index_document_version(
                     document_version_id=registration.version.id,
                 )
+                vectors_indexed = indexing_result.upserted_child_chunks
 
             validation_result = self._validation_service.validate(
                 document_version=registration.version,
@@ -286,9 +315,10 @@ class IngestionOrchestrator:
                 parsed_text_length=parsed_text_length,
                 parent_chunks_created=parent_chunks_created,
                 child_chunks_created=child_chunks_created,
+                chunk_persistence_called=chunk_persistence_called,
                 parent_chunks_persisted=parent_chunks_persisted,
                 child_chunks_persisted=child_chunks_persisted,
-                vectors_indexed=(indexing_result.upserted_child_chunks if indexing_result is not None else 0),
+                vectors_indexed=vectors_indexed,
             )
         except Exception as exc:
             self._registry.update_version_status(registration.version.id, LifecycleStatus.FAILED)
@@ -305,6 +335,13 @@ class IngestionOrchestrator:
                 created_document=registration.created_document,
                 created_version=registration.created_version,
                 storage_path=storage_path,
+                parsed_text_length=parsed_text_length,
+                parent_chunks_created=parent_chunks_created,
+                child_chunks_created=child_chunks_created,
+                chunk_persistence_called=chunk_persistence_called,
+                parent_chunks_persisted=parent_chunks_persisted,
+                child_chunks_persisted=child_chunks_persisted,
+                vectors_indexed=vectors_indexed,
                 error_message=str(exc),
             )
 
@@ -343,6 +380,14 @@ class IngestionOrchestrator:
         self._registry.update_version_status(version.id, LifecycleStatus.PROCESSING)
         self._job_service.mark_processing(job)
 
+        parsed_text_length = 0
+        parent_chunks_created = 0
+        child_chunks_created = 0
+        chunk_persistence_called = False
+        parent_chunks_persisted = 0
+        child_chunks_persisted = 0
+        vectors_indexed = 0
+
         try:
             parsed_documents = self._parse_content(
                 content_bytes=content_bytes,
@@ -358,6 +403,7 @@ class IngestionOrchestrator:
             child_chunks_created = len(chunking_result.child_chunks)
             logger.info("ingestion_chunk_debug parsed_text_length=%s parent_chunks_created=%s child_chunks_created=%s", parsed_text_length, parent_chunks_created, child_chunks_created)
             persisted_chunks = None
+            chunk_persistence_called = True
             logger.info("ingestion_chunk_debug calling_persistence=True document_id=%s document_version_id=%s", document.id, version.id)
             persisted_chunks = self._chunk_persistence_service.persist_chunks(
                 document_id=document.id,
@@ -370,6 +416,7 @@ class IngestionOrchestrator:
             indexing_result: VectorIndexingResult | None = None
             if self._vector_indexing_service is not None:
                 indexing_result = self._vector_indexing_service.index_document_version(document_version_id=version.id)
+                vectors_indexed = indexing_result.upserted_child_chunks
 
             validation_result = self._validation_service.validate(
                 document_version=version,
@@ -401,9 +448,10 @@ class IngestionOrchestrator:
                 parsed_text_length=parsed_text_length,
                 parent_chunks_created=parent_chunks_created,
                 child_chunks_created=child_chunks_created,
+                chunk_persistence_called=chunk_persistence_called,
                 parent_chunks_persisted=parent_chunks_persisted,
                 child_chunks_persisted=child_chunks_persisted,
-                vectors_indexed=(indexing_result.upserted_child_chunks if indexing_result is not None else 0),
+                vectors_indexed=vectors_indexed,
             )
         except Exception as exc:
             self._registry.update_version_status(version.id, LifecycleStatus.FAILED)
@@ -420,6 +468,13 @@ class IngestionOrchestrator:
                 created_document=False,
                 created_version=False,
                 storage_path=storage_path,
+                parsed_text_length=parsed_text_length,
+                parent_chunks_created=parent_chunks_created,
+                child_chunks_created=child_chunks_created,
+                chunk_persistence_called=chunk_persistence_called,
+                parent_chunks_persisted=parent_chunks_persisted,
+                child_chunks_persisted=child_chunks_persisted,
+                vectors_indexed=vectors_indexed,
                 error_message=str(exc),
             )
 
